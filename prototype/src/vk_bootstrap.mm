@@ -4154,7 +4154,7 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             return report;
         }
 
-        for (uint32_t frame_index = 0;
+        for (uint32_t frame_index = 1;
              config.interactive ? (glfwWindowShouldClose(window) != GLFW_TRUE)
                                 : (frame_index < config.present_frame_count);
              ++frame_index) {
@@ -4232,9 +4232,12 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                 // FPS display
                 fps_frame_count++;
                 if (now - fps_timer >= 1.0) {
-                    char title[128];
-                    std::snprintf(title, sizeof(title), "Meridian - %u FPS - %u draws",
-                                  fps_frame_count, gpu_draw_count);
+                    char title[256];
+                    const uint32_t total_pages = static_cast<uint32_t>(residency_model.pages.size());
+                    const uint32_t res_pages = count_resident_pages(residency_model);
+                    std::snprintf(title, sizeof(title),
+                                  "Meridian - %u FPS - %u draws - pages %u/%u",
+                                  fps_frame_count, gpu_draw_count, res_pages, total_pages);
                     glfwSetWindowTitle(window, title);
                     fps_frame_count = 0;
                     fps_timer = now;
