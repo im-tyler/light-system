@@ -1,0 +1,6 @@
+name = terrace_streaming_replay
+frame_count = 4
+resident_budget = 20
+eviction_grace_frames = 1
+bootstrap_resident = none
+error_thresholds = 0.03, 0.03, 0.03, 0.03

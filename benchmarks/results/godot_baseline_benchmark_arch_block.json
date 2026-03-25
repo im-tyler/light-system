@@ -1,0 +1,21 @@
+{
+  "asset_path": "res://benchmarks/scenes/generated/arch_block.obj",
+  "avg_fps": 1857.76487418436,
+  "avg_frame_ms": 0.538281250709429,
+  "bounds_max": [
+    19.5,
+    4.80000019073486,
+    14.5
+  ],
+  "bounds_min": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "frames": 20,
+  "mesh_instance_count": 1,
+  "mode": "stock_godot",
+  "renderer": "forward_plus",
+  "scene_id": "benchmark_arch_block",
+  "warmup_frames": 5
+}

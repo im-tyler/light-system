@@ -1,0 +1,21 @@
+{
+  "asset_path": "res://benchmarks/scenes/generated/terrace_grid.obj",
+  "avg_fps": 61.0504337633319,
+  "avg_frame_ms": 16.3799,
+  "bounds_max": [
+    18.0,
+    1.27112483978271,
+    14.0
+  ],
+  "bounds_min": [
+    -18.0,
+    -0.825704991817474,
+    -14.0
+  ],
+  "frames": 20,
+  "mesh_instance_count": 1,
+  "mode": "stock_godot",
+  "renderer": "forward_plus",
+  "scene_id": "benchmark_terrace",
+  "warmup_frames": 5
+}

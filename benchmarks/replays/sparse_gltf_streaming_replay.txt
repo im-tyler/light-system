@@ -1,0 +1,6 @@
+name = sparse_gltf_streaming_replay
+frame_count = 4
+resident_budget = 10
+eviction_grace_frames = 1
+bootstrap_resident = none
+error_thresholds = 2.5, 2.5, 2.5, 2.5

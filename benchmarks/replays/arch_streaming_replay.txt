@@ -1,0 +1,6 @@
+name = arch_streaming_replay
+frame_count = 4
+resident_budget = 12
+eviction_grace_frames = 1
+bootstrap_resident = none
+error_thresholds = 3.0, 3.0, 3.0, 3.0

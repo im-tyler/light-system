@@ -1,0 +1,10 @@
+asset_id = stanford_dragon
+source_asset = ../../assets/dragon/dragon.obj
+output_path = ../../../build/stanford_dragon.vgeo
+emit_fallback = true
+material_slots = default
+cluster_vertex_limit = 64
+cluster_triangle_limit = 124
+page_cluster_limit = 8
+hierarchy_partition_size = 8
+bounds_padding = 0.1

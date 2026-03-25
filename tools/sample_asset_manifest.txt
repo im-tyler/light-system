@@ -1,0 +1,13 @@
+# First-pass Meridian builder manifest.
+
+asset_id = sample_rock_asset
+source_asset = ../assets/sample_rock.obj
+output_path = ../build/sample_rock.vgeo
+bounds_min = -1.0 -1.0 -1.0
+bounds_max = 1.0 1.0 1.0
+emit_fallback = true
+cluster_vertex_limit = 6
+cluster_triangle_limit = 4
+page_cluster_limit = 2
+hierarchy_partition_size = 2
+material_slots = rock_master, moss_overlay

@@ -1,0 +1,21 @@
+{
+  "asset_path": "res://benchmarks/scenes/generated/gltf_block_scene.gltf",
+  "avg_fps": 60.7807438532269,
+  "avg_frame_ms": 16.4525791657765,
+  "bounds_max": [
+    12.0,
+    2.50001001358032,
+    9.5
+  ],
+  "bounds_min": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "frames": 20,
+  "mesh_instance_count": 20,
+  "mode": "stock_godot",
+  "renderer": "forward_plus",
+  "scene_id": "benchmark_gltf_block",
+  "warmup_frames": 5
+}

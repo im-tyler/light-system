@@ -1,0 +1,21 @@
+{
+  "asset_path": "res://prototype/thirdparty/meshoptimizer/gltf/fuzz.glb",
+  "avg_fps": 62.6778483948203,
+  "avg_frame_ms": 15.9546,
+  "bounds_max": [
+    0.5,
+    0.5,
+    0.5
+  ],
+  "bounds_min": [
+    -0.5,
+    -0.5,
+    -0.5
+  ],
+  "frames": 20,
+  "mesh_instance_count": 1,
+  "mode": "stock_godot",
+  "renderer": "forward_plus",
+  "scene_id": "external_fuzz",
+  "warmup_frames": 5
+}

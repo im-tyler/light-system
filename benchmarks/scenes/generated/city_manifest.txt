@@ -1,0 +1,10 @@
+asset_id = massive_city
+source_asset = massive_city.glb
+output_path = ../../build/massive_city.vgeo
+emit_fallback = true
+material_slots = city
+cluster_vertex_limit = 64
+cluster_triangle_limit = 124
+page_cluster_limit = 8
+hierarchy_partition_size = 8
+bounds_padding = 0.5

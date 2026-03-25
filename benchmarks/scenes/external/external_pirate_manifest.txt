@@ -1,0 +1,10 @@
+asset_id = external_pirate
+source_asset = /Users/tyler/Documents/renderer/prototype/thirdparty/meshoptimizer/demo/pirate.glb
+output_path = ../../../build/external_pirate.vgeo
+emit_fallback = true
+material_slots = pirate_surface
+cluster_vertex_limit = 24
+cluster_triangle_limit = 24
+page_cluster_limit = 6
+hierarchy_partition_size = 4
+bounds_padding = 0.25

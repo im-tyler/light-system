@@ -1,0 +1,10 @@
+asset_id = workflow_gltf_block
+source_asset = /Users/tyler/Documents/renderer/benchmarks/scenes/generated/gltf_block_scene.gltf
+output_path = ../../../build/workflow_gltf_block.vgeo
+emit_fallback = true
+material_slots = stone_wall, roof_cap
+cluster_vertex_limit = 24
+cluster_triangle_limit = 24
+page_cluster_limit = 6
+hierarchy_partition_size = 4
+bounds_padding = 0.25

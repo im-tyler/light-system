@@ -1,0 +1,19 @@
+[remap]
+
+importer="csv_translation"
+type="Translation"
+uid="uid://bh7rw5y5dh6o8"
+
+[deps]
+
+files=["res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation"]
+
+source_file="res://benchmarks/results/godot_baselines.csv"
+dest_files=["res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation", "res://benchmarks/results/godot_baselines.en.translation"]
+
+[params]
+
+compress=1
+delimiter=0
+unescape_keys=false
+unescape_translations=true

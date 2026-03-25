@@ -1,0 +1,6 @@
+name = sample_material_replay
+frame_count = 4
+resident_budget = 5
+eviction_grace_frames = 1
+bootstrap_resident = none
+error_thresholds = 1.5, 1.5, 1.5, 1.5

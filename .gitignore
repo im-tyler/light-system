@@ -1,0 +1,16 @@
+# Build artifacts
+prototype/build/
+benchmarks/build/
+build/
+*.o
+*.a
+
+# Godot
+.godot/
+
+# External assets (large files)
+benchmarks/assets/
+benchmarks/scenes/generated/*.glb
+
+# OS
+.DS_Store

@@ -1,0 +1,10 @@
+asset_id = benchmark_terrace_grid
+source_asset = generated/terrace_grid.obj
+output_path = ../../build/benchmark_terrace_grid.vgeo
+emit_fallback = true
+material_slots = rock_master, moss_overlay
+cluster_vertex_limit = 24
+cluster_triangle_limit = 24
+page_cluster_limit = 6
+hierarchy_partition_size = 4
+bounds_padding = 0.25

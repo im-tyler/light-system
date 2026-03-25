@@ -1,0 +1,1 @@
+date,build_id,git_commit,scene_id,mode,hardware_profile,renderer_backend,resolution,cold_or_warm,avg_frame_ms,p1_low_frame_ms,cpu_frame_ms,gpu_frame_ms,visible_instances,visible_clusters,rejected_clusters,shadow_pass_ms,residency_misses,vram_mb,disk_read_mb,notes

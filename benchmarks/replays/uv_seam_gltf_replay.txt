@@ -1,0 +1,6 @@
+name = uv_seam_gltf_replay
+frame_count = 3
+resident_budget = 4
+eviction_grace_frames = 1
+bootstrap_resident = none
+error_thresholds = 1.0, 1.0, 1.0
