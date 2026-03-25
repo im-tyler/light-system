@@ -36,11 +36,21 @@ ClusterRecord append_meshlet_payload(const MeshData& mesh, const meshopt_Meshlet
         local_indices.push_back(meshlet_triangles[meshlet.triangle_offset + i]);
     }
 
+    std::vector<Vec3f> local_normals;
+    local_normals.reserve(meshlet.vertex_count);
+    for (size_t i = 0; i < meshlet.vertex_count; ++i) {
+        const uint32_t vertex_index = meshlet_vertices[meshlet.vertex_offset + i];
+        local_normals.push_back(mesh.normals[vertex_index]);
+    }
+
     const uint32_t payload_offset = static_cast<uint32_t>(payload.size());
     const PayloadHeader payload_header{meshlet.vertex_count, meshlet.triangle_count};
     append_bytes(payload, payload_header);
     for (const Vec3f& position : local_positions) {
         append_bytes(payload, position);
+    }
+    for (const Vec3f& normal : local_normals) {
+        append_bytes(payload, normal);
     }
     for (const uint32_t index : local_indices) {
         append_bytes(payload, index);
@@ -508,6 +518,9 @@ LodClusterRecord append_lod_cluster_payload(const MeshData& mesh, const unsigned
     append_bytes(payload, payload_header);
     for (const uint32_t vertex_index : local_vertices) {
         append_bytes(payload, mesh.positions[vertex_index]);
+    }
+    for (const uint32_t vertex_index : local_vertices) {
+        append_bytes(payload, mesh.normals[vertex_index]);
     }
     for (const unsigned char index : local_triangles) {
         const uint32_t widened = index;

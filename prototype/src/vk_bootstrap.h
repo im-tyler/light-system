@@ -17,6 +17,7 @@ struct VkBootstrapConfig {
     float debug_error_threshold = 0.001f;
     uint32_t resident_budget = 0xffffffffu;
     uint32_t eviction_grace_frames = 1;
+    std::string screenshot_path;
 };
 
 struct VkBootstrapReport {

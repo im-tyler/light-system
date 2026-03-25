@@ -106,7 +106,8 @@ VGeoResource create_stub_resource(const BuildManifest& manifest) {
 
 VGeoResource build_resource(const BuildManifest& manifest) {
     VGeoResource resource = create_stub_resource(manifest);
-    const detail::MeshData mesh = detail::load_mesh(manifest);
+    detail::MeshData mesh = detail::load_mesh(manifest);
+    detail::compute_smooth_normals(mesh);
     resource.bounds = detail::resolve_resource_bounds(manifest, mesh.bounds);
     resource.source_vertex_count = static_cast<uint32_t>(mesh.positions.size());
     resource.seam_locked_vertex_count =

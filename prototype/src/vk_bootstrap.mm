@@ -37,6 +37,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <set>
 #include <sstream>
@@ -174,13 +175,6 @@ struct FrameUBO {
     float view_projection[16];
     float light_vp[16];
     float light_dir[4];
-};
-
-struct DrawPushConstants {
-    uint32_t payload_offset = 0;
-    uint32_t vertex_count = 0;
-    uint32_t geometry_index = 0;
-    uint32_t geometry_kind = 0;
 };
 
 void configure_macos_moltenvk_environment() {
@@ -431,9 +425,9 @@ CameraFrameData build_camera_frame_data(const VGeoResource& resource, const VkEx
         resource.bounds.max.z - resource.bounds.min.z,
     };
     const float radius = std::max({extents.x, extents.y, extents.z, 1.0f});
-    camera_distance = radius * 2.4f;
+    camera_distance = radius * 1.5f;
 
-    const Vec3f eye = {center.x + radius * 0.55f, center.y + radius * 0.9f,
+    const Vec3f eye = {center.x + radius * 0.4f, center.y + radius * 0.5f,
                        center.z + camera_distance};
     const float aspect_ratio =
         std::max(1.0f, static_cast<float>(extent.width)) / std::max(1.0f, static_cast<float>(extent.height));
@@ -992,7 +986,7 @@ void main() {
     const uint32_t zero = 0;
     result = create_uploaded_buffer(physical_device, device, &zero, sizeof(uint32_t),
                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                                   VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                   VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
                                    context.draw_count);
     if (result != VK_SUCCESS) return result;
 
@@ -1724,7 +1718,6 @@ struct ShadowContext {
     Mat4f light_vp;
 };
 
-// Shadow pass uses the same DrawPushConstants as the main pass (16 bytes).
 // Light VP comes from the per-frame UBO.
 
 void destroy_shadow_context(VkDevice device, ShadowContext& context) {
@@ -1756,6 +1749,7 @@ Mat4f ortho_matrix(float left, float right, float bottom, float top, float near_
 VkResult create_shadow_context(VkPhysicalDevice physical_device, VkDevice device,
                                const UploadedSceneBuffers& scene_buffers,
                                const UploadedBuffer& frame_ubo,
+                               const UploadedBuffer& draw_list,
                                const VGeoResource& resource,
                                uint32_t shadow_resolution,
                                ShadowContext& context) {
@@ -1853,7 +1847,7 @@ VkResult create_shadow_context(VkPhysicalDevice physical_device, VkDevice device
     result = vkCreateFramebuffer(device, &fb_info, nullptr, &context.framebuffer);
     if (result != VK_SUCCESS) return result;
 
-    // Shadow vertex shader: same vertex pulling, depth only
+    // Shadow vertex shader: vertex pulling via indirect draw list SSBO
     const char* vert_source = R"(
 #version 450
 
@@ -1863,29 +1857,35 @@ layout(set = 0, binding = 2) uniform FrameData {
     vec4 light_dir;
 } frame;
 
-layout(push_constant) uniform PushData {
-    uint payload_offset;
-    uint vertex_count;
-    uint geometry_index;
-    uint geometry_kind;
-} push;
-
 layout(set = 0, binding = 0) readonly buffer BasePayload { uint base_data[]; };
 layout(set = 0, binding = 1) readonly buffer LodPayload { uint lod_data[]; };
 
-uint read_u32(uint byte_offset) {
+struct DrawEntry {
+    uint draw_vertex_count;
+    uint draw_instance_count;
+    uint draw_first_vertex;
+    uint draw_first_instance;
+    uint cluster_index;
+    uint geometry_kind;
+    uint payload_offset;
+    uint local_vertex_count;
+};
+layout(set = 0, binding = 3) readonly buffer DrawList { DrawEntry draws[]; };
+
+uint read_u32(uint byte_offset, uint geometry_kind) {
     uint w = byte_offset >> 2u;
-    return push.geometry_kind == 0u ? base_data[w] : lod_data[w];
+    return geometry_kind == 0u ? base_data[w] : lod_data[w];
 }
 
 void main() {
-    uint pos_base = push.payload_offset + 8u;
-    uint idx_base = pos_base + push.vertex_count * 12u;
-    uint local_idx = read_u32(idx_base + gl_VertexIndex * 4u);
+    DrawEntry entry = draws[gl_InstanceIndex];
+    uint pos_base = entry.payload_offset + 8u;
+    uint idx_base = pos_base + entry.local_vertex_count * 24u;
+    uint local_idx = read_u32(idx_base + gl_VertexIndex * 4u, entry.geometry_kind);
     uint addr = pos_base + local_idx * 12u;
-    vec3 pos = vec3(uintBitsToFloat(read_u32(addr)),
-                    uintBitsToFloat(read_u32(addr+4u)),
-                    uintBitsToFloat(read_u32(addr+8u)));
+    vec3 pos = vec3(uintBitsToFloat(read_u32(addr, entry.geometry_kind)),
+                    uintBitsToFloat(read_u32(addr+4u, entry.geometry_kind)),
+                    uintBitsToFloat(read_u32(addr+8u, entry.geometry_kind)));
     gl_Position = frame.light_vp * vec4(pos, 1.0);
 }
     )";
@@ -1894,8 +1894,8 @@ void main() {
         compile_glsl_to_spirv(vert_source, shaderc_vertex_shader, "shadow.vert");
     VkShaderModule vert_mod = create_shader_module(device, vert_spirv);
 
-    // Descriptor set: payload SSBOs + frame UBO
-    VkDescriptorSetLayoutBinding ds_bindings[3] = {};
+    // Descriptor set: payload SSBOs + frame UBO + draw list SSBO
+    VkDescriptorSetLayoutBinding ds_bindings[4] = {};
     ds_bindings[0].binding = 0;
     ds_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     ds_bindings[0].descriptorCount = 1;
@@ -1908,24 +1908,22 @@ void main() {
     ds_bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     ds_bindings[2].descriptorCount = 1;
     ds_bindings[2].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    ds_bindings[3].binding = 3;
+    ds_bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    ds_bindings[3].descriptorCount = 1;
+    ds_bindings[3].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
 
     VkDescriptorSetLayoutCreateInfo ds_layout_info{};
     ds_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    ds_layout_info.bindingCount = 3;
+    ds_layout_info.bindingCount = 4;
     ds_layout_info.pBindings = ds_bindings;
     result = vkCreateDescriptorSetLayout(device, &ds_layout_info, nullptr, &context.descriptor_set_layout);
     if (result != VK_SUCCESS) { vkDestroyShaderModule(device, vert_mod, nullptr); return result; }
-
-    VkPushConstantRange shadow_push_range{};
-    shadow_push_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-    shadow_push_range.size = sizeof(DrawPushConstants);
 
     VkPipelineLayoutCreateInfo pl_info{};
     pl_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     pl_info.setLayoutCount = 1;
     pl_info.pSetLayouts = &context.descriptor_set_layout;
-    pl_info.pushConstantRangeCount = 1;
-    pl_info.pPushConstantRanges = &shadow_push_range;
     result = vkCreatePipelineLayout(device, &pl_info, nullptr, &context.pipeline_layout);
     if (result != VK_SUCCESS) { vkDestroyShaderModule(device, vert_mod, nullptr); return result; }
 
@@ -2000,7 +1998,7 @@ void main() {
     // Descriptor set binding payload SSBOs + frame UBO + draw list SSBO
     VkDescriptorPoolSize shadow_pool_sizes[2] = {};
     shadow_pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    shadow_pool_sizes[0].descriptorCount = 2;
+    shadow_pool_sizes[0].descriptorCount = 3;
     shadow_pool_sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     shadow_pool_sizes[1].descriptorCount = 1;
     VkDescriptorPoolCreateInfo pool_info{};
@@ -2019,8 +2017,8 @@ void main() {
     result = vkAllocateDescriptorSets(device, &ds_alloc, &context.descriptor_set);
     if (result != VK_SUCCESS) return result;
 
-    VkDescriptorBufferInfo buf_infos[3] = {};
-    VkWriteDescriptorSet ds_writes[3] = {};
+    VkDescriptorBufferInfo buf_infos[4] = {};
+    VkWriteDescriptorSet ds_writes[4] = {};
     uint32_t wc = 0;
     if (scene_buffers.base_payload.buffer != VK_NULL_HANDLE) {
         buf_infos[wc] = {scene_buffers.base_payload.buffer, 0, scene_buffers.base_payload.size};
@@ -2050,6 +2048,16 @@ void main() {
     ds_writes[wc].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     ds_writes[wc].pBufferInfo = &buf_infos[wc];
     wc++;
+    if (draw_list.buffer != VK_NULL_HANDLE) {
+        buf_infos[wc] = {draw_list.buffer, 0, draw_list.size};
+        ds_writes[wc].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        ds_writes[wc].dstSet = context.descriptor_set;
+        ds_writes[wc].dstBinding = 3;
+        ds_writes[wc].descriptorCount = 1;
+        ds_writes[wc].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        ds_writes[wc].pBufferInfo = &buf_infos[wc];
+        wc++;
+    }
     vkUpdateDescriptorSets(device, wc, ds_writes, 0, nullptr);
 
     // Build light VP matrix: orthographic from above-right to cover the scene bounds
@@ -2655,7 +2663,7 @@ VkResult create_swapchain(VkPhysicalDevice physical_device, VkDevice device, VkS
     create_info.imageColorSpace = swapchain.surface_format.colorSpace;
     create_info.imageExtent = swapchain.extent;
     create_info.imageArrayLayers = 1;
-    create_info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    create_info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     create_info.preTransform = capabilities.currentTransform;
     create_info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     create_info.presentMode = swapchain.present_mode;
@@ -2892,12 +2900,14 @@ VkResult create_visibility_resources(VkPhysicalDevice physical_device, VkDevice 
 VkResult create_debug_render_context(VkPhysicalDevice physical_device, VkDevice device,
                                      const SwapchainContext& swapchain,
                                      const UploadedSceneBuffers& scene_buffers,
+                                     const UploadedBuffer& draw_list,
                                      DebugRenderContext& context) {
 #if !MERIDIAN_HAS_SHADERC
     (void)physical_device;
     (void)device;
     (void)swapchain;
     (void)scene_buffers;
+    (void)draw_list;
     (void)context;
     return VK_ERROR_FEATURE_NOT_PRESENT;
 #else
@@ -2995,60 +3005,59 @@ layout(set = 0, binding = 2) uniform FrameData {
     vec4 light_dir;
 } frame;
 
-layout(push_constant) uniform PushData {
-    uint payload_offset;
-    uint vertex_count;
-    uint geometry_index;
-    uint geometry_kind;
-} push;
-
 layout(set = 0, binding = 0) readonly buffer BasePayload { uint base_data[]; };
 layout(set = 0, binding = 1) readonly buffer LodPayload { uint lod_data[]; };
 
-layout(location = 0) flat out vec3 frag_normal;
+struct DrawEntry {
+    uint draw_vertex_count;
+    uint draw_instance_count;
+    uint draw_first_vertex;
+    uint draw_first_instance;
+    uint cluster_index;
+    uint geometry_kind;
+    uint payload_offset;
+    uint local_vertex_count;
+};
+layout(set = 0, binding = 4) readonly buffer DrawList { DrawEntry draws[]; };
+
+layout(location = 0) out vec3 frag_normal;
 layout(location = 1) flat out uint frag_geometry_index;
 layout(location = 2) flat out uint frag_geometry_kind;
 layout(location = 3) out vec3 frag_world_pos;
 layout(location = 4) flat out uint frag_local_triangle;
 
-uint read_u32(uint byte_offset) {
+uint read_u32(uint byte_offset, uint geometry_kind) {
     uint word_index = byte_offset >> 2u;
-    if (push.geometry_kind == 0u) {
+    if (geometry_kind == 0u) {
         return base_data[word_index];
     } else {
         return lod_data[word_index];
     }
 }
 
-vec3 read_pos(uint pos_base, uint vertex_index) {
-    uint addr = pos_base + vertex_index * 12u;
-    return vec3(uintBitsToFloat(read_u32(addr)),
-                uintBitsToFloat(read_u32(addr + 4u)),
-                uintBitsToFloat(read_u32(addr + 8u)));
+vec3 read_vec3(uint base, uint index, uint gk) {
+    uint addr = base + index * 12u;
+    return vec3(uintBitsToFloat(read_u32(addr, gk)),
+                uintBitsToFloat(read_u32(addr + 4u, gk)),
+                uintBitsToFloat(read_u32(addr + 8u, gk)));
 }
 
 void main() {
-    uint pos_base = push.payload_offset + 8u;
-    uint idx_base = pos_base + push.vertex_count * 12u;
+    DrawEntry entry = draws[gl_InstanceIndex];
+    uint pos_base = entry.payload_offset + 8u;
+    uint normal_base = pos_base + entry.local_vertex_count * 12u;
+    uint idx_base = pos_base + entry.local_vertex_count * 24u;
 
-    uint local_index = read_u32(idx_base + gl_VertexIndex * 4u);
-    vec3 position = read_pos(pos_base, local_index);
-
-    uint tri_id = gl_VertexIndex / 3u;
-    uint i0 = read_u32(idx_base + (tri_id * 3u + 0u) * 4u);
-    uint i1 = read_u32(idx_base + (tri_id * 3u + 1u) * 4u);
-    uint i2 = read_u32(idx_base + (tri_id * 3u + 2u) * 4u);
-    vec3 p0 = read_pos(pos_base, i0);
-    vec3 p1 = read_pos(pos_base, i1);
-    vec3 p2 = read_pos(pos_base, i2);
-    vec3 face_normal = normalize(cross(p1 - p0, p2 - p0));
+    uint local_index = read_u32(idx_base + gl_VertexIndex * 4u, entry.geometry_kind);
+    vec3 position = read_vec3(pos_base, local_index, entry.geometry_kind);
+    vec3 smooth_normal = read_vec3(normal_base, local_index, entry.geometry_kind);
 
     gl_Position = frame.view_projection * vec4(position, 1.0);
-    frag_normal = face_normal;
+    frag_normal = normalize(smooth_normal);
     frag_world_pos = position;
-    frag_geometry_index = push.geometry_index;
-    frag_geometry_kind = push.geometry_kind;
-    frag_local_triangle = tri_id;
+    frag_geometry_index = entry.cluster_index;
+    frag_geometry_kind = entry.geometry_kind;
+    frag_local_triangle = gl_VertexIndex / 3u;
 }
     )";
 
@@ -3063,7 +3072,7 @@ layout(set = 0, binding = 2) uniform FrameData {
 
 layout(set = 0, binding = 3) uniform sampler2DShadow shadow_map;
 
-layout(location = 0) flat in vec3 frag_normal;
+layout(location = 0) in vec3 frag_normal;
 layout(location = 1) flat in uint frag_geometry_index;
 layout(location = 2) flat in uint frag_geometry_kind;
 layout(location = 3) in vec3 frag_world_pos;
@@ -3097,10 +3106,10 @@ void main() {
 
     // Hemisphere ambient (sky blue from above, ground bounce from below)
     float up = N.y * 0.5 + 0.5;
-    vec3 sky_color = vec3(0.4, 0.45, 0.55);
-    vec3 ground_color = vec3(0.25, 0.22, 0.2);
-    vec3 ambient = base_color * mix(ground_color, sky_color, up) * 0.6;
-    vec3 diffuse = base_color * ndotl * shadow * 0.7;
+    vec3 sky_color = vec3(0.55, 0.6, 0.7);
+    vec3 ground_color = vec3(0.35, 0.3, 0.28);
+    vec3 ambient = base_color * mix(ground_color, sky_color, up) * 0.75;
+    vec3 diffuse = base_color * ndotl * shadow * 0.8;
     out_color = vec4(ambient + diffuse, 1.0);
 
     // Two-word visibility encoding matching visibility_format.h:
@@ -3183,8 +3192,8 @@ void main() {
     color_blending.attachmentCount = 2;
     color_blending.pAttachments = color_blend_attachments;
 
-    // Descriptor set layout: 0=base SSBO, 1=lod SSBO, 2=frame UBO, 3=shadow sampler
-    VkDescriptorSetLayoutBinding ds_bindings[4] = {};
+    // Descriptor set layout: 0=base SSBO, 1=lod SSBO, 2=frame UBO, 3=shadow sampler, 4=draw list SSBO
+    VkDescriptorSetLayoutBinding ds_bindings[5] = {};
     ds_bindings[0].binding = 0;
     ds_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     ds_bindings[0].descriptorCount = 1;
@@ -3201,10 +3210,14 @@ void main() {
     ds_bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     ds_bindings[3].descriptorCount = 1;
     ds_bindings[3].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    ds_bindings[4].binding = 4;
+    ds_bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    ds_bindings[4].descriptorCount = 1;
+    ds_bindings[4].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
 
     VkDescriptorSetLayoutCreateInfo set_layout_info{};
     set_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    set_layout_info.bindingCount = 4;
+    set_layout_info.bindingCount = 5;
     set_layout_info.pBindings = ds_bindings;
     result = vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr,
                                          &context.descriptor_set_layout);
@@ -3271,7 +3284,7 @@ void main() {
 
     VkDescriptorPoolSize pool_sizes[3] = {};
     pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    pool_sizes[0].descriptorCount = 2;
+    pool_sizes[0].descriptorCount = 3;
     pool_sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     pool_sizes[1].descriptorCount = 1;
     pool_sizes[2].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -3301,15 +3314,17 @@ void main() {
         return result;
     }
 
-    VkDescriptorBufferInfo buffer_infos[3] = {};
+    VkDescriptorBufferInfo buffer_infos[4] = {};
     buffer_infos[0].buffer = scene_buffers.base_payload.buffer;
     buffer_infos[0].range = scene_buffers.base_payload.size > 0 ? scene_buffers.base_payload.size : VK_WHOLE_SIZE;
     buffer_infos[1].buffer = scene_buffers.lod_payload.buffer;
     buffer_infos[1].range = scene_buffers.lod_payload.size > 0 ? scene_buffers.lod_payload.size : VK_WHOLE_SIZE;
     buffer_infos[2].buffer = context.frame_ubo.buffer;
     buffer_infos[2].range = sizeof(FrameUBO);
+    buffer_infos[3].buffer = draw_list.buffer;
+    buffer_infos[3].range = draw_list.size > 0 ? draw_list.size : VK_WHOLE_SIZE;
 
-    VkWriteDescriptorSet writes[3] = {};
+    VkWriteDescriptorSet writes[4] = {};
     uint32_t write_count = 0;
     if (scene_buffers.base_payload.buffer != VK_NULL_HANDLE) {
         writes[write_count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -3336,18 +3351,21 @@ void main() {
     writes[write_count].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     writes[write_count].pBufferInfo = &buffer_infos[2];
     write_count++;
+    if (draw_list.buffer != VK_NULL_HANDLE) {
+        writes[write_count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[write_count].dstSet = context.descriptor_set;
+        writes[write_count].dstBinding = 4;
+        writes[write_count].descriptorCount = 1;
+        writes[write_count].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[write_count].pBufferInfo = &buffer_infos[3];
+        write_count++;
+    }
     vkUpdateDescriptorSets(device, write_count, writes, 0, nullptr);
 
     VkPipelineLayoutCreateInfo pipeline_layout_info{};
     pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     pipeline_layout_info.setLayoutCount = 1;
     pipeline_layout_info.pSetLayouts = &context.descriptor_set_layout;
-    VkPushConstantRange push_constant_range{};
-    push_constant_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-    push_constant_range.offset = 0;
-    push_constant_range.size = sizeof(DrawPushConstants);
-    pipeline_layout_info.pushConstantRangeCount = 1;
-    pipeline_layout_info.pPushConstantRanges = &push_constant_range;
     result = vkCreatePipelineLayout(device, &pipeline_layout_info, nullptr, &context.pipeline_layout);
     if (result != VK_SUCCESS) {
         vkDestroyShaderModule(device, frag_module, nullptr);
@@ -3427,8 +3445,6 @@ VkResult record_debug_command_buffer(FrameContext& frame, const DebugRenderConte
                                      float error_threshold,
                                      const TraversalSelection& selection,
                                      const UploadableScene& scene,
-                                     const std::vector<GpuDrawEntry>& readback_draws,
-                                     uint32_t readback_draw_count,
                                      uint32_t frame_index,
                                      uint32_t image_index) {
     VkCommandBufferBeginInfo begin_info{};
@@ -3479,6 +3495,8 @@ VkResult record_debug_command_buffer(FrameContext& frame, const DebugRenderConte
         compute_selection.descriptor_set != VK_NULL_HANDLE) {
         vkCmdFillBuffer(frame.command_buffer, compute_selection.draw_count.buffer, 0,
                         sizeof(uint32_t), 0);
+        vkCmdFillBuffer(frame.command_buffer, compute_selection.draw_list.buffer, 0,
+                        compute_selection.draw_list.size, 0);
 
         VkMemoryBarrier fill_barrier{};
         fill_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -3506,9 +3524,11 @@ VkResult record_debug_command_buffer(FrameContext& frame, const DebugRenderConte
         VkMemoryBarrier sel_barrier{};
         sel_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
         sel_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        sel_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+        sel_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+                                    VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
         vkCmdPipelineBarrier(frame.command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT |
+                             VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
                              0, 1, &sel_barrier, 0, nullptr, 0, nullptr);
     }
 
@@ -3546,9 +3566,11 @@ VkResult record_debug_command_buffer(FrameContext& frame, const DebugRenderConte
         VkMemoryBarrier occ_bar{};
         occ_bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
         occ_bar.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        occ_bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+        occ_bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+                                VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
         vkCmdPipelineBarrier(frame.command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT |
+                             VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
                              0, 1, &occ_bar, 0, nullptr, 0, nullptr);
     }
 
@@ -3570,18 +3592,12 @@ VkResult record_debug_command_buffer(FrameContext& frame, const DebugRenderConte
         vkCmdBindDescriptorSets(frame.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                 shadow.pipeline_layout, 0, 1, &shadow.descriptor_set, 0, nullptr);
 
-        if (readback_draw_count > 0) {
-            for (uint32_t i = 0; i < readback_draw_count; ++i) {
-                const GpuDrawEntry& e = readback_draws[i];
-                DrawPushConstants sp{};
-                sp.payload_offset = e.payload_offset;
-                sp.vertex_count = e.local_vertex_count;
-                sp.geometry_index = e.cluster_index;
-                sp.geometry_kind = e.geometry_kind;
-                vkCmdPushConstants(frame.command_buffer, shadow.pipeline_layout,
-                                   VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(DrawPushConstants), &sp);
-                vkCmdDraw(frame.command_buffer, e.draw_vertex_count, 1, 0, 0);
-            }
+        if (compute_selection.draw_list.buffer != VK_NULL_HANDLE &&
+            compute_selection.draw_count.buffer != VK_NULL_HANDLE) {
+            vkCmdDrawIndirect(frame.command_buffer,
+                              compute_selection.draw_list.buffer, 0,
+                              compute_selection.max_draws,
+                              sizeof(GpuDrawEntry));
         }
         vkCmdEndRenderPass(frame.command_buffer);
     }
@@ -3608,19 +3624,12 @@ VkResult record_debug_command_buffer(FrameContext& frame, const DebugRenderConte
         vkCmdBindDescriptorSets(frame.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                 debug_render.pipeline_layout, 0, 1, &debug_render.descriptor_set,
                                 0, nullptr);
-        if (readback_draw_count > 0) {
-            for (uint32_t i = 0; i < readback_draw_count; ++i) {
-                const GpuDrawEntry& e = readback_draws[i];
-                DrawPushConstants push{};
-                push.payload_offset = e.payload_offset;
-                push.vertex_count = e.local_vertex_count;
-                push.geometry_index = e.cluster_index;
-                push.geometry_kind = e.geometry_kind;
-                vkCmdPushConstants(frame.command_buffer, debug_render.pipeline_layout,
-                                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                                   sizeof(DrawPushConstants), &push);
-                vkCmdDraw(frame.command_buffer, e.draw_vertex_count, 1, 0, 0);
-            }
+        if (compute_selection.draw_list.buffer != VK_NULL_HANDLE &&
+            compute_selection.draw_count.buffer != VK_NULL_HANDLE) {
+            vkCmdDrawIndirect(frame.command_buffer,
+                              compute_selection.draw_list.buffer, 0,
+                              compute_selection.max_draws,
+                              sizeof(GpuDrawEntry));
         }
     }
     vkCmdEndRenderPass(frame.command_buffer);
@@ -3827,7 +3836,6 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
     OcclusionRefineContext occlusion_refine;
     ShadowContext shadow;
     TraversalSelection last_submitted_selection;
-    std::vector<GpuDrawEntry> gpu_draw_list;
     uint32_t gpu_draw_count = 0;
 
     const auto cleanup = [&]() {
@@ -4068,7 +4076,8 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             report.debug_rendered_lod_cluster_count == report.replay_selected_lod_cluster_count;
 
         result = create_debug_render_context(selection.physical_device, device, swapchain,
-                                             scene_buffers, debug_render);
+                                             scene_buffers, compute_selection.draw_list,
+                                             debug_render);
         if (result != VK_SUCCESS) {
             std::ostringstream message;
             message << "create_debug_render_context failed with code " << result;
@@ -4103,7 +4112,8 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
         }
 
         result = create_shadow_context(selection.physical_device, device, scene_buffers,
-                                       debug_render.frame_ubo, resource, 2048, shadow);
+                                       debug_render.frame_ubo, compute_selection.draw_list,
+                                       resource, 2048, shadow);
         if (result != VK_SUCCESS) {
             std::ostringstream message;
             message << "create_shadow_context failed with code " << result;
@@ -4278,33 +4288,14 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             if (report.presented_frame_count > 0) {
                 analyze_visibility_readback(device, swapchain, debug_render, last_submitted_selection,
                                            report);
-                // Read back GPU draw list from compute selection
-                // (Occlusion-refined readback deferred until indirect draws eliminate the
-                //  1-frame latency issue that causes flashing with camera movement)
+                // Read back GPU draw count for debug stats (draws are consumed on GPU via indirect)
                 const UploadedBuffer& readback_count_buf = compute_selection.draw_count;
-                const UploadedBuffer& readback_list_buf = compute_selection.draw_list;
-
                 if (readback_count_buf.buffer != VK_NULL_HANDLE) {
                     void* count_mapped = nullptr;
                     if (vkMapMemory(device, readback_count_buf.memory, 0,
                                     sizeof(uint32_t), 0, &count_mapped) == VK_SUCCESS) {
                         gpu_draw_count = *static_cast<const uint32_t*>(count_mapped);
                         vkUnmapMemory(device, readback_count_buf.memory);
-                    }
-                    if (gpu_draw_count > 0 && readback_list_buf.buffer != VK_NULL_HANDLE) {
-                        const VkDeviceSize list_size =
-                            static_cast<VkDeviceSize>(gpu_draw_count) * sizeof(GpuDrawEntry);
-                        void* list_mapped = nullptr;
-                        if (vkMapMemory(device, readback_list_buf.memory, 0,
-                                        list_size, 0, &list_mapped) == VK_SUCCESS) {
-                            gpu_draw_list.resize(gpu_draw_count);
-                            std::memcpy(gpu_draw_list.data(), list_mapped,
-                                        gpu_draw_count * sizeof(GpuDrawEntry));
-                            vkUnmapMemory(device, readback_list_buf.memory);
-                        }
-                    } else {
-                        gpu_draw_list.clear();
-                        gpu_draw_count = 0;
                     }
                 }
             }
@@ -4341,7 +4332,6 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                                                  hzb, occlusion_refine, shadow, swapchain,
                                                  camera_frame, frustum, config.debug_error_threshold,
                                                  selection_for_frame, report.uploadable_scene,
-                                                 gpu_draw_list, gpu_draw_count,
                                                  frame_index, image_index);
             if (result != VK_SUCCESS) {
                 std::ostringstream message;
@@ -4420,6 +4410,71 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                 vkUnmapMemory(device, occlusion_refine.output_count.memory);
             }
         }
+        // Screenshot capture
+        if (!config.screenshot_path.empty() && report.presented_frame_count > 0 &&
+            !swapchain.images.empty() && frame.command_pool != VK_NULL_HANDLE) {
+            const uint32_t w = swapchain.extent.width;
+            const uint32_t h = swapchain.extent.height;
+            const VkDeviceSize pixel_size = 4; // BGRA
+            const VkDeviceSize buf_size = w * h * pixel_size;
+
+            UploadedBuffer readback{};
+            if (create_uploaded_buffer(selection.physical_device, device, nullptr, buf_size,
+                                       VK_BUFFER_USAGE_TRANSFER_DST_BIT, readback) == VK_SUCCESS) {
+                vkResetCommandPool(device, frame.command_pool, 0);
+                VkCommandBufferBeginInfo begin{};
+                begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+                begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                vkBeginCommandBuffer(frame.command_buffer, &begin);
+
+                // Transition swapchain image to transfer src
+                VkImageMemoryBarrier to_src{};
+                to_src.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                to_src.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+                to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                to_src.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+                to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                to_src.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                to_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                to_src.image = swapchain.images.back();
+                to_src.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                vkCmdPipelineBarrier(frame.command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                                     1, &to_src);
+
+                VkBufferImageCopy region{};
+                region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                region.imageExtent = {w, h, 1};
+                vkCmdCopyImageToBuffer(frame.command_buffer, swapchain.images.back(),
+                                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.buffer, 1, &region);
+
+                vkEndCommandBuffer(frame.command_buffer);
+                VkSubmitInfo sub{};
+                sub.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+                sub.commandBufferCount = 1;
+                sub.pCommandBuffers = &frame.command_buffer;
+                vkQueueSubmit(graphics_queue, 1, &sub, VK_NULL_HANDLE);
+                vkQueueWaitIdle(graphics_queue);
+
+                void* mapped = nullptr;
+                if (vkMapMemory(device, readback.memory, 0, buf_size, 0, &mapped) == VK_SUCCESS) {
+                    const uint8_t* pixels = static_cast<const uint8_t*>(mapped);
+                    std::ofstream ppm(config.screenshot_path, std::ios::binary);
+                    if (ppm) {
+                        ppm << "P6\n" << w << " " << h << "\n255\n";
+                        for (uint32_t i = 0; i < w * h; ++i) {
+                            // BGRA -> RGB
+                            ppm.put(static_cast<char>(pixels[i * 4 + 2]));
+                            ppm.put(static_cast<char>(pixels[i * 4 + 1]));
+                            ppm.put(static_cast<char>(pixels[i * 4 + 0]));
+                        }
+                    }
+                    vkUnmapMemory(device, readback.memory);
+                }
+                destroy_uploaded_buffer(device, readback);
+            }
+        }
+
         report.status = report.present_loop_completed ? "window, surface, device, and swapchain created successfully"
                                                      : "bootstrap completed but present loop ended early";
         cleanup();

@@ -542,4 +542,35 @@ MeshData load_mesh(const BuildManifest& manifest) {
                        " (first-pass builder supports .obj, .gltf, and .glb)");
 }
 
+void compute_smooth_normals(MeshData& mesh) {
+    const size_t vertex_count = mesh.positions.size();
+    mesh.normals.assign(vertex_count, Vec3f{0.0f, 0.0f, 0.0f});
+
+    for (const MeshSection& section : mesh.sections) {
+        for (size_t i = 0; i + 2 < section.indices.size(); i += 3) {
+            const uint32_t i0 = section.indices[i];
+            const uint32_t i1 = section.indices[i + 1];
+            const uint32_t i2 = section.indices[i + 2];
+            const Vec3f& p0 = mesh.positions[i0];
+            const Vec3f& p1 = mesh.positions[i1];
+            const Vec3f& p2 = mesh.positions[i2];
+            const Vec3f e1 = {p1.x - p0.x, p1.y - p0.y, p1.z - p0.z};
+            const Vec3f e2 = {p2.x - p0.x, p2.y - p0.y, p2.z - p0.z};
+            const Vec3f fn = {e1.y * e2.z - e1.z * e2.y,
+                              e1.z * e2.x - e1.x * e2.z,
+                              e1.x * e2.y - e1.y * e2.x};
+            mesh.normals[i0].x += fn.x; mesh.normals[i0].y += fn.y; mesh.normals[i0].z += fn.z;
+            mesh.normals[i1].x += fn.x; mesh.normals[i1].y += fn.y; mesh.normals[i1].z += fn.z;
+            mesh.normals[i2].x += fn.x; mesh.normals[i2].y += fn.y; mesh.normals[i2].z += fn.z;
+        }
+    }
+
+    for (Vec3f& n : mesh.normals) {
+        const float len = std::sqrt(n.x * n.x + n.y * n.y + n.z * n.z);
+        if (len > 1e-8f) {
+            n.x /= len; n.y /= len; n.z /= len;
+        }
+    }
+}
+
 }  // namespace meridian::detail

@@ -150,6 +150,7 @@ struct MeshSection {
 
 struct MeshData {
     std::vector<Vec3f> positions;
+    std::vector<Vec3f> normals;
     std::vector<MeshSection> sections;
     std::vector<unsigned char> vertex_locks;
     struct VertexSeamAttributes {
@@ -293,6 +294,7 @@ inline Bounds3f resolve_resource_bounds(const BuildManifest& manifest, const Bou
 
 void validate_manifest(const BuildManifest& manifest);
 MeshData load_mesh(const BuildManifest& manifest);
+void compute_smooth_normals(MeshData& mesh);
 
 clodConfig make_clod_config(const BuildManifest& manifest);
 void build_section_base_clusters(const MeshData& mesh, const MeshSection& section,
