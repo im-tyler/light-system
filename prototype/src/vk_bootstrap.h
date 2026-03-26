@@ -13,7 +13,7 @@ struct VkBootstrapConfig {
     bool interactive = false;
     uint32_t window_width = 1280;
     uint32_t window_height = 720;
-    uint32_t present_frame_count = 3;
+    uint32_t present_frame_count = 120;
     float debug_error_threshold = 0.001f;
     uint32_t resident_budget = 0xffffffffu;
     uint32_t eviction_grace_frames = 1;

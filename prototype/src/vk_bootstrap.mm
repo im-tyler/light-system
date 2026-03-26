@@ -39,6 +39,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <numeric>
 #include <set>
 #include <sstream>
 #include <string>
@@ -4049,6 +4050,7 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
         double last_frame_time = glfwGetTime();
         uint32_t fps_frame_count = 0;
         double fps_timer = last_frame_time;
+        std::vector<double> frame_times_ms;
 
         ResidencyModel residency_model = create_residency_model(resource);
         snapshot_page_residency(report.uploadable_scene, residency_model);
@@ -4229,7 +4231,6 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                                                       std::max(0.01f, radius * 0.01f), radius * 8.0f);
                 camera_frame.view_projection = multiply_matrix(proj, view);
 
-                // FPS display
                 fps_frame_count++;
                 if (now - fps_timer >= 1.0) {
                     char title[256];
@@ -4242,6 +4243,15 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                     fps_frame_count = 0;
                     fps_timer = now;
                 }
+            }
+
+            // Frame timing (common path)
+            {
+                const double frame_now = glfwGetTime();
+                if (frame_index > 2) {
+                    frame_times_ms.push_back((frame_now - last_frame_time) * 1000.0);
+                }
+                last_frame_time = frame_now;
             }
 
             report.runtime_completed_page_count = complete_loading_pages(residency_model, frame_index);
@@ -4392,6 +4402,17 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                                        report);
         }
         report.present_loop_completed = report.presented_frame_count == config.present_frame_count;
+
+        // Frame timing report
+        if (!frame_times_ms.empty()) {
+            std::sort(frame_times_ms.begin(), frame_times_ms.end());
+            const double median = frame_times_ms[frame_times_ms.size() / 2];
+            const double p99 = frame_times_ms[static_cast<size_t>(frame_times_ms.size() * 0.99)];
+            const double avg = std::accumulate(frame_times_ms.begin(), frame_times_ms.end(), 0.0)
+                               / static_cast<double>(frame_times_ms.size());
+            std::fprintf(stderr, "MERIDIAN_BENCHMARK: median_ms=%.2f p99_ms=%.2f avg_ms=%.2f avg_fps=%.1f samples=%zu\n",
+                         median, p99, avg, 1000.0 / avg, frame_times_ms.size());
+        }
         if (compute_cull.counter.buffer != VK_NULL_HANDLE) {
             void* mapped = nullptr;
             if (vkMapMemory(device, compute_cull.counter.memory, 0, sizeof(uint32_t), 0, &mapped) == VK_SUCCESS) {
