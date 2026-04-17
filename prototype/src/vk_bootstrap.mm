@@ -3,6 +3,7 @@
 #include "vk_helpers.h"
 #include "gpu_profiler.h"
 #include "math_utils.h"
+#include "async_reader.h"
 #include "runtime_model.h"
 #include "shader_loader.h"
 #include "streaming_scheduler.h"
@@ -1926,6 +1927,12 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
         // loads from frame 0. Default path leaves every page resident for the
         // existing "all-in-memory" benchmark behavior.
         std::vector<uint32_t> page_load_start_frame(residency_model.pages.size(), 0xffffffffu);
+        // Per-page absolute file offset + size, filled when async I/O is on.
+        struct PageFileRange { uint64_t offset = 0; uint32_t size = 0; };
+        std::vector<PageFileRange> page_file_ranges(residency_model.pages.size());
+        AsyncReader async_reader;
+        std::filesystem::path temp_vgeo_path;
+        bool async_io_active = false;
         StreamingScheduler streaming_scheduler;
         if (config.demand_streaming) {
             for (PageResidencyEntry& entry : residency_model.pages) {
@@ -1970,6 +1977,38 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             sc.max_loads_per_frame = config.streaming_max_loads_per_frame;
             sc.eviction_grace_frames = config.eviction_grace_frames;
             streaming_scheduler = create_streaming_scheduler(resource, sc);
+
+            // Real async disk I/O path: serialize the resource to a temp
+            // .vgeo and open it for pread() on a worker thread. Each page
+            // load turns into an actual disk read. If anything fails here
+            // we fall back to the latency-window simulation (async_io_active
+            // stays false).
+            try {
+                const std::string unique =
+                    std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+                temp_vgeo_path = std::filesystem::temp_directory_path() /
+                                 (std::string("meridian-stream-") + unique + ".vgeo");
+                write_resource(resource, temp_vgeo_path);
+                const VGeoPayloadOffsets payload_offsets = compute_payload_offsets(resource);
+                for (uint32_t p = 0; p < resource.pages.size(); ++p) {
+                    const PageRecord& page = resource.pages[p];
+                    const uint64_t base = (page.lod_cluster_count != 0)
+                                              ? payload_offsets.lod_geometry_payload_offset
+                                              : payload_offsets.cluster_geometry_payload_offset;
+                    page_file_ranges[p] = {base + page.byte_offset, page.uncompressed_byte_size};
+                }
+                async_io_active = async_reader.open(temp_vgeo_path);
+                if (!async_io_active) {
+                    std::fprintf(stderr,
+                                 "MERIDIAN_STREAM: async_reader.open failed, "
+                                 "falling back to latency simulation\n");
+                }
+            } catch (const std::exception& e) {
+                std::fprintf(stderr,
+                             "MERIDIAN_STREAM: temp .vgeo write failed (%s), "
+                             "falling back to latency simulation\n", e.what());
+                async_io_active = false;
+            }
         }
         snapshot_page_residency(report.uploadable_scene, residency_model);
         result = update_vector_buffer(device, report.uploadable_scene.page_residency,
@@ -2173,20 +2212,36 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                 last_frame_time = frame_now;
             }
 
-            // Async-load completion: when demand streaming is active, each
-            // page that entered the loading state `streaming_load_latency_frames`
-            // ago now becomes resident. The default (non-streaming) path keeps
-            // the old "complete instantly" behavior so benchmark numbers stay
-            // comparable to prior sessions.
+            // Async-load completion. Two paths:
+            //   * Real async I/O (async_io_active): drain completions from
+            //     the worker thread that just finished pread()ing the page's
+            //     byte range from the temp .vgeo. Completion time reflects
+            //     actual disk latency + worker scheduling.
+            //   * Simulated (fallback): a page that entered the loading state
+            //     streaming_load_latency_frames ago now becomes resident.
+            //   * Non-streaming default: complete_loading_pages transitions
+            //     every loading page to resident instantly.
             std::vector<uint32_t> completed_this_frame;
             if (config.demand_streaming) {
-                for (uint32_t p = 0; p < residency_model.pages.size(); ++p) {
-                    if (residency_model.pages[p].state == PageResidencyState::loading &&
-                        page_load_start_frame[p] != 0xffffffffu &&
-                        frame_index - page_load_start_frame[p] >=
-                            config.streaming_load_latency_frames) {
-                        completed_this_frame.push_back(p);
-                        page_load_start_frame[p] = 0xffffffffu;
+                if (async_io_active) {
+                    const auto reads = async_reader.drain_completions();
+                    for (const auto& r : reads) {
+                        if (!r.success) continue;
+                        if (r.page_index >= residency_model.pages.size()) continue;
+                        if (residency_model.pages[r.page_index].state !=
+                            PageResidencyState::loading) continue;
+                        completed_this_frame.push_back(r.page_index);
+                        page_load_start_frame[r.page_index] = 0xffffffffu;
+                    }
+                } else {
+                    for (uint32_t p = 0; p < residency_model.pages.size(); ++p) {
+                        if (residency_model.pages[p].state == PageResidencyState::loading &&
+                            page_load_start_frame[p] != 0xffffffffu &&
+                            frame_index - page_load_start_frame[p] >=
+                                config.streaming_load_latency_frames) {
+                            completed_this_frame.push_back(p);
+                            page_load_start_frame[p] = 0xffffffffu;
+                        }
                     }
                 }
                 report.runtime_completed_page_count =
@@ -2246,11 +2301,21 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                 step_residency(residency_model, residency_input);
             if (config.demand_streaming) {
                 // Any page that step_residency advanced to `loading` this
-                // frame needs its load-start timestamp recorded so we can
-                // later complete it after the latency window.
+                // frame needs its load-start timestamp recorded (for the
+                // simulation fallback) AND its real pread submitted to the
+                // worker thread (for the async I/O path). The scheduler's
+                // throttle guarantees we won't spam the worker.
                 for (uint32_t p : residency_update.loading_pages) {
                     if (p < page_load_start_frame.size()) {
                         page_load_start_frame[p] = frame_index;
+                    }
+                    if (async_io_active && p < page_file_ranges.size() &&
+                        page_file_ranges[p].size > 0) {
+                        AsyncReadJob job{};
+                        job.offset = page_file_ranges[p].offset;
+                        job.size = page_file_ranges[p].size;
+                        job.page_index = p;
+                        async_reader.submit(job);
                     }
                 }
             }
@@ -2639,6 +2704,16 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
         }
 
         vkDeviceWaitIdle(device);
+        // Tear down the async reader and remove the temp .vgeo before the
+        // visibility readback / cleanup path runs. Closing here instead of
+        // in `cleanup` keeps the reader local to the streaming block where
+        // it lives.
+        if (async_io_active) {
+            async_reader.close();
+            async_io_active = false;
+            std::error_code ec;
+            std::filesystem::remove(temp_vgeo_path, ec);
+        }
         if (report.presented_frame_count > 0) {
             analyze_visibility_readback(device, swapchain, debug_render, last_submitted_selection,
                                        report);

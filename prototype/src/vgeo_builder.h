@@ -190,4 +190,15 @@ TraversalSelection simulate_traversal(const VGeoResource& resource, float error_
 void write_resource(const VGeoResource& resource, const std::filesystem::path& output_path);
 void write_summary(const VGeoResource& resource, const std::filesystem::path& output_path);
 
+// File-space offsets of the two payload regions within a serialized .vgeo.
+// Computed from the resource's in-memory counts (same math write_resource
+// uses), so callers that want to pread() a single page's bytes from disk
+// can map `page.byte_offset` into an absolute file offset without re-
+// parsing the header.
+struct VGeoPayloadOffsets {
+    std::uint64_t cluster_geometry_payload_offset = 0;
+    std::uint64_t lod_geometry_payload_offset = 0;
+};
+VGeoPayloadOffsets compute_payload_offsets(const VGeoResource& resource);
+
 }  // namespace meridian

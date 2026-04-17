@@ -347,3 +347,33 @@ void write_summary(const VGeoResource& resource, const std::filesystem::path& ou
 }
 
 }  // namespace meridian::detail
+
+namespace meridian {
+
+VGeoPayloadOffsets compute_payload_offsets(const VGeoResource& resource) {
+    using namespace meridian::detail;
+    const uint64_t metadata_offset = sizeof(FileHeader) + sizeof(SummaryBlockDisk);
+    const uint64_t material_table_offset = metadata_offset + sizeof(ResourceMetadata);
+    const uint64_t hierarchy_table_offset =
+        material_table_offset + (resource.material_sections.size() * sizeof(MaterialSectionDisk));
+    const uint64_t page_dependency_table_offset =
+        hierarchy_table_offset + (resource.hierarchy_nodes.size() * sizeof(HierarchyNodeDisk));
+    const uint64_t node_lod_link_table_offset =
+        page_dependency_table_offset + (resource.page_dependencies.size() * sizeof(uint32_t));
+    const uint64_t cluster_table_offset =
+        node_lod_link_table_offset + (resource.node_lod_links.size() * sizeof(NodeLodLinkDisk));
+    const uint64_t page_table_offset =
+        cluster_table_offset + (resource.clusters.size() * sizeof(ClusterRecordDisk));
+    const uint64_t lod_group_table_offset =
+        page_table_offset + (resource.pages.size() * sizeof(PageRecordDisk));
+    const uint64_t lod_cluster_table_offset =
+        lod_group_table_offset + (resource.lod_groups.size() * sizeof(LodGroupRecordDisk));
+    VGeoPayloadOffsets offsets{};
+    offsets.cluster_geometry_payload_offset =
+        lod_cluster_table_offset + (resource.lod_clusters.size() * sizeof(LodClusterRecordDisk));
+    offsets.lod_geometry_payload_offset =
+        offsets.cluster_geometry_payload_offset + resource.cluster_geometry_payload.size();
+    return offsets;
+}
+
+}  // namespace meridian

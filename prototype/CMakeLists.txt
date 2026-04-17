@@ -35,6 +35,7 @@ add_library(vgeo_builder
     src/vgeo_builder.cpp
     src/runtime_model.cpp
     src/streaming_scheduler.cpp
+    src/async_reader.cpp
     src/resource_upload.cpp
     src/gpu_profiler.cpp
     src/vk_bootstrap.mm

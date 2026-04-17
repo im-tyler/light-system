@@ -61,7 +61,7 @@ Last updated: 2026-04-16
 ## Streaming
 
 - [x] connect streaming_scheduler.cpp to frame loop (request/load/evict state machine, gated behind `--demand-streaming`)
-- [ ] real async disk I/O for non-blocking page loads (currently simulated via N-frame latency window; next step is mmapped .vgeo + GCD or POSIX AIO for actual reads)
+- [x] real async disk I/O for non-blocking page loads (AsyncReader: worker thread + pread(); serialises the resource to a temp .vgeo on demand-streaming startup, submits real reads for page byte ranges, drains completions on the main thread to transition pages from loading -> resident)
 - [x] staging buffer for device-local memory (`create_device_local_buffer_staged` routes payload uploads through a HOST_VISIBLE staging buffer + vkCmdCopyBuffer; transparently falls back to the existing HOST_COHERENT path on unified-memory platforms like Apple Silicon where DEVICE_LOCAL and HOST_VISIBLE share the same heap)
 - [x] root-page autodetect so the demand-streaming seed set doesn't rely on index-0 ordering (seed = pages picked by a coarse `simulate_traversal` with all-resident mask + infinite error threshold, capped at `streaming_seed_pages`)
 
