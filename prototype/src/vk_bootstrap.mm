@@ -2091,6 +2091,27 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             // same buffers the GPU selection shader used to populate. This replaces
             // the serial DFS compute dispatch (was ~18ms on 1M-tri city on M4) with
             // CPU traversal + HOST_COHERENT write (~1-3ms total).
+            //
+            // Filters applied here:
+            //   1. Frustum AABB test (base + LOD) -- mirrors instance_cull but at
+            //      cluster granularity. Assumes cluster bounds are world-space
+            //      (single-instance / identity transform scenes).
+            //   2. Normal-cone backface cull (base only, LOD clusters don't carry cones).
+            const FrustumPlanes frustum =
+                extract_frustum_planes(camera_frame.view_projection);
+            auto aabb_outside_frustum = [&](const float bmin[4], const float bmax[4]) -> bool {
+                for (int p = 0; p < 6; ++p) {
+                    const float nx = frustum.planes[p][0];
+                    const float ny = frustum.planes[p][1];
+                    const float nz = frustum.planes[p][2];
+                    const float d  = frustum.planes[p][3];
+                    const float px = nx > 0.0f ? bmax[0] : bmin[0];
+                    const float py = ny > 0.0f ? bmax[1] : bmin[1];
+                    const float pz = nz > 0.0f ? bmax[2] : bmin[2];
+                    if (nx * px + ny * py + nz * pz + d < 0.0f) return true;
+                }
+                return false;
+            };
             {
                 std::vector<GpuDrawEntry> cpu_draws;
                 cpu_draws.reserve(selection_for_frame.selected_cluster_indices.size() +
@@ -2098,6 +2119,7 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                 const Vec3f cam = camera_frame.camera_position;
                 for (const uint32_t ci : selection_for_frame.selected_cluster_indices) {
                     const GpuClusterRecord& c = report.uploadable_scene.clusters[ci];
+                    if (aabb_outside_frustum(c.bounds_min.data(), c.bounds_max.data())) continue;
                     // Normal-cone backface cull (mirrors shader is_base_cluster_backfacing).
                     // Cone packing: xyz = cone axis, w = cone cutoff. Cutoff >= 1.0 means
                     // meshoptimizer could not compute a useful cone; do not cull.
@@ -2132,6 +2154,7 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                 }
                 for (const uint32_t ci : selection_for_frame.selected_lod_cluster_indices) {
                     const GpuLodClusterRecord& c = report.uploadable_scene.lod_clusters[ci];
+                    if (aabb_outside_frustum(c.bounds_min.data(), c.bounds_max.data())) continue;
                     GpuDrawEntry e{};
                     e.draw_vertex_count = c.local_triangle_count * 3u;
                     e.draw_instance_count = 1u;
@@ -2157,7 +2180,7 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                 }
             }
 
-            const FrustumPlanes frustum = extract_frustum_planes(camera_frame.view_projection);
+            // frustum was already extracted above for cluster-level CPU culling
             result = record_debug_command_buffer(frame, debug_render, compute_cull, compute_selection,
                                                  hzb, occlusion_refine, shadow, swapchain,
                                                  camera_frame, frustum, config.debug_error_threshold,
