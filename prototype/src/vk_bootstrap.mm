@@ -1162,49 +1162,20 @@ VkResult record_debug_command_buffer(FrameContext& frame, const DebugRenderConte
                             profiler.query_pool, 2); // sel start
     }
 
-    // Compute cluster/LOD selection pass
-    if (compute_selection.pipeline != VK_NULL_HANDLE &&
-        compute_selection.descriptor_set != VK_NULL_HANDLE) {
-        vkCmdFillBuffer(frame.command_buffer, compute_selection.draw_count.buffer, 0,
-                        sizeof(uint32_t), 0);
-        vkCmdFillBuffer(frame.command_buffer, compute_selection.draw_list.buffer, 0,
-                        compute_selection.draw_list.size, 0);
-
-        VkMemoryBarrier fill_barrier{};
-        fill_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        fill_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        fill_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-        vkCmdPipelineBarrier(frame.command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &fill_barrier,
-                             0, nullptr, 0, nullptr);
-
-        vkCmdBindPipeline(frame.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                          compute_selection.pipeline);
-        vkCmdBindDescriptorSets(frame.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                compute_selection.pipeline_layout, 0, 1,
-                                &compute_selection.descriptor_set, 0, nullptr);
-
-        SelectionPushConstants sel_push{};
-        sel_push.error_threshold = error_threshold;
-        sel_push.camera_pos[0] = camera_frame.camera_position.x;
-        sel_push.camera_pos[1] = camera_frame.camera_position.y;
-        sel_push.camera_pos[2] = camera_frame.camera_position.z;
-        vkCmdPushConstants(frame.command_buffer, compute_selection.pipeline_layout,
-                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(SelectionPushConstants), &sel_push);
-
-        // One thread per visible instance (driven by cull output)
-        const uint32_t group_count = (compute_cull.max_instances + 63) / 64;
-        vkCmdDispatch(frame.command_buffer, std::max(group_count, 1u), 1, 1);
-
-        VkMemoryBarrier sel_barrier{};
-        sel_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        sel_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        sel_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT |
-                                    VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
-        vkCmdPipelineBarrier(frame.command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT |
+    // Selection runs on CPU (simulate_traversal) and its output is uploaded into
+    // compute_selection.draw_list / .draw_count before command buffer recording.
+    // The GPU selection compute shader is retained but not dispatched; kept for
+    // future use once parallel traversal replaces serial DFS.
+    if (compute_selection.draw_list.buffer != VK_NULL_HANDLE) {
+        VkMemoryBarrier host_write_barrier{};
+        host_write_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        host_write_barrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+        host_write_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
+                                           VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+        vkCmdPipelineBarrier(frame.command_buffer, VK_PIPELINE_STAGE_HOST_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
                              VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
-                             0, 1, &sel_barrier, 0, nullptr, 0, nullptr);
+                             0, 1, &host_write_barrier, 0, nullptr, 0, nullptr);
     }
 
     if (profiler.query_pool != VK_NULL_HANDLE) {
@@ -2115,6 +2086,76 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             frame_ubo_data.light_dir[3] = 0.0f;
             update_uploaded_buffer(device, &frame_ubo_data, sizeof(FrameUBO),
                                    debug_render.frame_ubo);
+
+            // Convert CPU TraversalSelection to GpuDrawEntry list and upload to the
+            // same buffers the GPU selection shader used to populate. This replaces
+            // the serial DFS compute dispatch (was ~18ms on 1M-tri city on M4) with
+            // CPU traversal + HOST_COHERENT write (~1-3ms total).
+            {
+                std::vector<GpuDrawEntry> cpu_draws;
+                cpu_draws.reserve(selection_for_frame.selected_cluster_indices.size() +
+                                  selection_for_frame.selected_lod_cluster_indices.size());
+                const Vec3f cam = camera_frame.camera_position;
+                for (const uint32_t ci : selection_for_frame.selected_cluster_indices) {
+                    const GpuClusterRecord& c = report.uploadable_scene.clusters[ci];
+                    // Normal-cone backface cull (mirrors shader is_base_cluster_backfacing).
+                    // Cone packing: xyz = cone axis, w = cone cutoff. Cutoff >= 1.0 means
+                    // meshoptimizer could not compute a useful cone; do not cull.
+                    const float cone_cutoff = c.normal_cone[3];
+                    if (cone_cutoff < 1.0f) {
+                        const float cx = (c.bounds_min[0] + c.bounds_max[0]) * 0.5f;
+                        const float cy = (c.bounds_min[1] + c.bounds_max[1]) * 0.5f;
+                        const float cz = (c.bounds_min[2] + c.bounds_max[2]) * 0.5f;
+                        float vx = cx - cam.x;
+                        float vy = cy - cam.y;
+                        float vz = cz - cam.z;
+                        const float len = std::sqrt(vx * vx + vy * vy + vz * vz);
+                        if (len > 1e-6f) {
+                            const float inv = 1.0f / len;
+                            vx *= inv; vy *= inv; vz *= inv;
+                        }
+                        const float d = vx * c.normal_cone[0] +
+                                        vy * c.normal_cone[1] +
+                                        vz * c.normal_cone[2];
+                        if (d < -cone_cutoff) continue;
+                    }
+                    GpuDrawEntry e{};
+                    e.draw_vertex_count = c.local_triangle_count * 3u;
+                    e.draw_instance_count = 1u;
+                    e.draw_first_vertex = 0u;
+                    e.draw_first_instance = static_cast<uint32_t>(cpu_draws.size());
+                    e.cluster_index = ci;
+                    e.geometry_kind = 0u;
+                    e.payload_offset = c.payload_offset;
+                    e.local_vertex_count = c.local_vertex_count;
+                    cpu_draws.push_back(e);
+                }
+                for (const uint32_t ci : selection_for_frame.selected_lod_cluster_indices) {
+                    const GpuLodClusterRecord& c = report.uploadable_scene.lod_clusters[ci];
+                    GpuDrawEntry e{};
+                    e.draw_vertex_count = c.local_triangle_count * 3u;
+                    e.draw_instance_count = 1u;
+                    e.draw_first_vertex = 0u;
+                    e.draw_first_instance = static_cast<uint32_t>(cpu_draws.size());
+                    e.cluster_index = ci;
+                    e.geometry_kind = 1u;
+                    e.payload_offset = c.payload_offset;
+                    e.local_vertex_count = c.local_vertex_count;
+                    cpu_draws.push_back(e);
+                }
+                const uint32_t cpu_draw_count = static_cast<uint32_t>(cpu_draws.size());
+                if (cpu_draw_count > 0 &&
+                    compute_selection.draw_list.buffer != VK_NULL_HANDLE) {
+                    update_uploaded_buffer(device, cpu_draws.data(),
+                                           static_cast<VkDeviceSize>(cpu_draw_count) *
+                                               sizeof(GpuDrawEntry),
+                                           compute_selection.draw_list);
+                }
+                if (compute_selection.draw_count.buffer != VK_NULL_HANDLE) {
+                    update_uploaded_buffer(device, &cpu_draw_count, sizeof(uint32_t),
+                                           compute_selection.draw_count);
+                }
+            }
 
             const FrustumPlanes frustum = extract_frustum_planes(camera_frame.view_projection);
             result = record_debug_command_buffer(frame, debug_render, compute_cull, compute_selection,
