@@ -191,7 +191,13 @@ struct ShadowContext {
     VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
     VkDescriptorSetLayout descriptor_set_layout = VK_NULL_HANDLE;
-    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    // Per-cascade descriptor sets + draw buffers. Each cascade samples the
+    // same payload + frame UBO but pulls its draw list from its own buffer,
+    // which the CPU fills with clusters that pass that cascade's frustum test.
+    VkDescriptorSet cascade_descriptor_sets[kShadowCascadeCount] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
+    UploadedBuffer cascade_draw_lists[kShadowCascadeCount];
+    UploadedBuffer cascade_draw_counts[kShadowCascadeCount];
+    uint32_t max_draws_per_cascade = 0;
     uint32_t resolution = 0;
     CascadeLightSetup cascades{};
     float scene_radius = 1.0f;
@@ -237,7 +243,7 @@ VkResult create_occlusion_refine_context(VkPhysicalDevice physical_device, VkDev
 VkResult create_shadow_context(VkPhysicalDevice physical_device, VkDevice device,
                                const UploadedSceneBuffers& scene_buffers,
                                const UploadedBuffer& frame_ubo,
-                               const UploadedBuffer& draw_list,
+                               uint32_t max_draws_per_cascade,
                                const VGeoResource& resource,
                                uint32_t shadow_resolution,
                                ShadowContext& context);

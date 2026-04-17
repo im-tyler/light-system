@@ -56,7 +56,7 @@ Last updated: 2026-04-16
 - [x] meshlet boundary seams (angle-weighted smooth normals + position welding of vertex normals across index-split duplicates in the source mesh)
 - [x] PCF shadow filtering (8-tap Poisson disk + per-pixel rotation, slope-scaled bias)
 - [x] cascaded shadow maps for outdoor / large scenes (3-cascade, log/uniform split blend, manual depth compare to work around MoltenVK sampler2DArrayShadow limitation)
-- [ ] per-cascade frustum culling to reduce 3x draw-submit cost
+- [x] per-cascade frustum culling to reduce 3x draw-submit cost (each cascade now pulls a CPU-filtered subset of the main draw list against its own orthographic frustum; shadow.cascade_draw_lists[3] + shadow.cascade_descriptor_sets[3])
 
 ## Streaming
 

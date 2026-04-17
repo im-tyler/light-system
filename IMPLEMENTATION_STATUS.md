@@ -62,10 +62,10 @@ GPU timestamp profiler emits `MERIDIAN_GPU: cull=.. sel=.. occ=.. shadow=.. main
 
 ### Performance (Apple M4, MoltenVK, 1280x720)
 
-Stanford Dragon (871K tris): median 29.2ms / 33.8 FPS with 3-cascade CSM + 8-tap Poisson PCF (baseline pre-CSM: 17.1ms / 53-72 FPS with PCF, single shadow map)
-Massive City (1M tris): median 70.7ms / 14.1 FPS with 3-cascade CSM + 8-tap Poisson PCF (baseline pre-CSM: 55.6ms / 17.9 FPS)
+Stanford Dragon (871K tris): median 24.0ms / 41 FPS with 3-cascade CSM + per-cascade culling + 8-tap Poisson PCF
+Massive City (1M tris): median 66.7ms / 14.9 FPS with 3-cascade CSM + per-cascade culling + 8-tap Poisson PCF
 
-The 11-15ms CSM regression is almost entirely MoltenVK vkQueueSubmit overhead from tripling shadow draws (each cascade re-submits the full camera draw list). Per-cascade frustum culling would claw most of this back.
+Per-cascade culling closed ~8ms of the CSM regression on Dragon (32 -> 24ms) and ~6ms on City (73 -> 67ms) by filtering the CPU draw list against each cascade's orthographic frustum before submitting, so most clusters land in only one or two cascades instead of all three.
 
 Per-pass GPU (Dragon, steady state): cull 0.1ms, sel 0.0ms (CPU), occ 0.05ms, shadow 3-4ms, main 3-4ms, hzb 0.1-0.2ms.
 
@@ -76,7 +76,6 @@ Per-frame CPU (emitted every 60 frames as `MERIDIAN_CPU: ...`):
 
 ## Not Yet Implemented
 
-- Per-cascade frustum culling (shadow pass submits the full camera-culled draw list to each cascade -- 3x vkCmdDrawIndirect cost under MoltenVK)
 - Per-cluster backface culling with normal cones on LOD clusters (currently base only; many LOD clusters have cones but shader `emit_lod` skips the test)
 - CPU cluster-level frustum culling
 - Real streaming scheduler (CPU prototype exists but pages start all-resident)

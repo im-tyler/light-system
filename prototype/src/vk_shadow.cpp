@@ -24,11 +24,12 @@ namespace meridian {
 VkResult create_shadow_context(VkPhysicalDevice physical_device, VkDevice device,
                                const UploadedSceneBuffers& scene_buffers,
                                const UploadedBuffer& frame_ubo,
-                               const UploadedBuffer& draw_list,
+                               uint32_t max_draws_per_cascade,
                                const VGeoResource& resource,
                                uint32_t shadow_resolution,
                                ShadowContext& context) {
     context.resolution = shadow_resolution;
+    context.max_draws_per_cascade = max_draws_per_cascade;
 
     // 2D array depth image, one layer per cascade.
     VkFormat depth_format = find_depth_format(physical_device);
@@ -262,70 +263,102 @@ VkResult create_shadow_context(VkPhysicalDevice physical_device, VkDevice device
     vkDestroyShaderModule(device, vert_mod, nullptr);
     if (result != VK_SUCCESS) return result;
 
-    // Descriptor set binding payload SSBOs + frame UBO + draw list SSBO.
+    // Per-cascade draw list + draw count buffers. The CPU fills these each
+    // frame with the subset of the main draw list that falls inside each
+    // cascade's orthographic frustum. Sizing each buffer to the full cluster
+    // count is cheap (32 B / draw) and means the worst-case fallback where
+    // every cluster lands in every cascade still fits.
+    const VkDeviceSize per_cascade_list_bytes =
+        std::max<VkDeviceSize>(
+            static_cast<VkDeviceSize>(max_draws_per_cascade) * sizeof(GpuDrawEntry),
+            sizeof(GpuDrawEntry));
+    for (uint32_t c = 0; c < kShadowCascadeCount; ++c) {
+        result = create_uploaded_buffer(
+            physical_device, device, nullptr, per_cascade_list_bytes,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+            context.cascade_draw_lists[c]);
+        if (result != VK_SUCCESS) return result;
+
+        const uint32_t zero = 0;
+        result = create_uploaded_buffer(
+            physical_device, device, &zero, sizeof(uint32_t),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+            context.cascade_draw_counts[c]);
+        if (result != VK_SUCCESS) return result;
+    }
+
+    // Descriptor pool sized for 3 sets, each holding 3 storage buffers (two
+    // payload SSBOs + one per-cascade draw-list SSBO) + 1 uniform (frame UBO).
     VkDescriptorPoolSize shadow_pool_sizes[2] = {};
     shadow_pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    shadow_pool_sizes[0].descriptorCount = 3;
+    shadow_pool_sizes[0].descriptorCount = 3 * kShadowCascadeCount;
     shadow_pool_sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    shadow_pool_sizes[1].descriptorCount = 1;
+    shadow_pool_sizes[1].descriptorCount = kShadowCascadeCount;
     VkDescriptorPoolCreateInfo pool_info{};
     pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pool_info.maxSets = 1;
+    pool_info.maxSets = kShadowCascadeCount;
     pool_info.poolSizeCount = 2;
     pool_info.pPoolSizes = shadow_pool_sizes;
     result = vkCreateDescriptorPool(device, &pool_info, nullptr, &context.descriptor_pool);
     if (result != VK_SUCCESS) return result;
 
+    VkDescriptorSetLayout layouts[kShadowCascadeCount] = {};
+    for (uint32_t c = 0; c < kShadowCascadeCount; ++c) layouts[c] = context.descriptor_set_layout;
     VkDescriptorSetAllocateInfo ds_alloc{};
     ds_alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     ds_alloc.descriptorPool = context.descriptor_pool;
-    ds_alloc.descriptorSetCount = 1;
-    ds_alloc.pSetLayouts = &context.descriptor_set_layout;
-    result = vkAllocateDescriptorSets(device, &ds_alloc, &context.descriptor_set);
+    ds_alloc.descriptorSetCount = kShadowCascadeCount;
+    ds_alloc.pSetLayouts = layouts;
+    result = vkAllocateDescriptorSets(device, &ds_alloc, context.cascade_descriptor_sets);
     if (result != VK_SUCCESS) return result;
 
-    VkDescriptorBufferInfo buf_infos[4] = {};
-    VkWriteDescriptorSet ds_writes[4] = {};
-    uint32_t wc = 0;
-    if (scene_buffers.base_payload.buffer != VK_NULL_HANDLE) {
-        buf_infos[wc] = {scene_buffers.base_payload.buffer, 0, scene_buffers.base_payload.size};
+    // Write bindings for each cascade set. Bindings 0-2 are shared (payloads,
+    // frame UBO); binding 3 is the cascade-specific draw list.
+    for (uint32_t c = 0; c < kShadowCascadeCount; ++c) {
+        VkDescriptorBufferInfo buf_infos[4] = {};
+        VkWriteDescriptorSet ds_writes[4] = {};
+        uint32_t wc = 0;
+        if (scene_buffers.base_payload.buffer != VK_NULL_HANDLE) {
+            buf_infos[wc] = {scene_buffers.base_payload.buffer, 0, scene_buffers.base_payload.size};
+            ds_writes[wc].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            ds_writes[wc].dstSet = context.cascade_descriptor_sets[c];
+            ds_writes[wc].dstBinding = 0;
+            ds_writes[wc].descriptorCount = 1;
+            ds_writes[wc].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            ds_writes[wc].pBufferInfo = &buf_infos[wc];
+            wc++;
+        }
+        if (scene_buffers.lod_payload.buffer != VK_NULL_HANDLE) {
+            buf_infos[wc] = {scene_buffers.lod_payload.buffer, 0, scene_buffers.lod_payload.size};
+            ds_writes[wc].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            ds_writes[wc].dstSet = context.cascade_descriptor_sets[c];
+            ds_writes[wc].dstBinding = 1;
+            ds_writes[wc].descriptorCount = 1;
+            ds_writes[wc].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            ds_writes[wc].pBufferInfo = &buf_infos[wc];
+            wc++;
+        }
+        buf_infos[wc] = {frame_ubo.buffer, 0, sizeof(FrameUBO)};
         ds_writes[wc].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        ds_writes[wc].dstSet = context.descriptor_set;
-        ds_writes[wc].dstBinding = 0;
+        ds_writes[wc].dstSet = context.cascade_descriptor_sets[c];
+        ds_writes[wc].dstBinding = 2;
         ds_writes[wc].descriptorCount = 1;
-        ds_writes[wc].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        ds_writes[wc].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         ds_writes[wc].pBufferInfo = &buf_infos[wc];
         wc++;
-    }
-    if (scene_buffers.lod_payload.buffer != VK_NULL_HANDLE) {
-        buf_infos[wc] = {scene_buffers.lod_payload.buffer, 0, scene_buffers.lod_payload.size};
+        buf_infos[wc] = {context.cascade_draw_lists[c].buffer, 0,
+                         context.cascade_draw_lists[c].size};
         ds_writes[wc].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        ds_writes[wc].dstSet = context.descriptor_set;
-        ds_writes[wc].dstBinding = 1;
-        ds_writes[wc].descriptorCount = 1;
-        ds_writes[wc].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        ds_writes[wc].pBufferInfo = &buf_infos[wc];
-        wc++;
-    }
-    buf_infos[wc] = {frame_ubo.buffer, 0, sizeof(FrameUBO)};
-    ds_writes[wc].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    ds_writes[wc].dstSet = context.descriptor_set;
-    ds_writes[wc].dstBinding = 2;
-    ds_writes[wc].descriptorCount = 1;
-    ds_writes[wc].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    ds_writes[wc].pBufferInfo = &buf_infos[wc];
-    wc++;
-    if (draw_list.buffer != VK_NULL_HANDLE) {
-        buf_infos[wc] = {draw_list.buffer, 0, draw_list.size};
-        ds_writes[wc].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        ds_writes[wc].dstSet = context.descriptor_set;
+        ds_writes[wc].dstSet = context.cascade_descriptor_sets[c];
         ds_writes[wc].dstBinding = 3;
         ds_writes[wc].descriptorCount = 1;
         ds_writes[wc].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         ds_writes[wc].pBufferInfo = &buf_infos[wc];
         wc++;
+        vkUpdateDescriptorSets(device, wc, ds_writes, 0, nullptr);
     }
-    vkUpdateDescriptorSets(device, wc, ds_writes, 0, nullptr);
 
     // Cache scene radius so the per-frame CSM fit can size the caster-extent
     // push-back consistently across frames.
