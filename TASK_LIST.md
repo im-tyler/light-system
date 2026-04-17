@@ -1,6 +1,6 @@
 # Task List
 
-Last updated: 2026-04-02
+Last updated: 2026-04-16
 
 ## Completed
 
@@ -39,29 +39,38 @@ Last updated: 2026-04-02
 - [x] Stanford Dragon downloaded and built (871K tris, 8871 clusters, 56MB .vgeo)
 - [x] 1M-triangle procedural city generated (31K clusters, 104MB .vgeo)
 
-## Next Priority: Rendering Quality
+## Performance (done / open)
 
-These directly affect visual output and must be fixed before the renderer looks credible:
+- [x] GPU profiler -- Vulkan timestamp queries per pass, `MERIDIAN_GPU:` line every frame
+- [x] vkCmdDrawIndirectCount with runtime extension probe + fallback to vkCmdDrawIndirect
+- [x] hoist cluster/LOD selection to CPU (serial GPU DFS was 10-18ms on M4; replaced with CPU simulate_traversal + HOST_COHERENT upload)
+- [x] per-cluster backface culling via meshlet normal cones (base clusters only; LOD clusters still unculled)
+- [ ] reconcile CPU/GPU selection divergence on sparse-LOD-link scenes (city emits 0 LOD on CPU vs LOD-heavy on GPU)
+- [ ] investigate/fix city builder producing only 8 node-LOD links for 6230 LOD groups
+- [ ] CPU cluster-level frustum culling (only instance-level runs today)
+- [ ] profile the ~9ms CPU-side overhead still remaining after the sel hoist
 
-- [x] smooth vertex normals from source mesh (normals stored in payload, interpolated in vertex shader)
-- [-] fix meshlet boundary seams (partially addressed by smooth normals; shared-vertex merging at cluster boundaries still needed)
-- [ ] per-cluster backface culling using meshlet normal cones
-- [ ] better shadow map quality (PCF filtering, cascaded shadow maps for large scenes)
+## Rendering Quality
 
-## Next Priority: Performance
+- [x] smooth vertex normals from source mesh
+- [-] meshlet boundary seams (partially addressed by smooth normals; shared-vertex merging still needed)
+- [ ] PCF shadow filtering
+- [ ] cascaded shadow maps for outdoor / large scenes
 
-- [ ] vkCmdDrawIndirectCount optimization (vkCmdDrawIndirect works but uses max_draws, causing no-op draws for zero-instance entries; needs actual count buffer)
-- [ ] frame timing and GPU profiling (Vulkan timestamp queries per pass)
+## Streaming
 
-## Next Priority: Streaming
-
-- [ ] CPU streaming scheduler with real page loading/eviction
+- [ ] connect streaming_scheduler.cpp to frame loop (request/load/evict state machine)
 - [ ] async disk I/O for non-blocking page loads
 - [ ] staging buffer for device-local memory
+
+## Traversal (deferred)
+
+- [ ] parallel GPU traversal (BFS-per-level or workgroup-DFS) to replace the retained-but-not-dispatched serial compute_select.comp; worth building only after profiling proves CPU selection is actually the bottleneck for some class of scene
 
 ## Later
 
 - [ ] benchmark automation vs stock Godot
 - [ ] broader glTF import coverage
+- [ ] texture / UV support
 - [ ] compressed geometry payloads
 - [ ] deeper Godot runtime integration

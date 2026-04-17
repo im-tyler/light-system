@@ -1,6 +1,6 @@
 # Implementation Status
 
-Last updated: 2026-04-02
+Last updated: 2026-04-16
 
 ## Phase 1: Offline Builder (Complete)
 
@@ -18,21 +18,22 @@ Last updated: 2026-04-02
 
 ### GPU Pipeline (Working)
 
-Per-frame GPU pipeline order:
-1. Compute instance culling (frustum 6-plane AABB test, atomic append)
-2. Compute cluster/LOD selection (iterative DFS hierarchy traversal, 2048-deep stack, residency-aware)
-3. Occlusion refinement (project cluster AABB against previous frame's HZB -- skipped on frame 0)
-4. Shadow pass (depth-only render from light orthographic projection, 2048px, depth bias)
-5. Main geometry pass (vertex pulling from payload SSBOs, smooth vertex normals + hemisphere ambient + directional lighting + shadow sampling)
-6. HZB construction (depth-copy compute shader + per-mip max-downsample cascade)
+Per-frame pipeline order:
+1. Compute instance culling (frustum 6-plane AABB test, atomic append) -- GPU
+2. Cluster/LOD selection -- **CPU** (`simulate_traversal`) with normal-cone backface cull; output uploaded to the same buffers the GPU shader used to populate. The serial DFS compute shader is retained for reference but not dispatched.
+3. Occlusion refinement (project cluster AABB against previous frame's HZB -- skipped on frame 0) -- GPU compute
+4. Shadow pass (depth-only render from light orthographic projection, 2048px, depth bias) -- GPU graphics
+5. Main geometry pass (vertex pulling from payload SSBOs, smooth vertex normals + hemisphere ambient + directional lighting + shadow sampling) -- GPU graphics
+6. HZB construction (depth-copy compute shader + per-mip max-downsample cascade) -- GPU compute
+
+GPU timestamp profiler emits `MERIDIAN_GPU: cull=.. sel=.. occ=.. shadow=.. main=.. hzb=.. total=..ms` every frame.
 
 ### Data Flow (Connected)
 
-- GPU compute selection outputs GpuDrawEntry array (32 bytes each: VkDrawIndirectCommand header + per-draw metadata)
-- vkCmdDrawIndirect reads draw list directly from GPU buffer for both shadow and main passes
-- Frame 0 uses CPU TraversalSelection fallback (no prior GPU output)
-- Frame 1+ driven entirely by GPU compute selection readback
-- Shadow map rendered to depth texture, sampled in main fragment shader via sampler2DShadow
+- CPU `simulate_traversal` runs every frame, producing selected base + LOD clusters
+- CPU converts selection to `GpuDrawEntry[]` (32 bytes each: VkDrawIndirectCommand header + per-draw metadata) with normal-cone backface cull and writes to HOST_COHERENT draw_list/draw_count buffers
+- `vkCmdDrawIndirectCount` reads draw list directly from the same buffers for both shadow and main passes (with fallback to `vkCmdDrawIndirect` if the extension is unavailable)
+- Shadow map rendered to depth texture, sampled in main fragment shader via `sampler2DShadow`
 - Visibility buffer: two-word RG32_UINT encoding matching visibility_format.h spec (instance, kind, index, local_triangle)
 - Occlusion refinement output available but readback deferred until indirect draws eliminate frame latency
 
@@ -44,28 +45,37 @@ Per-frame GPU pipeline order:
 
 ### Known Issues
 
-- **vkCmdDrawIndirect uses max_draws**: `vkCmdDrawIndirect` is called with `max_draws` (total cluster count) as the draw count, causing thousands of no-op draws for entries with `draw_instance_count = 0`. Needs migration to `vkCmdDrawIndirectCount` to use the actual count buffer populated by compute selection.
 - **No texture support**: all shading is procedural (per-cluster color hash + hemisphere ambient). No UV interpolation or texture sampling.
 - **Meshlet boundary seams**: adjacent clusters don't share vertices, creating potential lighting discontinuities at cluster boundaries. Smooth vertex normals reduce the visual impact but don't fully eliminate seams.
 - **Page residency initialized as all-resident**: no real demand-driven streaming. All geometry loaded at startup.
-- **No GPU profiling**: no Vulkan timestamp queries or per-pass timing.
+- **CPU cluster selection divergence on sparse-LOD-link scenes**: on `massive_city` the CPU `simulate_traversal` returns 0 LOD clusters + 31394 base clusters while the GPU `compute_select.comp` produced 15106 LOD-heavy draws on the same data. Root cause not yet traced; city's builder also produces only 8 node-LOD links for 6230 LOD groups, which is suspicious.
+- **No CPU cluster-level frustum culling**: only instance-level frustum cull runs (on GPU `compute_cull`). A cluster-level test would help scenes where the camera sees a small portion of the asset.
 
 ### What's Validated
 
-- GPU selection matches CPU traversal exactly on all scenes (parity verified via readback counters)
-- Visibility buffer readback confirms `visibility_selection_subset=true` on all benchmark scenes
+- CPU and GPU selection match exactly on scenes with well-connected LOD hierarchies (Dragon: both emit 8628 after normal-cone backface cull). Diverge on sparse-LOD scenes (see Known Issues).
+- Visibility buffer readback confirms `visibility_selection_subset=true` on most benchmark scenes
 - Tested assets: 5 synthetic benchmarks, pirate.glb (5K tris), Stanford Dragon (871K tris), generated city (1M tris)
 - Platform: macOS Apple M4, MoltenVK, Vulkan 1.2
 
+### Performance (Apple M4, MoltenVK, 1280x720)
+
+Stanford Dragon (871K tris): median 17.1ms / 55-70 FPS
+Massive City (1M tris): median 53.2ms / 18-20 FPS (bottlenecked by sparse-LOD selection + lack of cluster frustum cull, not by the renderer architecture)
+
+Per-pass GPU (Dragon, steady state): cull 0.1ms, sel 0.0ms (CPU), occ 0.05ms, shadow 3-4ms, main 3-4ms, hzb 0.1-0.2ms.
+
 ## Not Yet Implemented
 
-- vkCmdDrawIndirectCount (current vkCmdDrawIndirect works but processes all max_draws entries including no-ops)
 - Cascaded shadow maps (current shadow pass is single-map orthographic)
+- PCF / poisson shadow filtering
+- Per-cluster backface culling with normal cones on LOD clusters (currently base only; many LOD clusters have cones but shader `emit_lod` skips the test)
+- CPU cluster-level frustum culling
 - Real streaming scheduler (CPU prototype exists but pages start all-resident)
 - Async disk I/O for page loading
-- Frame timing / GPU profiling (Vulkan timestamp queries)
 - Benchmark automation vs stock Godot
 - Texture/UV support
 - Broader glTF import coverage
 - Compressed geometry payloads
 - Deeper Godot runtime integration
+- Parallel GPU traversal (BFS-per-level or workgroup-DFS) to replace the retained-but-not-dispatched serial compute_select.comp
