@@ -77,7 +77,8 @@ struct GpuLodGroupRecord {
     uint32_t material_section_index = 0;
     float geometric_error = 0.0f;
     uint32_t flags = 0;
-    std::array<float, 2> padding0 = {0.0f, 0.0f};
+    uint32_t first_base_run_index = 0;
+    uint32_t base_run_count = 0;
     std::array<float, 4> bounds_min = {0.0f, 0.0f, 0.0f, 0.0f};
     std::array<float, 4> bounds_max = {0.0f, 0.0f, 0.0f, 0.0f};
 };

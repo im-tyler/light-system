@@ -262,6 +262,27 @@ void validate_resource(const VGeoResource& resource) {
                 throw BuilderError("lod cluster material does not match owning lod group");
             }
         }
+        if (group.first_base_run_index + group.base_run_count >
+            resource.lod_group_base_runs.size()) {
+            throw BuilderError("lod group base run range exceeds base run table");
+        }
+        for (uint32_t run_offset = 0; run_offset < group.base_run_count; ++run_offset) {
+            const LodGroupBaseRun& run =
+                resource.lod_group_base_runs[group.first_base_run_index + run_offset];
+            if (run.cluster_count == 0) {
+                throw BuilderError("lod group base run must cover at least one cluster");
+            }
+            if (run.first_cluster_index + run.cluster_count > resource.clusters.size()) {
+                throw BuilderError("lod group base run exceeds cluster table");
+            }
+            for (uint32_t cluster_index = run.first_cluster_index;
+                 cluster_index < run.first_cluster_index + run.cluster_count; ++cluster_index) {
+                if (resource.clusters[cluster_index].material_section_index !=
+                    group.material_section_index) {
+                    throw BuilderError("lod group base run references foreign material section");
+                }
+            }
+        }
     }
 }
 

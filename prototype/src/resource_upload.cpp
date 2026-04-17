@@ -83,6 +83,8 @@ UploadableScene build_uploadable_scene(const VGeoResource& resource) {
         record.material_section_index = group.material_section_index;
         record.geometric_error = group.geometric_error;
         record.flags = group.flags;
+        record.first_base_run_index = group.first_base_run_index;
+        record.base_run_count = group.base_run_count;
         record.bounds_min = to_float4(group.bounds.min);
         record.bounds_max = to_float4(group.bounds.max);
         scene.lod_groups.push_back(record);

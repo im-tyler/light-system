@@ -45,8 +45,8 @@ Last updated: 2026-04-16
 - [x] vkCmdDrawIndirectCount with runtime extension probe + fallback to vkCmdDrawIndirect
 - [x] hoist cluster/LOD selection to CPU (serial GPU DFS was 10-18ms on M4; replaced with CPU simulate_traversal + HOST_COHERENT upload)
 - [x] per-cluster backface culling via meshlet normal cones (base clusters only; LOD clusters still unculled)
-- [ ] reconcile CPU/GPU selection divergence on sparse-LOD-link scenes (city emits 0 LOD on CPU vs LOD-heavy on GPU)
-- [x] investigate city builder producing only 8 node-LOD links for 6230 LOD groups (architectural mismatch between meshopt_partitionClusters partitioning and clusterlod grouping; exact-span match is semantically required by current traversal -- see IMPLEMENTATION_STATUS.md for fix options)
+- [ ] reconcile CPU/GPU selection divergence on sparse-LOD-link scenes (post-LOD-fix, the remaining gap is that `cluster_select.comp` hasn't been rewritten against the multi-run coverage model -- it still uses the pre-fix single-group-per-node logic; the GPU shader isn't dispatched in the current pipeline)
+- [x] fix city builder producing only 8 node-LOD links for 6230 LOD groups (dragon 946->2509, city 8->6230; builder now attaches groups to deepest containing node with multi-run base cluster coverage, traversal filters via a coverage bitmap -- see IMPLEMENTATION_STATUS.md Known Issues)
 - [ ] CPU cluster-level frustum culling (only instance-level runs today)
 - [ ] profile the ~9ms CPU-side overhead still remaining after the sel hoist
 
