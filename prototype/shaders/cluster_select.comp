@@ -132,6 +132,12 @@ void main() {
         float node_error = uintBitsToFloat(node_data[nb + 9u]);
 
         // Try LOD group selection
+        // NOTE: GPU traversal is retained-but-not-dispatched; the CPU path
+        // (simulate_traversal) implements the full multi-run covered-set
+        // logic needed for subset LOD attachments. This shader still uses
+        // the old exact-span assumption and will over-emit when subset
+        // LOD groups exist. If the GPU path is ever revived it needs a
+        // matching rewrite against GpuLodGroupRecord::base_run_{count,index}.
         uint sel_group = 0xFFFFFFFFu;
         for (uint l = 0u; l < lod_link_count; l++) {
             uint gi = lod_link_data[first_lod_link + l];

@@ -395,29 +395,34 @@ void build_section_base_clusters(const MeshData& mesh, const MeshSection& sectio
     }
 }
 
+// Attach each LOD group to the deepest hierarchy node whose cluster span
+// contains the full set of base clusters the group covers. Base-cluster
+// coverage is stored as a flat list of (first_cluster_index, cluster_count)
+// runs on each LOD group -- most groups have a single run, scenes whose
+// clusterlod grouping doesn't align with the hierarchy partitioner have more.
+// Subset attachment is made safe by threading a "covered" set of cluster
+// ranges through the traversal: when an LOD group is selected at a node,
+// its runs become the covered set for that subtree; descendants whose
+// clusters fall in the covered set are skipped and base-cluster emits
+// filter out already-covered clusters.
+//
+// Historical note: before f018cf1 this function required an exact node/group
+// span match. That was semantically safe but scenes whose clusterlod groupings
+// don't line up with the hierarchy partitioner (e.g. massive_city: 6230 groups
+// -> 8 links) lost almost all LOD coverage and fell through to 31k base-leaf
+// emits. Multi-run subset attachment + covered-set threading keeps correctness
+// and recovers most of the lost coverage.
 void build_node_lod_links(VGeoResource& resource,
                           const std::vector<LodGroupBuildInfo>& lod_group_infos,
                           const std::vector<uint32_t>& source_to_runtime_cluster_indices) {
     resource.node_lod_links.clear();
+    resource.lod_group_base_runs.clear();
 
-    struct SpanKey {
-        uint32_t material_section_index = 0;
-        uint32_t first_cluster_index = 0;
-        uint32_t cluster_count = 0;
-        bool operator==(const SpanKey& other) const {
-            return material_section_index == other.material_section_index &&
-                   first_cluster_index == other.first_cluster_index &&
-                   cluster_count == other.cluster_count;
-        }
-    };
-    struct SpanKeyHash {
-        size_t operator()(const SpanKey& key) const {
-            return (static_cast<size_t>(key.material_section_index) << 32) ^
-                   (static_cast<size_t>(key.first_cluster_index) << 16) ^ key.cluster_count;
-        }
-    };
-
-    std::unordered_map<SpanKey, uint32_t, SpanKeyHash> node_lookup;
+    // For each hierarchy node, the cluster span's material section (for
+    // groups that cover the whole node). We only attach groups to nodes whose
+    // entire span is single-material -- LOD groups are always single-material.
+    std::vector<uint32_t> node_material_section(resource.hierarchy_nodes.size(), 0xffffffffu);
+    std::vector<uint8_t> node_single_material(resource.hierarchy_nodes.size(), 0);
     for (uint32_t node_index = 0; node_index < resource.hierarchy_nodes.size(); ++node_index) {
         const HierarchyNode& node = resource.hierarchy_nodes[node_index];
         if (node.cluster_count == 0) {
@@ -433,26 +438,26 @@ void build_node_lod_links(VGeoResource& resource,
                 break;
             }
         }
-        if (!single_material) {
-            continue;
-        }
-        node_lookup.emplace(SpanKey{material_section_index, node.first_cluster_index, node.cluster_count},
-                            node_index);
+        node_material_section[node_index] = material_section_index;
+        node_single_material[node_index] = single_material ? 1u : 0u;
     }
 
-    // We require an EXACT node/span match: traversal's try_select_lod_group
-    // emits the group's LOD clusters and returns without descending or
-    // emitting any base clusters, so the group must replace every base
-    // cluster under the node. Attaching to a node that only *contains* the
-    // group's span would leave the non-overlapping base clusters unrendered.
-    //
-    // Scenes whose clusterlod groupings don't align with the hierarchy
-    // partitions (notably massive_city: 6230 LOD groups but only ~8
-    // node-aligned spans) lose most of their LOD coverage here and fall
-    // through to per-leaf base emit. The right long-term fix is to partition
-    // the hierarchy in a way that respects LOD group boundaries (or to teach
-    // traversal to stitch partial LOD coverage with complement base emits).
+    // cluster_owning_node[c] = the leaf hierarchy node that owns cluster c.
+    std::vector<uint32_t> cluster_owning_node(resource.clusters.size(), 0xffffffffu);
+    for (uint32_t node_index = 0; node_index < resource.hierarchy_nodes.size(); ++node_index) {
+        const HierarchyNode& node = resource.hierarchy_nodes[node_index];
+        if (node.child_count != 0 || node.cluster_count == 0) {
+            continue;
+        }
+        for (uint32_t offset = 0; offset < node.cluster_count; ++offset) {
+            cluster_owning_node[node.first_cluster_index + offset] = node_index;
+        }
+    }
+
+    // Bucket candidate group -> node attachments; we resolve order and write
+    // out the final link table after processing all groups.
     std::vector<std::vector<uint32_t>> links_by_node(resource.hierarchy_nodes.size());
+
     for (uint32_t group_index = 0; group_index < lod_group_infos.size(); ++group_index) {
         const LodGroupBuildInfo& info = lod_group_infos[group_index];
         if (info.source_cluster_ids.empty()) {
@@ -473,38 +478,91 @@ void build_node_lod_links(VGeoResource& resource,
             std::unique(runtime_cluster_indices.begin(), runtime_cluster_indices.end()),
             runtime_cluster_indices.end());
 
-        const uint32_t first_cluster_index = runtime_cluster_indices.front();
-        const uint32_t cluster_count = static_cast<uint32_t>(runtime_cluster_indices.size());
-        bool contiguous = true;
-        for (uint32_t offset = 0; offset < cluster_count; ++offset) {
-            if (runtime_cluster_indices[offset] != first_cluster_index + offset) {
-                contiguous = false;
-                break;
+        // Compact consecutive cluster indices into runs of (first, count).
+        std::vector<LodGroupBaseRun> runs;
+        for (size_t i = 0; i < runtime_cluster_indices.size();) {
+            uint32_t run_first = runtime_cluster_indices[i];
+            uint32_t run_count = 1;
+            while (i + run_count < runtime_cluster_indices.size() &&
+                   runtime_cluster_indices[i + run_count] == run_first + run_count) {
+                ++run_count;
             }
+            runs.push_back(LodGroupBaseRun{run_first, run_count});
+            i += run_count;
         }
-        if (!contiguous) {
+
+        const uint32_t group_first = runtime_cluster_indices.front();
+        const uint32_t group_end = runtime_cluster_indices.back() + 1;
+
+        // Walk up from the leaf owning group_first to find the deepest
+        // ancestor whose cluster span contains [group_first, group_end). The
+        // group's runs must all live inside this span (they're all >= group_first
+        // and < group_end by construction).
+        if (group_first >= cluster_owning_node.size()) {
+            continue;
+        }
+        uint32_t candidate = cluster_owning_node[group_first];
+        uint32_t best_node = 0xffffffffu;
+        while (candidate != 0xffffffffu) {
+            const HierarchyNode& node = resource.hierarchy_nodes[candidate];
+            const uint32_t node_first = node.first_cluster_index;
+            const uint32_t node_end = node_first + node.cluster_count;
+            if (node_first > group_first || node_end < group_end) {
+                candidate = node.parent_index;
+                continue;
+            }
+            if (!node_single_material[candidate] ||
+                node_material_section[candidate] != info.material_section_index) {
+                candidate = node.parent_index;
+                continue;
+            }
+
+            best_node = candidate;
+            uint32_t containing_child = 0xffffffffu;
+            for (uint32_t child_offset = 0; child_offset < node.child_count; ++child_offset) {
+                const HierarchyNode& child =
+                    resource.hierarchy_nodes[node.first_child_index + child_offset];
+                const uint32_t child_first = child.first_cluster_index;
+                const uint32_t child_end = child_first + child.cluster_count;
+                if (child_first <= group_first && child_end >= group_end) {
+                    containing_child = node.first_child_index + child_offset;
+                    break;
+                }
+            }
+            if (containing_child != 0xffffffffu) {
+                candidate = containing_child;
+                continue;
+            }
+            break;
+        }
+
+        if (best_node == 0xffffffffu) {
             continue;
         }
 
-        const auto found = node_lookup.find(
-            SpanKey{info.material_section_index, first_cluster_index, cluster_count});
-        if (found != node_lookup.end()) {
-            links_by_node[found->second].push_back(group_index);
-        }
+        // Persist the group's base runs.
+        LodGroupRecord& group_record = resource.lod_groups[group_index];
+        group_record.first_base_run_index =
+            static_cast<uint32_t>(resource.lod_group_base_runs.size());
+        group_record.base_run_count = static_cast<uint32_t>(runs.size());
+        resource.lod_group_base_runs.insert(resource.lod_group_base_runs.end(), runs.begin(),
+                                            runs.end());
+
+        links_by_node[best_node].push_back(group_index);
     }
 
     for (uint32_t node_index = 0; node_index < resource.hierarchy_nodes.size(); ++node_index) {
-        std::vector<uint32_t>& linked_groups = links_by_node[node_index];
-        std::sort(linked_groups.begin(), linked_groups.end(), [&](uint32_t lhs, uint32_t rhs) {
-            return resource.lod_groups[lhs].geometric_error < resource.lod_groups[rhs].geometric_error;
+        std::vector<uint32_t>& linked = links_by_node[node_index];
+        std::sort(linked.begin(), linked.end(), [&](uint32_t lhs, uint32_t rhs) {
+            return resource.lod_groups[lhs].geometric_error <
+                   resource.lod_groups[rhs].geometric_error;
         });
-        linked_groups.erase(std::unique(linked_groups.begin(), linked_groups.end()),
-                            linked_groups.end());
+        linked.erase(std::unique(linked.begin(), linked.end()), linked.end());
 
         HierarchyNode& node = resource.hierarchy_nodes[node_index];
         node.first_lod_link_index = static_cast<uint32_t>(resource.node_lod_links.size());
-        node.lod_link_count = static_cast<uint32_t>(linked_groups.size());
-        for (uint32_t group_index : linked_groups) {
+        node.lod_link_count = static_cast<uint32_t>(linked.size());
+        for (uint32_t group_index : linked) {
             resource.node_lod_links.push_back(NodeLodLink{group_index});
         }
     }
@@ -673,6 +731,18 @@ void collect_node_base_pages(const VGeoResource& resource, const HierarchyNode& 
     }
 }
 
+void collect_cluster_span_pages(const VGeoResource& resource, uint32_t first_cluster_index,
+                                uint32_t cluster_count, std::vector<uint32_t>& pages) {
+    pages.clear();
+    for (uint32_t cluster_index = first_cluster_index;
+         cluster_index < first_cluster_index + cluster_count; ++cluster_index) {
+        const uint32_t page_index = resource.clusters[cluster_index].page_index;
+        if (pages.empty() || pages.back() != page_index) {
+            pages.push_back(page_index);
+        }
+    }
+}
+
 void link_adjacent_page_sets(std::vector<std::vector<uint32_t>>& adjacency,
                              const std::vector<uint32_t>& lhs, const std::vector<uint32_t>& rhs) {
     for (const uint32_t lhs_page : lhs) {
@@ -695,16 +765,32 @@ void build_page_dependencies(VGeoResource& resource) {
             continue;
         }
 
-        collect_node_base_pages(resource, node, current_pages);
+        // Each link's adjacent replacement-level dependency is between the
+        // pages holding the group's covered base clusters and the pages
+        // holding the group's LOD clusters.
+        std::vector<uint32_t> link_base_pages;
         for (uint32_t link_offset = 0; link_offset < node.lod_link_count; ++link_offset) {
-            const uint32_t group_index =
-                resource.node_lod_links[node.first_lod_link_index + link_offset].lod_group_index;
-            collect_group_pages(resource, resource.lod_groups[group_index], next_pages);
-            if (!current_pages.empty() && !next_pages.empty()) {
-                link_adjacent_page_sets(adjacency, current_pages, next_pages);
+            const NodeLodLink& link =
+                resource.node_lod_links[node.first_lod_link_index + link_offset];
+            const LodGroupRecord& group = resource.lod_groups[link.lod_group_index];
+            link_base_pages.clear();
+            for (uint32_t run_offset = 0; run_offset < group.base_run_count; ++run_offset) {
+                const LodGroupBaseRun& run =
+                    resource.lod_group_base_runs[group.first_base_run_index + run_offset];
+                for (uint32_t cluster_index = run.first_cluster_index;
+                     cluster_index < run.first_cluster_index + run.cluster_count; ++cluster_index) {
+                    const uint32_t page_index = resource.clusters[cluster_index].page_index;
+                    if (link_base_pages.empty() || link_base_pages.back() != page_index) {
+                        link_base_pages.push_back(page_index);
+                    }
+                }
             }
-            current_pages = next_pages;
+            collect_group_pages(resource, group, next_pages);
+            if (!link_base_pages.empty() && !next_pages.empty()) {
+                link_adjacent_page_sets(adjacency, link_base_pages, next_pages);
+            }
         }
+        (void)current_pages;
     }
 
     resource.page_dependencies.clear();

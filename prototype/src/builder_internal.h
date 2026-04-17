@@ -25,8 +25,8 @@
 namespace meridian::detail {
 
 constexpr std::array<char, 4> kMagic = {'V', 'G', 'E', 'O'};
-constexpr uint32_t kSchemaVersion = 1;
-constexpr uint32_t kBuilderVersion = 1;
+constexpr uint32_t kSchemaVersion = 2;
+constexpr uint32_t kBuilderVersion = 2;
 constexpr uint32_t kPageFlagLodPayload = 1u << 0;
 
 struct FileHeader {
@@ -44,6 +44,8 @@ struct FileHeader {
     uint32_t total_page_dependencies;
     uint32_t total_cluster_geometry_bytes;
     uint32_t total_lod_geometry_bytes;
+    uint32_t total_lod_group_base_runs;
+    uint32_t reserved0;
     Bounds3f bounds;
     uint64_t metadata_offset;
     uint64_t material_table_offset;
@@ -54,6 +56,7 @@ struct FileHeader {
     uint64_t page_table_offset;
     uint64_t lod_group_table_offset;
     uint64_t lod_cluster_table_offset;
+    uint64_t lod_group_base_run_table_offset;
     uint64_t cluster_geometry_payload_offset;
     uint64_t lod_geometry_payload_offset;
 };
@@ -137,10 +140,17 @@ struct LodGroupRecordDisk {
     Bounds3f bounds;
     float geometric_error;
     uint32_t flags;
+    uint32_t first_base_run_index;
+    uint32_t base_run_count;
 };
 
 struct NodeLodLinkDisk {
     uint32_t lod_group_index;
+};
+
+struct LodGroupBaseRunDisk {
+    uint32_t first_cluster_index;
+    uint32_t cluster_count;
 };
 
 struct MeshSection {

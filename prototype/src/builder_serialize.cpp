@@ -86,12 +86,21 @@ LodGroupRecordDisk to_disk(const LodGroupRecord& group) {
     disk.bounds = group.bounds;
     disk.geometric_error = group.geometric_error;
     disk.flags = group.flags;
+    disk.first_base_run_index = group.first_base_run_index;
+    disk.base_run_count = group.base_run_count;
     return disk;
 }
 
 NodeLodLinkDisk to_disk(const NodeLodLink& link) {
     NodeLodLinkDisk disk{};
     disk.lod_group_index = link.lod_group_index;
+    return disk;
+}
+
+LodGroupBaseRunDisk to_disk(const LodGroupBaseRun& run) {
+    LodGroupBaseRunDisk disk{};
+    disk.first_cluster_index = run.first_cluster_index;
+    disk.cluster_count = run.cluster_count;
     return disk;
 }
 
@@ -158,8 +167,11 @@ void write_resource(const VGeoResource& resource, const std::filesystem::path& o
         page_table_offset + (resource.pages.size() * sizeof(PageRecordDisk));
     const uint64_t lod_cluster_table_offset =
         lod_group_table_offset + (resource.lod_groups.size() * sizeof(LodGroupRecordDisk));
-    const uint64_t cluster_geometry_payload_offset =
+    const uint64_t lod_group_base_run_table_offset =
         lod_cluster_table_offset + (resource.lod_clusters.size() * sizeof(LodClusterRecordDisk));
+    const uint64_t cluster_geometry_payload_offset =
+        lod_group_base_run_table_offset +
+        (resource.lod_group_base_runs.size() * sizeof(LodGroupBaseRunDisk));
     const uint64_t lod_geometry_payload_offset =
         cluster_geometry_payload_offset + resource.cluster_geometry_payload.size();
 
@@ -178,6 +190,8 @@ void write_resource(const VGeoResource& resource, const std::filesystem::path& o
     header.total_page_dependencies = static_cast<uint32_t>(resource.page_dependencies.size());
     header.total_cluster_geometry_bytes = static_cast<uint32_t>(resource.cluster_geometry_payload.size());
     header.total_lod_geometry_bytes = static_cast<uint32_t>(resource.lod_geometry_payload.size());
+    header.total_lod_group_base_runs = static_cast<uint32_t>(resource.lod_group_base_runs.size());
+    header.reserved0 = 0;
     header.bounds = resource.bounds;
     header.metadata_offset = metadata_offset;
     header.material_table_offset = material_table_offset;
@@ -188,6 +202,7 @@ void write_resource(const VGeoResource& resource, const std::filesystem::path& o
     header.page_table_offset = page_table_offset;
     header.lod_group_table_offset = lod_group_table_offset;
     header.lod_cluster_table_offset = lod_cluster_table_offset;
+    header.lod_group_base_run_table_offset = lod_group_base_run_table_offset;
     header.cluster_geometry_payload_offset = cluster_geometry_payload_offset;
     header.lod_geometry_payload_offset = lod_geometry_payload_offset;
 
@@ -199,6 +214,7 @@ void write_resource(const VGeoResource& resource, const std::filesystem::path& o
     metadata.cluster_table_offset = cluster_table_offset;
     metadata.lod_group_table_offset = lod_group_table_offset;
     metadata.lod_cluster_table_offset = lod_cluster_table_offset;
+    metadata.lod_group_base_run_table_offset = lod_group_base_run_table_offset;
     metadata.cluster_geometry_payload_offset = cluster_geometry_payload_offset;
     metadata.lod_geometry_payload_offset = lod_geometry_payload_offset;
 
@@ -237,6 +253,7 @@ void write_resource(const VGeoResource& resource, const std::filesystem::path& o
         adjusted_cluster.geometry_payload_offset += static_cast<uint32_t>(lod_geometry_payload_offset);
         write_pod(output, to_disk(adjusted_cluster));
     }
+    for (const auto& run : resource.lod_group_base_runs) write_pod(output, to_disk(run));
 
     if (!resource.cluster_geometry_payload.empty()) {
         output.write(reinterpret_cast<const char*>(resource.cluster_geometry_payload.data()),
@@ -319,8 +336,14 @@ void write_summary(const VGeoResource& resource, const std::filesystem::path& ou
                << " error=" << node.geometric_error << '\n';
     }
     for (size_t index = 0; index < resource.node_lod_links.size(); ++index) {
-        output << "node_lod_link[" << index << "]="
-               << " group=" << resource.node_lod_links[index].lod_group_index << '\n';
+        const NodeLodLink& link = resource.node_lod_links[index];
+        output << "node_lod_link[" << index << "]=" << " group=" << link.lod_group_index << '\n';
+    }
+    for (size_t index = 0; index < resource.lod_group_base_runs.size(); ++index) {
+        const LodGroupBaseRun& run = resource.lod_group_base_runs[index];
+        output << "lod_group_base_run[" << index << "]="
+               << " first_cluster=" << run.first_cluster_index
+               << " cluster_count=" << run.cluster_count << '\n';
     }
     for (size_t index = 0; index < resource.lod_groups.size(); ++index) {
         const LodGroupRecord& group = resource.lod_groups[index];

@@ -90,10 +90,26 @@ struct LodGroupRecord {
     Bounds3f bounds;
     float geometric_error = 0.0f;
     uint32_t flags = 0;
+    // The base clusters that this group's LOD clusters replace, encoded as a
+    // flat run table (offset + count into VGeoResource::lod_group_base_runs).
+    // Most groups have a single run (the LOD group's base clusters are
+    // contiguous in runtime order). Scenes whose clusterlod grouping doesn't
+    // line up with the hierarchy partitioner get multiple runs per group.
+    uint32_t first_base_run_index = 0;
+    uint32_t base_run_count = 0;
 };
 
 struct NodeLodLink {
     uint32_t lod_group_index = 0;
+};
+
+// A contiguous run of base cluster indices that an LOD group covers (i.e. the
+// clusters whose geometry the group's LOD clusters replace). Groups have one
+// run in the simple case, more when the partitioner scatters the group's base
+// clusters across the runtime cluster ordering.
+struct LodGroupBaseRun {
+    uint32_t first_cluster_index = 0;
+    uint32_t cluster_count = 0;
 };
 
 struct ResourceMetadata {
@@ -104,6 +120,7 @@ struct ResourceMetadata {
     uint64_t cluster_table_offset = 0;
     uint64_t lod_group_table_offset = 0;
     uint64_t lod_cluster_table_offset = 0;
+    uint64_t lod_group_base_run_table_offset = 0;
     uint64_t cluster_geometry_payload_offset = 0;
     uint64_t lod_geometry_payload_offset = 0;
     uint64_t material_mapping_offset = 0;
@@ -142,6 +159,7 @@ struct VGeoResource {
     std::vector<LodGroupRecord> lod_groups;
     std::vector<LodClusterRecord> lod_clusters;
     std::vector<NodeLodLink> node_lod_links;
+    std::vector<LodGroupBaseRun> lod_group_base_runs;
     std::vector<std::byte> cluster_geometry_payload;
     std::vector<std::byte> lod_geometry_payload;
 };
