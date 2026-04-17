@@ -546,6 +546,19 @@ void compute_smooth_normals(MeshData& mesh) {
     const size_t vertex_count = mesh.positions.size();
     mesh.normals.assign(vertex_count, Vec3f{0.0f, 0.0f, 0.0f});
 
+    auto safe_normalize = [](const Vec3f& v) -> Vec3f {
+        const float len = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+        if (len <= 1e-8f) return Vec3f{0.0f, 0.0f, 0.0f};
+        return {v.x / len, v.y / len, v.z / len};
+    };
+    auto sub = [](const Vec3f& a, const Vec3f& b) -> Vec3f {
+        return {a.x - b.x, a.y - b.y, a.z - b.z};
+    };
+
+    // Angle-weighted accumulation: each face contributes its face-normal
+    // direction scaled by the interior angle at the vertex. This produces
+    // better results than area weighting at corners where small triangles
+    // would otherwise be under-represented.
     for (const MeshSection& section : mesh.sections) {
         for (size_t i = 0; i + 2 < section.indices.size(); i += 3) {
             const uint32_t i0 = section.indices[i];
@@ -554,14 +567,68 @@ void compute_smooth_normals(MeshData& mesh) {
             const Vec3f& p0 = mesh.positions[i0];
             const Vec3f& p1 = mesh.positions[i1];
             const Vec3f& p2 = mesh.positions[i2];
-            const Vec3f e1 = {p1.x - p0.x, p1.y - p0.y, p1.z - p0.z};
-            const Vec3f e2 = {p2.x - p0.x, p2.y - p0.y, p2.z - p0.z};
-            const Vec3f fn = {e1.y * e2.z - e1.z * e2.y,
-                              e1.z * e2.x - e1.x * e2.z,
-                              e1.x * e2.y - e1.y * e2.x};
-            mesh.normals[i0].x += fn.x; mesh.normals[i0].y += fn.y; mesh.normals[i0].z += fn.z;
-            mesh.normals[i1].x += fn.x; mesh.normals[i1].y += fn.y; mesh.normals[i1].z += fn.z;
-            mesh.normals[i2].x += fn.x; mesh.normals[i2].y += fn.y; mesh.normals[i2].z += fn.z;
+            const Vec3f e01 = sub(p1, p0);
+            const Vec3f e02 = sub(p2, p0);
+            const Vec3f fn_raw = {e01.y * e02.z - e01.z * e02.y,
+                                  e01.z * e02.x - e01.x * e02.z,
+                                  e01.x * e02.y - e01.y * e02.x};
+            const Vec3f fn = safe_normalize(fn_raw);
+            if (fn.x == 0.0f && fn.y == 0.0f && fn.z == 0.0f) continue;
+
+            const Vec3f d01 = safe_normalize(e01);
+            const Vec3f d02 = safe_normalize(e02);
+            const Vec3f d10 = safe_normalize(sub(p0, p1));
+            const Vec3f d12 = safe_normalize(sub(p2, p1));
+            const Vec3f d20 = safe_normalize(sub(p0, p2));
+            const Vec3f d21 = safe_normalize(sub(p1, p2));
+
+            const float c0 = std::clamp(d01.x * d02.x + d01.y * d02.y + d01.z * d02.z, -1.0f, 1.0f);
+            const float c1 = std::clamp(d10.x * d12.x + d10.y * d12.y + d10.z * d12.z, -1.0f, 1.0f);
+            const float c2 = std::clamp(d20.x * d21.x + d20.y * d21.y + d20.z * d21.z, -1.0f, 1.0f);
+            const float a0 = std::acos(c0);
+            const float a1 = std::acos(c1);
+            const float a2 = std::acos(c2);
+
+            mesh.normals[i0].x += fn.x * a0; mesh.normals[i0].y += fn.y * a0; mesh.normals[i0].z += fn.z * a0;
+            mesh.normals[i1].x += fn.x * a1; mesh.normals[i1].y += fn.y * a1; mesh.normals[i1].z += fn.z * a1;
+            mesh.normals[i2].x += fn.x * a2; mesh.normals[i2].y += fn.y * a2; mesh.normals[i2].z += fn.z * a2;
+        }
+    }
+
+    // Position welding: merge normal contributions across vertex indices that
+    // share a position (within a tight quantization grid). This closes normal
+    // seams where the source mesh split a vertex for UV/material boundaries,
+    // and it's the dominant source of visible cluster-seam lighting breaks
+    // after angle-weighted accumulation.
+    struct Key { int32_t x, y, z; bool operator==(const Key& o) const { return x==o.x && y==o.y && z==o.z; } };
+    struct KeyHash { size_t operator()(const Key& k) const noexcept {
+        size_t h = static_cast<uint32_t>(k.x);
+        h = h * 1315423911u ^ static_cast<uint32_t>(k.y);
+        h = h * 1315423911u ^ static_cast<uint32_t>(k.z);
+        return h;
+    }};
+    const float quantum = 1.0f / 4096.0f;
+    std::unordered_map<Key, std::vector<uint32_t>, KeyHash> buckets;
+    buckets.reserve(vertex_count);
+    for (uint32_t i = 0; i < vertex_count; ++i) {
+        const Vec3f& p = mesh.positions[i];
+        Key k{
+            static_cast<int32_t>(std::lround(p.x / quantum)),
+            static_cast<int32_t>(std::lround(p.y / quantum)),
+            static_cast<int32_t>(std::lround(p.z / quantum)),
+        };
+        buckets[k].push_back(i);
+    }
+    for (auto& [key, members] : buckets) {
+        if (members.size() < 2) continue;
+        Vec3f merged{0.0f, 0.0f, 0.0f};
+        for (uint32_t idx : members) {
+            merged.x += mesh.normals[idx].x;
+            merged.y += mesh.normals[idx].y;
+            merged.z += mesh.normals[idx].z;
+        }
+        for (uint32_t idx : members) {
+            mesh.normals[idx] = merged;
         }
     }
 

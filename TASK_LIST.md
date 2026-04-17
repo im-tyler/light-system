@@ -53,7 +53,7 @@ Last updated: 2026-04-16
 ## Rendering Quality
 
 - [x] smooth vertex normals from source mesh
-- [-] meshlet boundary seams (partially addressed by smooth normals; shared-vertex merging still needed)
+- [x] meshlet boundary seams (angle-weighted smooth normals + position welding of vertex normals across index-split duplicates in the source mesh)
 - [x] PCF shadow filtering (8-tap Poisson disk + per-pixel rotation, slope-scaled bias)
 - [x] cascaded shadow maps for outdoor / large scenes (3-cascade, log/uniform split blend, manual depth compare to work around MoltenVK sampler2DArrayShadow limitation)
 - [ ] per-cascade frustum culling to reduce 3x draw-submit cost
