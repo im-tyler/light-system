@@ -1989,9 +1989,21 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
 
             report.runtime_completed_page_count = complete_loading_pages(residency_model, frame_index);
 
+            using clock_t = std::chrono::steady_clock;
+            auto t_traverse_start = clock_t::now();
             const std::vector<uint8_t> resident_pages = build_resident_page_mask(residency_model);
             const TraversalSelection selection_for_frame =
                 simulate_traversal(resource, config.debug_error_threshold, resident_pages);
+            auto t_traverse_end = clock_t::now();
+            static double acc_traverse_ms = 0.0;
+            static double acc_build_ms = 0.0;
+            static double acc_upload_ms = 0.0;
+            static double acc_residency_ms = 0.0;
+            static double acc_cmdrec_ms = 0.0;
+            static double acc_submit_ms = 0.0;
+            static uint32_t cpu_prof_samples = 0;
+            acc_traverse_ms +=
+                std::chrono::duration<double, std::milli>(t_traverse_end - t_traverse_start).count();
 
             ResidencyUpdateInput residency_input;
             residency_input.frame_index = frame_index;
@@ -2000,12 +2012,16 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             residency_input.selected_pages = selection_for_frame.selected_page_indices;
             residency_input.missing_pages = selection_for_frame.missing_page_indices;
             residency_input.prefetch_pages = selection_for_frame.prefetch_page_indices;
+            auto t_residency_start = clock_t::now();
             const ResidencyUpdateResult residency_update =
                 step_residency(residency_model, residency_input);
 
             snapshot_page_residency(report.uploadable_scene, residency_model);
             result = update_vector_buffer(device, report.uploadable_scene.page_residency,
                                           scene_buffers.page_residency);
+            auto t_residency_end = clock_t::now();
+            acc_residency_ms +=
+                std::chrono::duration<double, std::milli>(t_residency_end - t_residency_start).count();
             if (result != VK_SUCCESS) {
                 std::ostringstream message;
                 message << "page residency update failed with code " << result;
@@ -2030,7 +2046,13 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                 report.debug_rendered_cluster_count == report.replay_selected_cluster_count &&
                 report.debug_rendered_lod_cluster_count == report.replay_selected_lod_cluster_count;
 
+            auto t_fence_start = clock_t::now();
             vkWaitForFences(device, 1, &frame.in_flight, VK_TRUE, UINT64_MAX);
+            auto t_fence_end = clock_t::now();
+            static double acc_fence_ms = 0.0;
+            static double acc_present_ms = 0.0;
+            acc_fence_ms +=
+                std::chrono::duration<double, std::milli>(t_fence_end - t_fence_start).count();
             if (report.presented_frame_count > 0) {
                 analyze_visibility_readback(device, swapchain, debug_render, last_submitted_selection,
                                            report);
@@ -2113,6 +2135,7 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                 return false;
             };
             {
+                auto t_build_start = clock_t::now();
                 std::vector<GpuDrawEntry> cpu_draws;
                 cpu_draws.reserve(selection_for_frame.selected_cluster_indices.size() +
                                   selection_for_frame.selected_lod_cluster_indices.size());
@@ -2167,6 +2190,10 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                     cpu_draws.push_back(e);
                 }
                 const uint32_t cpu_draw_count = static_cast<uint32_t>(cpu_draws.size());
+                auto t_build_end = clock_t::now();
+                acc_build_ms +=
+                    std::chrono::duration<double, std::milli>(t_build_end - t_build_start).count();
+                auto t_upload_start = clock_t::now();
                 if (cpu_draw_count > 0 &&
                     compute_selection.draw_list.buffer != VK_NULL_HANDLE) {
                     update_uploaded_buffer(device, cpu_draws.data(),
@@ -2178,15 +2205,22 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                     update_uploaded_buffer(device, &cpu_draw_count, sizeof(uint32_t),
                                            compute_selection.draw_count);
                 }
+                auto t_upload_end = clock_t::now();
+                acc_upload_ms +=
+                    std::chrono::duration<double, std::milli>(t_upload_end - t_upload_start).count();
             }
 
             // frustum was already extracted above for cluster-level CPU culling
+            auto t_cmdrec_start = clock_t::now();
             result = record_debug_command_buffer(frame, debug_render, compute_cull, compute_selection,
                                                  hzb, occlusion_refine, shadow, swapchain,
                                                  camera_frame, frustum, config.debug_error_threshold,
                                                  selection_for_frame, report.uploadable_scene,
                                                  frame_index, image_index,
                                                  has_draw_indirect_count, gpu_profiler);
+            auto t_cmdrec_end = clock_t::now();
+            acc_cmdrec_ms +=
+                std::chrono::duration<double, std::milli>(t_cmdrec_end - t_cmdrec_start).count();
             if (result != VK_SUCCESS) {
                 std::ostringstream message;
                 message << "record_debug_command_buffer failed with code " << result;
@@ -2206,7 +2240,25 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             submit_info.signalSemaphoreCount = 1;
             submit_info.pSignalSemaphores = &frame.render_finished;
 
+            auto t_submit_start = clock_t::now();
             result = vkQueueSubmit(graphics_queue, 1, &submit_info, frame.in_flight);
+            auto t_submit_end = clock_t::now();
+            acc_submit_ms +=
+                std::chrono::duration<double, std::milli>(t_submit_end - t_submit_start).count();
+            cpu_prof_samples++;
+            if (cpu_prof_samples % 60 == 0) {
+                std::fprintf(stderr,
+                    "MERIDIAN_CPU: traverse=%.2f residency=%.2f build=%.2f upload=%.2f cmdrec=%.2f submit=%.2f fence=%.2f present=%.2f (ms/frame, n=%u)\n",
+                    acc_traverse_ms / cpu_prof_samples,
+                    acc_residency_ms / cpu_prof_samples,
+                    acc_build_ms / cpu_prof_samples,
+                    acc_upload_ms / cpu_prof_samples,
+                    acc_cmdrec_ms / cpu_prof_samples,
+                    acc_submit_ms / cpu_prof_samples,
+                    acc_fence_ms / cpu_prof_samples,
+                    acc_present_ms / cpu_prof_samples,
+                    cpu_prof_samples);
+            }
             if (result != VK_SUCCESS) {
                 std::ostringstream message;
                 message << "vkQueueSubmit failed with code " << result;
@@ -2223,7 +2275,11 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             present_info.pSwapchains = &swapchain.swapchain;
             present_info.pImageIndices = &image_index;
 
+            auto t_present_start = clock_t::now();
             result = vkQueuePresentKHR(present_queue, &present_info);
+            auto t_present_end = clock_t::now();
+            acc_present_ms +=
+                std::chrono::duration<double, std::milli>(t_present_end - t_present_start).count();
             if (result != VK_SUCCESS) {
                 std::ostringstream message;
                 message << "vkQueuePresentKHR failed with code " << result;
