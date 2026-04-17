@@ -54,7 +54,7 @@ Last updated: 2026-04-16
 
 - [x] smooth vertex normals from source mesh
 - [-] meshlet boundary seams (partially addressed by smooth normals; shared-vertex merging still needed)
-- [ ] PCF shadow filtering
+- [x] PCF shadow filtering (8-tap Poisson disk + per-pixel rotation, slope-scaled bias)
 - [ ] cascaded shadow maps for outdoor / large scenes
 
 ## Streaming

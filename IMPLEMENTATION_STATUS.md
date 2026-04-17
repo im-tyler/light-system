@@ -23,7 +23,7 @@ Per-frame pipeline order:
 2. Cluster/LOD selection -- **CPU** (`simulate_traversal`) with normal-cone backface cull; output uploaded to the same buffers the GPU shader used to populate. The serial DFS compute shader is retained for reference but not dispatched.
 3. Occlusion refinement (project cluster AABB against previous frame's HZB -- skipped on frame 0) -- GPU compute
 4. Shadow pass (depth-only render from light orthographic projection, 2048px, depth bias) -- GPU graphics
-5. Main geometry pass (vertex pulling from payload SSBOs, smooth vertex normals + hemisphere ambient + directional lighting + shadow sampling) -- GPU graphics
+5. Main geometry pass (vertex pulling from payload SSBOs, smooth vertex normals + hemisphere ambient + directional lighting + 8-tap Poisson-disk PCF shadow with per-pixel rotation and slope-scaled bias) -- GPU graphics
 6. HZB construction (depth-copy compute shader + per-mip max-downsample cascade) -- GPU compute
 
 GPU timestamp profiler emits `MERIDIAN_GPU: cull=.. sel=.. occ=.. shadow=.. main=.. hzb=.. total=..ms` every frame.
@@ -73,7 +73,6 @@ Per-frame CPU (emitted every 60 frames as `MERIDIAN_CPU: ...`):
 ## Not Yet Implemented
 
 - Cascaded shadow maps (current shadow pass is single-map orthographic)
-- PCF / poisson shadow filtering
 - Per-cluster backface culling with normal cones on LOD clusters (currently base only; many LOD clusters have cones but shader `emit_lod` skips the test)
 - CPU cluster-level frustum culling
 - Real streaming scheduler (CPU prototype exists but pages start all-resident)

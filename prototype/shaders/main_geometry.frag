@@ -28,25 +28,43 @@ void main() {
     vec3 L = normalize(frame.light_dir.xyz);
     float ndotl = max(dot(N, L), 0.0);
 
-    // Shadow map lookup
+    // Shadow map lookup with Poisson-disk PCF + slope-scaled bias.
     vec4 light_clip = frame.light_vp * vec4(frag_world_pos, 1.0);
     vec3 light_ndc = light_clip.xyz / light_clip.w;
     vec2 shadow_uv = light_ndc.xy * 0.5 + 0.5;
-    float shadow_ref = light_ndc.z;
     float shadow = 1.0;
     if (shadow_uv.x >= 0.0 && shadow_uv.x <= 1.0 &&
         shadow_uv.y >= 0.0 && shadow_uv.y <= 1.0 &&
-        shadow_ref >= 0.0 && shadow_ref <= 1.0) {
-        // PCF 3x3 shadow filtering
-        shadow = 0.0;
+        light_ndc.z >= 0.0 && light_ndc.z <= 1.0) {
+        // Slope-scaled bias: grow bias as the surface grazes the light direction.
+        float cos_theta = clamp(dot(N, L), 0.0, 1.0);
+        float slope = sqrt(max(1.0 - cos_theta * cos_theta, 0.0)) / max(cos_theta, 1e-3);
+        float bias = clamp(0.0004 * slope, 0.00005, 0.005);
+        float shadow_ref = light_ndc.z - bias;
+
+        // 8-tap Poisson disk, rotated per-pixel by interleaved gradient noise to
+        // break up banding from the fixed kernel.
+        const vec2 poisson[8] = vec2[8](
+            vec2(-0.94201624, -0.39906216), vec2( 0.94558609, -0.76890725),
+            vec2(-0.09418410, -0.92938870), vec2( 0.34495938,  0.29387760),
+            vec2(-0.91588581,  0.45771432), vec2(-0.38277543,  0.27676845),
+            vec2( 0.44323325, -0.97511554), vec2( 0.53742981, -0.47373420));
+
+        // Interleaved-gradient-noise rotation. Uses gl_FragCoord for screen-stable jitter.
+        float ign = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+        float rot_ang = ign * 6.28318530718;
+        float sr = sin(rot_ang);
+        float cr = cos(rot_ang);
+        mat2 rot = mat2(cr, -sr, sr, cr);
+
         vec2 texel_size = vec2(1.0) / vec2(textureSize(shadow_map, 0));
-        for (int x = -1; x <= 1; x++) {
-            for (int y = -1; y <= 1; y++) {
-                vec2 offset = vec2(float(x), float(y)) * texel_size;
-                shadow += texture(shadow_map, vec3(shadow_uv + offset, shadow_ref));
-            }
+        float radius = 2.5; // in texels
+        shadow = 0.0;
+        for (int i = 0; i < 8; i++) {
+            vec2 offset = rot * poisson[i] * texel_size * radius;
+            shadow += texture(shadow_map, vec3(shadow_uv + offset, shadow_ref));
         }
-        shadow /= 9.0;
+        shadow *= (1.0 / 8.0);
     }
 
     // Hemisphere ambient (sky blue from above, ground bounce from below)
