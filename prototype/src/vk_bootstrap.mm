@@ -198,6 +198,118 @@ VkResult create_uploaded_buffer(VkPhysicalDevice physical_device, VkDevice devic
     return VK_SUCCESS;
 }
 
+// Uploads `data` to a DEVICE_LOCAL buffer via a one-shot HOST_VISIBLE staging
+// buffer + vkCmdCopyBuffer on `queue`. Used for large, immutable assets like
+// cluster geometry payload where GPU-local residency outperforms keeping the
+// data CPU-mapped. Falls back to a HOST_VISIBLE buffer if the implementation
+// does not surface a pure DEVICE_LOCAL memory type (no functional change,
+// just skips the copy).
+VkResult create_device_local_buffer_staged(VkPhysicalDevice physical_device, VkDevice device,
+                                           VkQueue queue, uint32_t queue_family,
+                                           const void* data, VkDeviceSize size,
+                                           VkBufferUsageFlags usage,
+                                           UploadedBuffer& out_buffer) {
+    if (size == 0) return VK_SUCCESS;
+
+    // If the platform has no DEVICE_LOCAL-without-HOST-VISIBLE memory type,
+    // the staging dance is pure overhead -- just fall back to the existing
+    // HOST_COHERENT create path.
+    {
+        VkBufferCreateInfo probe_info{};
+        probe_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        probe_info.size = size;
+        probe_info.usage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        probe_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        VkBuffer probe_buf = VK_NULL_HANDLE;
+        if (vkCreateBuffer(device, &probe_info, nullptr, &probe_buf) == VK_SUCCESS) {
+            VkMemoryRequirements mreq{};
+            vkGetBufferMemoryRequirements(device, probe_buf, &mreq);
+            vkDestroyBuffer(device, probe_buf, nullptr);
+            const uint32_t dev_only = find_memory_type(physical_device, mreq.memoryTypeBits,
+                                                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            const uint32_t host_any = find_memory_type(physical_device, mreq.memoryTypeBits,
+                                                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+            if (dev_only == kInvalidQueueFamily || dev_only == host_any) {
+                // Unified-memory path (typical for Apple): no staging win.
+                return create_uploaded_buffer(physical_device, device, data, size, usage, out_buffer);
+            }
+        }
+    }
+
+    // Staging buffer (HOST_VISIBLE, TRANSFER_SRC).
+    UploadedBuffer staging{};
+    VkResult r = create_uploaded_buffer(physical_device, device, data, size,
+                                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT, staging);
+    if (r != VK_SUCCESS) return r;
+
+    // Destination buffer (DEVICE_LOCAL + usage + TRANSFER_DST).
+    VkBufferCreateInfo buf_info{};
+    buf_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    buf_info.size = size;
+    buf_info.usage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    buf_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    r = vkCreateBuffer(device, &buf_info, nullptr, &out_buffer.buffer);
+    if (r != VK_SUCCESS) { destroy_uploaded_buffer(device, staging); return r; }
+
+    VkMemoryRequirements mreq{};
+    vkGetBufferMemoryRequirements(device, out_buffer.buffer, &mreq);
+    VkMemoryAllocateInfo alloc{};
+    alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    alloc.allocationSize = mreq.size;
+    alloc.memoryTypeIndex = find_memory_type(physical_device, mreq.memoryTypeBits,
+                                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (alloc.memoryTypeIndex == kInvalidQueueFamily) {
+        destroy_uploaded_buffer(device, staging);
+        vkDestroyBuffer(device, out_buffer.buffer, nullptr);
+        out_buffer.buffer = VK_NULL_HANDLE;
+        return VK_ERROR_MEMORY_MAP_FAILED;
+    }
+    r = vkAllocateMemory(device, &alloc, nullptr, &out_buffer.memory);
+    if (r != VK_SUCCESS) { destroy_uploaded_buffer(device, staging); return r; }
+    r = vkBindBufferMemory(device, out_buffer.buffer, out_buffer.memory, 0);
+    if (r != VK_SUCCESS) { destroy_uploaded_buffer(device, staging); return r; }
+    out_buffer.size = size;
+
+    // One-shot transient command pool for the copy.
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandPoolCreateInfo pool_info{};
+    pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    pool_info.queueFamilyIndex = queue_family;
+    pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    r = vkCreateCommandPool(device, &pool_info, nullptr, &pool);
+    if (r != VK_SUCCESS) { destroy_uploaded_buffer(device, staging); return r; }
+
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VkCommandBufferAllocateInfo cb_info{};
+    cb_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cb_info.commandPool = pool;
+    cb_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cb_info.commandBufferCount = 1;
+    vkAllocateCommandBuffers(device, &cb_info, &cmd);
+
+    VkCommandBufferBeginInfo begin{};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &begin);
+
+    VkBufferCopy copy{};
+    copy.size = size;
+    vkCmdCopyBuffer(cmd, staging.buffer, out_buffer.buffer, 1, &copy);
+
+    vkEndCommandBuffer(cmd);
+
+    VkSubmitInfo submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &cmd;
+    vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
+    vkQueueWaitIdle(queue);
+
+    vkDestroyCommandPool(device, pool, nullptr);
+    destroy_uploaded_buffer(device, staging);
+    return VK_SUCCESS;
+}
+
 namespace {  // reopen anonymous namespace for internal helpers
 
 VkResult update_uploaded_buffer(VkDevice device, const void* data, VkDeviceSize size,
@@ -519,17 +631,8 @@ VkResult update_vector_buffer(VkDevice device, const std::vector<T>& values,
                                   uploaded_buffer);
 }
 
-VkResult upload_byte_buffer(VkPhysicalDevice physical_device, VkDevice device,
-                            const std::vector<std::byte>& values, VkBufferUsageFlags usage,
-                            UploadedBuffer& uploaded_buffer) {
-    if (values.empty()) {
-        return VK_SUCCESS;
-    }
-    return create_uploaded_buffer(physical_device, device, values.data(),
-                                  static_cast<VkDeviceSize>(values.size()), usage, uploaded_buffer);
-}
-
 VkResult upload_scene_buffers(VkPhysicalDevice physical_device, VkDevice device,
+                              VkQueue upload_queue, uint32_t upload_queue_family,
                               const UploadableScene& scene, UploadedSceneBuffers& buffers,
                               VkBootstrapReport& report) {
     const VkBufferUsageFlags metadata_usage =
@@ -565,11 +668,23 @@ VkResult upload_scene_buffers(VkPhysicalDevice physical_device, VkDevice device,
     result = upload_vector_buffer(physical_device, device, scene.page_residency, metadata_usage,
                                   buffers.page_residency);
     if (result != VK_SUCCESS) return result;
-    result = upload_byte_buffer(physical_device, device, scene.base_payload, metadata_usage,
-                                buffers.base_payload);
+    // Payload buffers are large and immutable. Push them to DEVICE_LOCAL via
+    // a staged copy when the platform has a dedicated device-only heap.
+    if (!scene.base_payload.empty()) {
+        result = create_device_local_buffer_staged(
+            physical_device, device, upload_queue, upload_queue_family,
+            scene.base_payload.data(),
+            static_cast<VkDeviceSize>(scene.base_payload.size()),
+            metadata_usage, buffers.base_payload);
+    }
     if (result != VK_SUCCESS) return result;
-    result = upload_byte_buffer(physical_device, device, scene.lod_payload, metadata_usage,
-                                buffers.lod_payload);
+    if (!scene.lod_payload.empty()) {
+        result = create_device_local_buffer_staged(
+            physical_device, device, upload_queue, upload_queue_family,
+            scene.lod_payload.data(),
+            static_cast<VkDeviceSize>(scene.lod_payload.size()),
+            metadata_usage, buffers.lod_payload);
+    }
     if (result != VK_SUCCESS) return result;
 
     const UploadedBuffer* all_buffers[] = {
@@ -1722,7 +1837,9 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             }
         }
 
-        result = upload_scene_buffers(selection.physical_device, device, report.uploadable_scene,
+        result = upload_scene_buffers(selection.physical_device, device,
+                                      graphics_queue, selection.queues.graphics_family,
+                                      report.uploadable_scene,
                                       scene_buffers, report);
         if (result != VK_SUCCESS) {
             std::ostringstream message;
