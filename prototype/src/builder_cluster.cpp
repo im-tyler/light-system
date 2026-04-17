@@ -440,6 +440,18 @@ void build_node_lod_links(VGeoResource& resource,
                             node_index);
     }
 
+    // We require an EXACT node/span match: traversal's try_select_lod_group
+    // emits the group's LOD clusters and returns without descending or
+    // emitting any base clusters, so the group must replace every base
+    // cluster under the node. Attaching to a node that only *contains* the
+    // group's span would leave the non-overlapping base clusters unrendered.
+    //
+    // Scenes whose clusterlod groupings don't align with the hierarchy
+    // partitions (notably massive_city: 6230 LOD groups but only ~8
+    // node-aligned spans) lose most of their LOD coverage here and fall
+    // through to per-leaf base emit. The right long-term fix is to partition
+    // the hierarchy in a way that respects LOD group boundaries (or to teach
+    // traversal to stitch partial LOD coverage with complement base emits).
     std::vector<std::vector<uint32_t>> links_by_node(resource.hierarchy_nodes.size());
     for (uint32_t group_index = 0; group_index < lod_group_infos.size(); ++group_index) {
         const LodGroupBuildInfo& info = lod_group_infos[group_index];
