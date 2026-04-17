@@ -39,10 +39,23 @@ inline Vec3f camera_right(const InteractiveCamera& cam) {
     return {std::cos(cam.yaw), 0.0f, std::sin(cam.yaw)};
 }
 
+// Number of cascaded shadow map splits. Must match the array size used by
+// shadow.vert and main_geometry.frag (which bind a 3-layer depth array).
+constexpr uint32_t kShadowCascadeCount = 3;
+
 struct FrameUBO {
     float view_projection[16];
-    float light_vp[16];
+    float light_vp[kShadowCascadeCount][16];
     float light_dir[4];
+    // cascade_splits[i] is the view-space distance at which cascade i ends.
+    // Index 0..kShadowCascadeCount-1 stores the three far splits; the last
+    // slot is padding so the struct remains a multiple of 16 bytes (std140).
+    float cascade_splits[4];
+};
+
+struct CascadeLightSetup {
+    Mat4f light_vp[kShadowCascadeCount];
+    float splits[kShadowCascadeCount];
 };
 
 inline Mat4f identity_matrix() {
@@ -165,6 +178,101 @@ inline FrustumPlanes extract_frustum_planes(const Mat4f& vp) {
         }
     }
     return fp;
+}
+
+// Build per-cascade light view-projection matrices and view-space split
+// distances. The sub-frustum for cascade i spans [near .. splits[0]] for i=0,
+// [splits[i-1] .. splits[i]] for i>0, with the last cascade ending at `far`.
+//
+// Each cascade fits a tight orthographic light projection around the 8
+// world-space corners of its sub-frustum, then pushes the light near plane
+// back along the light direction to catch shadow casters outside the frustum.
+inline CascadeLightSetup compute_cascade_light_setup(
+    const Vec3f& camera_position,
+    const Vec3f& camera_forward_dir,
+    const Vec3f& camera_right_dir,
+    const Vec3f& camera_up_dir,
+    float vertical_fov_radians,
+    float aspect_ratio,
+    float near_plane,
+    float far_plane,
+    const Vec3f& light_dir,
+    float caster_extent,
+    float lambda) {
+    CascadeLightSetup out{};
+
+    // Log/uniform split blend (lambda=0 uniform, lambda=1 log).
+    const float clip_range = far_plane - near_plane;
+    for (uint32_t i = 0; i < kShadowCascadeCount; ++i) {
+        const float p = static_cast<float>(i + 1) / static_cast<float>(kShadowCascadeCount);
+        const float log_split = near_plane * std::pow(far_plane / near_plane, p);
+        const float uniform_split = near_plane + clip_range * p;
+        out.splits[i] = lambda * log_split + (1.0f - lambda) * uniform_split;
+    }
+
+    const Vec3f light = normalize_vec3(light_dir);
+    const Vec3f world_up = (std::fabs(light.y) > 0.99f) ? Vec3f{1.0f, 0.0f, 0.0f}
+                                                        : Vec3f{0.0f, 1.0f, 0.0f};
+
+    const float tan_half = std::tan(vertical_fov_radians * 0.5f);
+
+    for (uint32_t i = 0; i < kShadowCascadeCount; ++i) {
+        const float sub_near = (i == 0) ? near_plane : out.splits[i - 1];
+        const float sub_far = out.splits[i];
+
+        // Eight sub-frustum corners in world space.
+        const float near_h = tan_half * sub_near;
+        const float near_w = near_h * aspect_ratio;
+        const float far_h = tan_half * sub_far;
+        const float far_w = far_h * aspect_ratio;
+
+        const Vec3f fc = camera_position;
+        Vec3f corners[8];
+        auto point = [&](float dist, float dx, float dy) {
+            return Vec3f{
+                fc.x + camera_forward_dir.x * dist + camera_right_dir.x * dx + camera_up_dir.x * dy,
+                fc.y + camera_forward_dir.y * dist + camera_right_dir.y * dx + camera_up_dir.y * dy,
+                fc.z + camera_forward_dir.z * dist + camera_right_dir.z * dx + camera_up_dir.z * dy,
+            };
+        };
+        corners[0] = point(sub_near, -near_w, -near_h);
+        corners[1] = point(sub_near,  near_w, -near_h);
+        corners[2] = point(sub_near,  near_w,  near_h);
+        corners[3] = point(sub_near, -near_w,  near_h);
+        corners[4] = point(sub_far,  -far_w,  -far_h);
+        corners[5] = point(sub_far,   far_w,  -far_h);
+        corners[6] = point(sub_far,   far_w,   far_h);
+        corners[7] = point(sub_far,  -far_w,   far_h);
+
+        Vec3f center{0.0f, 0.0f, 0.0f};
+        for (const Vec3f& c : corners) {
+            center.x += c.x; center.y += c.y; center.z += c.z;
+        }
+        center.x /= 8.0f; center.y /= 8.0f; center.z /= 8.0f;
+
+        // Use the sub-frustum bounding-sphere radius for a rotation-stable extent.
+        float radius = 0.0f;
+        for (const Vec3f& c : corners) {
+            const Vec3f d = subtract_vec3(c, center);
+            radius = std::max(radius, std::sqrt(dot_vec3(d, d)));
+        }
+        // Round up to avoid shimmer as camera moves.
+        radius = std::ceil(radius * 16.0f) / 16.0f;
+
+        const Vec3f eye{
+            center.x - light.x * radius,
+            center.y - light.y * radius,
+            center.z - light.z * radius,
+        };
+        const Mat4f light_view = look_at_matrix(eye, center, world_up);
+        // Orthographic fit: symmetric box around the cascade center.
+        // Push the near plane back (toward the light) by caster_extent so
+        // shadow casters outside the sub-frustum are captured.
+        const Mat4f light_proj = ortho_matrix(-radius, radius, -radius, radius,
+                                              -caster_extent, 2.0f * radius);
+        out.light_vp[i] = multiply_matrix(light_proj, light_view);
+    }
+    return out;
 }
 
 } // namespace meridian

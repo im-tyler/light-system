@@ -30,7 +30,7 @@ VkResult create_shadow_context(VkPhysicalDevice physical_device, VkDevice device
                                ShadowContext& context) {
     context.resolution = shadow_resolution;
 
-    // Shadow depth image
+    // 2D array depth image, one layer per cascade.
     VkFormat depth_format = find_depth_format(physical_device);
     if (depth_format == VK_FORMAT_UNDEFINED) return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
@@ -40,7 +40,7 @@ VkResult create_shadow_context(VkPhysicalDevice physical_device, VkDevice device
     image_info.format = depth_format;
     image_info.extent = {shadow_resolution, shadow_resolution, 1};
     image_info.mipLevels = 1;
-    image_info.arrayLayers = 1;
+    image_info.arrayLayers = kShadowCascadeCount;
     image_info.samples = VK_SAMPLE_COUNT_1_BIT;
     image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
     image_info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -59,31 +59,52 @@ VkResult create_shadow_context(VkPhysicalDevice physical_device, VkDevice device
     result = vkBindImageMemory(device, context.depth_image, context.depth_memory, 0);
     if (result != VK_SUCCESS) return result;
 
-    VkImageViewCreateInfo view_info{};
-    view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    view_info.image = context.depth_image;
-    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    view_info.format = depth_format;
-    view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-    view_info.subresourceRange.levelCount = 1;
-    view_info.subresourceRange.layerCount = 1;
-    result = vkCreateImageView(device, &view_info, nullptr, &context.depth_view);
-    if (result != VK_SUCCESS) return result;
+    // Full 2D_ARRAY view for sampling in the main pass as sampler2DArrayShadow.
+    {
+        VkImageViewCreateInfo view_info{};
+        view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        view_info.image = context.depth_image;
+        view_info.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        view_info.format = depth_format;
+        view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        view_info.subresourceRange.levelCount = 1;
+        view_info.subresourceRange.layerCount = kShadowCascadeCount;
+        result = vkCreateImageView(device, &view_info, nullptr, &context.depth_array_view);
+        if (result != VK_SUCCESS) return result;
+    }
 
-    // Sampler for shadow map lookup (comparison sampler)
+    // Per-layer 2D views for framebuffer attachments (render pass writes one layer).
+    for (uint32_t i = 0; i < kShadowCascadeCount; ++i) {
+        VkImageViewCreateInfo view_info{};
+        view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        view_info.image = context.depth_image;
+        view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        view_info.format = depth_format;
+        view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        view_info.subresourceRange.levelCount = 1;
+        view_info.subresourceRange.baseArrayLayer = i;
+        view_info.subresourceRange.layerCount = 1;
+        result = vkCreateImageView(device, &view_info, nullptr, &context.cascade_views[i]);
+        if (result != VK_SUCCESS) return result;
+    }
+
+    // Shadow sampler. MoltenVK's translation of sampler2DArrayShadow samples
+    // at zero cost on Apple silicon (Metal depth2d_array.sample_compare does
+    // not always route correctly through SPIRV-Cross), so we sample the raw
+    // depth with a regular sampler and do the comparison in the fragment shader.
     VkSamplerCreateInfo sampler_info{};
     sampler_info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-    sampler_info.magFilter = VK_FILTER_LINEAR;
-    sampler_info.minFilter = VK_FILTER_LINEAR;
+    sampler_info.magFilter = VK_FILTER_NEAREST;
+    sampler_info.minFilter = VK_FILTER_NEAREST;
     sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
     sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
     sampler_info.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
-    sampler_info.compareEnable = VK_TRUE;
-    sampler_info.compareOp = VK_COMPARE_OP_LESS;
+    sampler_info.compareEnable = VK_FALSE;
     result = vkCreateSampler(device, &sampler_info, nullptr, &context.sampler);
     if (result != VK_SUCCESS) return result;
 
-    // Depth-only render pass
+    // Depth-only render pass (identical for all cascades).
     VkAttachmentDescription depth_attach{};
     depth_attach.format = depth_format;
     depth_attach.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -111,25 +132,27 @@ VkResult create_shadow_context(VkPhysicalDevice physical_device, VkDevice device
     result = vkCreateRenderPass(device, &rp_info, nullptr, &context.render_pass);
     if (result != VK_SUCCESS) return result;
 
-    VkFramebufferCreateInfo fb_info{};
-    fb_info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-    fb_info.renderPass = context.render_pass;
-    fb_info.attachmentCount = 1;
-    fb_info.pAttachments = &context.depth_view;
-    fb_info.width = shadow_resolution;
-    fb_info.height = shadow_resolution;
-    fb_info.layers = 1;
-    result = vkCreateFramebuffer(device, &fb_info, nullptr, &context.framebuffer);
-    if (result != VK_SUCCESS) return result;
+    // One framebuffer per cascade, bound to that cascade's layer view.
+    for (uint32_t i = 0; i < kShadowCascadeCount; ++i) {
+        VkFramebufferCreateInfo fb_info{};
+        fb_info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        fb_info.renderPass = context.render_pass;
+        fb_info.attachmentCount = 1;
+        fb_info.pAttachments = &context.cascade_views[i];
+        fb_info.width = shadow_resolution;
+        fb_info.height = shadow_resolution;
+        fb_info.layers = 1;
+        result = vkCreateFramebuffer(device, &fb_info, nullptr, &context.framebuffers[i]);
+        if (result != VK_SUCCESS) return result;
+    }
 
-    // Shadow vertex shader: vertex pulling via indirect draw list SSBO
+    // Shadow vertex shader: vertex pulling via indirect draw list SSBO.
     const std::string vert_source = load_shader_source(resolve_shader_path("shadow.vert"));
-
     const std::vector<uint32_t> vert_spirv =
         compile_glsl_to_spirv(vert_source, shaderc_vertex_shader, "shadow.vert");
     VkShaderModule vert_mod = create_shader_module(device, vert_spirv);
 
-    // Descriptor set: payload SSBOs + frame UBO + draw list SSBO
+    // Descriptor set: payload SSBOs + frame UBO + draw list SSBO.
     VkDescriptorSetLayoutBinding ds_bindings[4] = {};
     ds_bindings[0].binding = 0;
     ds_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -155,14 +178,23 @@ VkResult create_shadow_context(VkPhysicalDevice physical_device, VkDevice device
     result = vkCreateDescriptorSetLayout(device, &ds_layout_info, nullptr, &context.descriptor_set_layout);
     if (result != VK_SUCCESS) { vkDestroyShaderModule(device, vert_mod, nullptr); return result; }
 
+    // Push constant range: the shadow vertex shader reads the cascade index
+    // to pick which light_vp to transform through.
+    VkPushConstantRange push_range{};
+    push_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    push_range.offset = 0;
+    push_range.size = sizeof(uint32_t);
+
     VkPipelineLayoutCreateInfo pl_info{};
     pl_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     pl_info.setLayoutCount = 1;
     pl_info.pSetLayouts = &context.descriptor_set_layout;
+    pl_info.pushConstantRangeCount = 1;
+    pl_info.pPushConstantRanges = &push_range;
     result = vkCreatePipelineLayout(device, &pl_info, nullptr, &context.pipeline_layout);
     if (result != VK_SUCCESS) { vkDestroyShaderModule(device, vert_mod, nullptr); return result; }
 
-    // Depth-only graphics pipeline (no fragment shader)
+    // Depth-only graphics pipeline (no fragment shader).
     VkPipelineShaderStageCreateInfo stage{};
     stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stage.stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -230,7 +262,7 @@ VkResult create_shadow_context(VkPhysicalDevice physical_device, VkDevice device
     vkDestroyShaderModule(device, vert_mod, nullptr);
     if (result != VK_SUCCESS) return result;
 
-    // Descriptor set binding payload SSBOs + frame UBO + draw list SSBO
+    // Descriptor set binding payload SSBOs + frame UBO + draw list SSBO.
     VkDescriptorPoolSize shadow_pool_sizes[2] = {};
     shadow_pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     shadow_pool_sizes[0].descriptorCount = 3;
@@ -295,26 +327,14 @@ VkResult create_shadow_context(VkPhysicalDevice physical_device, VkDevice device
     }
     vkUpdateDescriptorSets(device, wc, ds_writes, 0, nullptr);
 
-    // Build light VP matrix: orthographic from above-right to cover the scene bounds
-    const Vec3f center = {
-        (resource.bounds.min.x + resource.bounds.max.x) * 0.5f,
-        (resource.bounds.min.y + resource.bounds.max.y) * 0.5f,
-        (resource.bounds.min.z + resource.bounds.max.z) * 0.5f,
-    };
+    // Cache scene radius so the per-frame CSM fit can size the caster-extent
+    // push-back consistently across frames.
     const Vec3f extents = {
         resource.bounds.max.x - resource.bounds.min.x,
         resource.bounds.max.y - resource.bounds.min.y,
         resource.bounds.max.z - resource.bounds.min.z,
     };
-    const float radius = std::max({extents.x, extents.y, extents.z, 1.0f}) * 0.75f;
-    const Vec3f light_dir = normalize_vec3({0.4f, 0.7f, 0.5f});
-    const Vec3f light_pos = {center.x + light_dir.x * radius * 3.0f,
-                             center.y + light_dir.y * radius * 3.0f,
-                             center.z + light_dir.z * radius * 3.0f};
-    const Mat4f light_view = look_at_matrix(light_pos, center, {0.0f, 1.0f, 0.0f});
-    const Mat4f light_proj = ortho_matrix(-radius, radius, -radius, radius,
-                                           radius * 0.1f, radius * 6.0f);
-    context.light_vp = multiply_matrix(light_proj, light_view);
+    context.scene_radius = std::max({extents.x, extents.y, extents.z, 1.0f}) * 0.75f;
 
     return VK_SUCCESS;
 }

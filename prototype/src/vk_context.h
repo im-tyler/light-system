@@ -182,17 +182,19 @@ struct OcclusionRefineContext {
 struct ShadowContext {
     VkImage depth_image = VK_NULL_HANDLE;
     VkDeviceMemory depth_memory = VK_NULL_HANDLE;
-    VkImageView depth_view = VK_NULL_HANDLE;
+    VkImageView depth_array_view = VK_NULL_HANDLE;
+    VkImageView cascade_views[kShadowCascadeCount] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkFramebuffer framebuffers[kShadowCascadeCount] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
     VkSampler sampler = VK_NULL_HANDLE;
     VkRenderPass render_pass = VK_NULL_HANDLE;
-    VkFramebuffer framebuffer = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
     VkDescriptorSetLayout descriptor_set_layout = VK_NULL_HANDLE;
     VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
     uint32_t resolution = 0;
-    Mat4f light_vp;
+    CascadeLightSetup cascades{};
+    float scene_radius = 1.0f;
 };
 
 void destroy_uploaded_buffer(VkDevice device, UploadedBuffer& uploaded_buffer);

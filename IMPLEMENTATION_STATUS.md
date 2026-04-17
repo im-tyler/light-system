@@ -22,7 +22,8 @@ Per-frame pipeline order:
 1. Compute instance culling (frustum 6-plane AABB test, atomic append) -- GPU
 2. Cluster/LOD selection -- **CPU** (`simulate_traversal`) with normal-cone backface cull; output uploaded to the same buffers the GPU shader used to populate. The serial DFS compute shader is retained for reference but not dispatched.
 3. Occlusion refinement (project cluster AABB against previous frame's HZB -- skipped on frame 0) -- GPU compute
-4. Shadow pass (depth-only render from light orthographic projection, 2048px, depth bias) -- GPU graphics
+4. Shadow pass (3 cascaded shadow maps, depth-only render from per-cascade orthographic projections that tight-fit the camera sub-frusta, 2048px per cascade in a 2D-array depth image, log/uniform split blend lambda=0.7, depth bias) -- GPU graphics
+
 5. Main geometry pass (vertex pulling from payload SSBOs, smooth vertex normals + hemisphere ambient + directional lighting + 8-tap Poisson-disk PCF shadow with per-pixel rotation and slope-scaled bias) -- GPU graphics
 6. HZB construction (depth-copy compute shader + per-mip max-downsample cascade) -- GPU compute
 
@@ -60,8 +61,10 @@ GPU timestamp profiler emits `MERIDIAN_GPU: cull=.. sel=.. occ=.. shadow=.. main
 
 ### Performance (Apple M4, MoltenVK, 1280x720)
 
-Stanford Dragon (871K tris): median 17.1ms / 53-72 FPS
-Massive City (1M tris): median 53-56ms / 18-20 FPS (bottlenecked by sparse-LOD selection + degenerate normal cones + vkQueueSubmit translation cost scaling with draw count)
+Stanford Dragon (871K tris): median 29.2ms / 33.8 FPS with 3-cascade CSM + 8-tap Poisson PCF (baseline pre-CSM: 17.1ms / 53-72 FPS with PCF, single shadow map)
+Massive City (1M tris): median 70.7ms / 14.1 FPS with 3-cascade CSM + 8-tap Poisson PCF (baseline pre-CSM: 55.6ms / 17.9 FPS)
+
+The 11-15ms CSM regression is almost entirely MoltenVK vkQueueSubmit overhead from tripling shadow draws (each cascade re-submits the full camera draw list). Per-cascade frustum culling would claw most of this back.
 
 Per-pass GPU (Dragon, steady state): cull 0.1ms, sel 0.0ms (CPU), occ 0.05ms, shadow 3-4ms, main 3-4ms, hzb 0.1-0.2ms.
 
@@ -72,7 +75,7 @@ Per-frame CPU (emitted every 60 frames as `MERIDIAN_CPU: ...`):
 
 ## Not Yet Implemented
 
-- Cascaded shadow maps (current shadow pass is single-map orthographic)
+- Per-cascade frustum culling (shadow pass submits the full camera-culled draw list to each cascade -- 3x vkCmdDrawIndirect cost under MoltenVK)
 - Per-cluster backface culling with normal cones on LOD clusters (currently base only; many LOD clusters have cones but shader `emit_lod` skips the test)
 - CPU cluster-level frustum culling
 - Real streaming scheduler (CPU prototype exists but pages start all-resident)

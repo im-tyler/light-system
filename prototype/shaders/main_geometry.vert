@@ -2,8 +2,9 @@
 
 layout(set = 0, binding = 2) uniform FrameData {
     mat4 view_projection;
-    mat4 light_vp;
+    mat4 light_vp[3];
     vec4 light_dir;
+    vec4 cascade_splits;
 } frame;
 
 layout(set = 0, binding = 0) readonly buffer BasePayload { uint base_data[]; };

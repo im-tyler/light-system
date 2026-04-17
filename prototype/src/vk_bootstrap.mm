@@ -352,9 +352,14 @@ void destroy_occlusion_refine_context(VkDevice device, OcclusionRefineContext& c
 
 
 void destroy_shadow_context(VkDevice device, ShadowContext& context) {
-    if (context.framebuffer != VK_NULL_HANDLE) vkDestroyFramebuffer(device, context.framebuffer, nullptr);
+    for (VkFramebuffer& fb : context.framebuffers) {
+        if (fb != VK_NULL_HANDLE) vkDestroyFramebuffer(device, fb, nullptr);
+    }
     if (context.render_pass != VK_NULL_HANDLE) vkDestroyRenderPass(device, context.render_pass, nullptr);
-    if (context.depth_view != VK_NULL_HANDLE) vkDestroyImageView(device, context.depth_view, nullptr);
+    for (VkImageView& v : context.cascade_views) {
+        if (v != VK_NULL_HANDLE) vkDestroyImageView(device, v, nullptr);
+    }
+    if (context.depth_array_view != VK_NULL_HANDLE) vkDestroyImageView(device, context.depth_array_view, nullptr);
     if (context.sampler != VK_NULL_HANDLE) vkDestroySampler(device, context.sampler, nullptr);
     if (context.depth_image != VK_NULL_HANDLE) vkDestroyImage(device, context.depth_image, nullptr);
     if (context.depth_memory != VK_NULL_HANDLE) vkFreeMemory(device, context.depth_memory, nullptr);
@@ -1234,40 +1239,47 @@ VkResult record_debug_command_buffer(FrameContext& frame, const DebugRenderConte
                             profiler.query_pool, 6); // shadow start
     }
 
-    // Shadow pass: render scene from light perspective
+    // Shadow pass: render scene from light perspective, once per cascade. All
+    // cascades share the draw list; per-cascade culling would trim this but
+    // isn't wired yet. Each cascade writes into its own framebuffer/layer of
+    // the shared 2D array depth image.
     if (shadow.pipeline != VK_NULL_HANDLE && shadow.descriptor_set != VK_NULL_HANDLE) {
-        VkClearValue shadow_clear{};
-        shadow_clear.depthStencil.depth = 1.0f;
+        for (uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade) {
+            VkClearValue shadow_clear{};
+            shadow_clear.depthStencil.depth = 1.0f;
 
-        VkRenderPassBeginInfo shadow_rp_info{};
-        shadow_rp_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-        shadow_rp_info.renderPass = shadow.render_pass;
-        shadow_rp_info.framebuffer = shadow.framebuffer;
-        shadow_rp_info.renderArea.extent = {shadow.resolution, shadow.resolution};
-        shadow_rp_info.clearValueCount = 1;
-        shadow_rp_info.pClearValues = &shadow_clear;
+            VkRenderPassBeginInfo shadow_rp_info{};
+            shadow_rp_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+            shadow_rp_info.renderPass = shadow.render_pass;
+            shadow_rp_info.framebuffer = shadow.framebuffers[cascade];
+            shadow_rp_info.renderArea.extent = {shadow.resolution, shadow.resolution};
+            shadow_rp_info.clearValueCount = 1;
+            shadow_rp_info.pClearValues = &shadow_clear;
 
-        vkCmdBeginRenderPass(frame.command_buffer, &shadow_rp_info, VK_SUBPASS_CONTENTS_INLINE);
-        vkCmdBindPipeline(frame.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, shadow.pipeline);
-        vkCmdBindDescriptorSets(frame.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                shadow.pipeline_layout, 0, 1, &shadow.descriptor_set, 0, nullptr);
+            vkCmdBeginRenderPass(frame.command_buffer, &shadow_rp_info, VK_SUBPASS_CONTENTS_INLINE);
+            vkCmdBindPipeline(frame.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, shadow.pipeline);
+            vkCmdBindDescriptorSets(frame.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                    shadow.pipeline_layout, 0, 1, &shadow.descriptor_set, 0, nullptr);
+            vkCmdPushConstants(frame.command_buffer, shadow.pipeline_layout,
+                               VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(uint32_t), &cascade);
 
-        if (compute_selection.draw_list.buffer != VK_NULL_HANDLE &&
-            compute_selection.draw_count.buffer != VK_NULL_HANDLE) {
-            if (has_draw_indirect_count) {
-                vkCmdDrawIndirectCount(frame.command_buffer,
-                                       compute_selection.draw_list.buffer, 0,
-                                       compute_selection.draw_count.buffer, 0,
-                                       compute_selection.max_draws,
-                                       sizeof(GpuDrawEntry));
-            } else {
-                vkCmdDrawIndirect(frame.command_buffer,
-                                  compute_selection.draw_list.buffer, 0,
-                                  compute_selection.max_draws,
-                                  sizeof(GpuDrawEntry));
+            if (compute_selection.draw_list.buffer != VK_NULL_HANDLE &&
+                compute_selection.draw_count.buffer != VK_NULL_HANDLE) {
+                if (has_draw_indirect_count) {
+                    vkCmdDrawIndirectCount(frame.command_buffer,
+                                           compute_selection.draw_list.buffer, 0,
+                                           compute_selection.draw_count.buffer, 0,
+                                           compute_selection.max_draws,
+                                           sizeof(GpuDrawEntry));
+                } else {
+                    vkCmdDrawIndirect(frame.command_buffer,
+                                      compute_selection.draw_list.buffer, 0,
+                                      compute_selection.max_draws,
+                                      sizeof(GpuDrawEntry));
+                }
             }
+            vkCmdEndRenderPass(frame.command_buffer);
         }
-        vkCmdEndRenderPass(frame.command_buffer);
     }
 
     if (profiler.query_pool != VK_NULL_HANDLE) {
@@ -1856,11 +1868,11 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             return report;
         }
 
-        // Bind shadow map sampler to main pass descriptor set binding 3
-        if (shadow.depth_view != VK_NULL_HANDLE && shadow.sampler != VK_NULL_HANDLE) {
+        // Bind cascaded shadow map (2D array) to main pass descriptor set binding 3
+        if (shadow.depth_array_view != VK_NULL_HANDLE && shadow.sampler != VK_NULL_HANDLE) {
             VkDescriptorImageInfo shadow_img_info{};
             shadow_img_info.sampler = shadow.sampler;
-            shadow_img_info.imageView = shadow.depth_view;
+            shadow_img_info.imageView = shadow.depth_array_view;
             shadow_img_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
             VkWriteDescriptorSet shadow_write{};
@@ -2095,13 +2107,55 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                 return report;
             }
 
-            // Upload per-frame UBO
+            // Compute cascaded shadow light view-projection matrices for the
+            // current camera. Using the same camera projection parameters
+            // (fov, aspect, near, far) that feed view_projection above.
+            const Vec3f norm_light = normalize_vec3({0.4f, 0.7f, 0.5f});
+            {
+                const float aspect = std::max(1.0f,
+                    static_cast<float>(swapchain.extent.width)) /
+                    std::max(1.0f, static_cast<float>(swapchain.extent.height));
+                const float fov = 55.0f * 3.14159265f / 180.0f;
+                const float radius = std::max({
+                    resource.bounds.max.x - resource.bounds.min.x,
+                    resource.bounds.max.y - resource.bounds.min.y,
+                    resource.bounds.max.z - resource.bounds.min.z, 1.0f});
+                const float near_p = std::max(0.01f, radius * 0.01f);
+                // Clamp the far plane for CSM so the cascades pack usefully
+                // around the camera rather than stretching to the full
+                // 8x-radius projection far, which would drown cascade 2 in
+                // empty space for indoor scenes.
+                const float far_p = radius * 3.0f;
+                const Vec3f fwd = config.interactive
+                                      ? camera_forward(interactive_cam)
+                                      : normalize_vec3(subtract_vec3(
+                                            {
+                                                (resource.bounds.min.x + resource.bounds.max.x) * 0.5f,
+                                                (resource.bounds.min.y + resource.bounds.max.y) * 0.5f,
+                                                (resource.bounds.min.z + resource.bounds.max.z) * 0.5f,
+                                            },
+                                            camera_frame.camera_position));
+                // World-space right/up derived from forward + world up.
+                const Vec3f world_up = {0.0f, 1.0f, 0.0f};
+                const Vec3f rgt = normalize_vec3(cross_vec3(fwd, world_up));
+                const Vec3f up_corr = cross_vec3(rgt, fwd);
+                shadow.cascades = compute_cascade_light_setup(
+                    camera_frame.camera_position, fwd, rgt, up_corr,
+                    fov, aspect, near_p, far_p, norm_light,
+                    /*caster_extent=*/radius * 1.5f,
+                    /*lambda=*/0.7f);
+            }
+
+            // Upload per-frame UBO (camera VP + 3 cascade light VPs + splits).
             FrameUBO frame_ubo_data{};
             std::memcpy(frame_ubo_data.view_projection, camera_frame.view_projection.m,
                         sizeof(frame_ubo_data.view_projection));
-            std::memcpy(frame_ubo_data.light_vp, shadow.light_vp.m,
-                        sizeof(frame_ubo_data.light_vp));
-            const Vec3f norm_light = normalize_vec3({0.4f, 0.7f, 0.5f});
+            for (uint32_t c = 0; c < kShadowCascadeCount; ++c) {
+                std::memcpy(frame_ubo_data.light_vp[c], shadow.cascades.light_vp[c].m,
+                            sizeof(frame_ubo_data.light_vp[c]));
+                frame_ubo_data.cascade_splits[c] = shadow.cascades.splits[c];
+            }
+            frame_ubo_data.cascade_splits[3] = 0.0f;
             frame_ubo_data.light_dir[0] = norm_light.x;
             frame_ubo_data.light_dir[1] = norm_light.y;
             frame_ubo_data.light_dir[2] = norm_light.z;
