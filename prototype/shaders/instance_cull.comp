@@ -1,0 +1,48 @@
+#version 450
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform CullData {
+    vec4 frustum_planes[6];
+    uint instance_count;
+} cull;
+
+struct InstanceRecord {
+    mat4 object_to_world;
+    vec4 bounds_min;
+    vec4 bounds_max;
+    uint resource_index;
+    uint root_node_index;
+    uint flags;
+    uint reserved;
+};
+
+layout(set = 0, binding = 0) readonly buffer Instances { InstanceRecord instances[]; };
+layout(set = 0, binding = 1) buffer VisibleInstances { uint visible_indices[]; };
+layout(set = 0, binding = 2) buffer Counter { uint visible_count; };
+
+bool aabb_outside_plane(vec4 plane, vec3 bmin, vec3 bmax) {
+    vec3 p = vec3(
+        plane.x > 0.0 ? bmax.x : bmin.x,
+        plane.y > 0.0 ? bmax.y : bmin.y,
+        plane.z > 0.0 ? bmax.z : bmin.z
+    );
+    return dot(plane.xyz, p) + plane.w < 0.0;
+}
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= cull.instance_count) return;
+
+    InstanceRecord inst = instances[id];
+    vec3 bmin = inst.bounds_min.xyz;
+    vec3 bmax = inst.bounds_max.xyz;
+
+    for (uint i = 0; i < 6; i++) {
+        if (aabb_outside_plane(cull.frustum_planes[i], bmin, bmax)) {
+            return;
+        }
+    }
+
+    uint slot = atomicAdd(visible_count, 1u);
+    visible_indices[slot] = id;
+}

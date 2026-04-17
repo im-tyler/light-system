@@ -1,0 +1,169 @@
+#version 450
+layout(local_size_x = 1) in;
+
+layout(push_constant) uniform SelectionParams {
+    float error_threshold;
+    float camera_pos_x;
+    float camera_pos_y;
+    float camera_pos_z;
+    uint pad[4];
+} params;
+
+layout(set = 0, binding = 0) readonly buffer VisibleIndices { uint visible_indices[]; };
+layout(set = 0, binding = 1) readonly buffer CullCount { uint cull_visible_count; };
+layout(set = 0, binding = 2) readonly buffer NodeData { uint node_data[]; };
+layout(set = 0, binding = 3) readonly buffer ClusterData { uint cluster_data[]; };
+layout(set = 0, binding = 4) readonly buffer LodGroupData { uint lod_group_data[]; };
+layout(set = 0, binding = 5) readonly buffer LodClusterData { uint lod_cluster_data[]; };
+layout(set = 0, binding = 6) readonly buffer LodLinkData { uint lod_link_data[]; };
+layout(set = 0, binding = 7) readonly buffer ResidencyData { uint residency_data[]; };
+layout(set = 0, binding = 8) readonly buffer InstanceData { uint instance_data[]; };
+
+struct DrawEntry {
+    uint draw_vertex_count;
+    uint draw_instance_count;
+    uint draw_first_vertex;
+    uint draw_first_instance;
+    uint cluster_index;
+    uint geometry_kind;
+    uint payload_offset;
+    uint local_vertex_count;
+};
+layout(set = 0, binding = 9) writeonly buffer DrawList { DrawEntry draws[]; };
+layout(set = 0, binding = 10) buffer DrawCount { uint draw_count; };
+
+// Word strides per struct (sizeof / 4)
+const uint NODE_W = 19;
+const uint CLUSTER_W = 24;
+const uint LOD_GROUP_W = 16;
+const uint LOD_CLUSTER_W = 20;
+const uint PAGE_W = 4;
+const uint INSTANCE_W = 28;
+
+bool is_page_resident(uint page_index) {
+    uint state = residency_data[page_index * PAGE_W];
+    return state == 3u || state == 4u;
+}
+
+bool is_base_cluster_backfacing(uint ci) {
+    uint b = ci * CLUSTER_W;
+    vec3 cone_axis = vec3(
+        uintBitsToFloat(cluster_data[b + 20u]),
+        uintBitsToFloat(cluster_data[b + 21u]),
+        uintBitsToFloat(cluster_data[b + 22u])
+    );
+    float cone_cutoff = uintBitsToFloat(cluster_data[b + 23u]);
+    // Degenerate cone (meshoptimizer uses cutoff >= 1.0): never cull
+    if (cone_cutoff >= 1.0)
+        return false;
+    // Compute cluster center from bounds
+    vec3 cluster_center = vec3(
+        (uintBitsToFloat(cluster_data[b + 12u]) + uintBitsToFloat(cluster_data[b + 16u])) * 0.5,
+        (uintBitsToFloat(cluster_data[b + 13u]) + uintBitsToFloat(cluster_data[b + 17u])) * 0.5,
+        (uintBitsToFloat(cluster_data[b + 14u]) + uintBitsToFloat(cluster_data[b + 18u])) * 0.5
+    );
+    vec3 view_dir = normalize(cluster_center - vec3(params.camera_pos_x, params.camera_pos_y, params.camera_pos_z));
+    return dot(view_dir, cone_axis) < -cone_cutoff;
+}
+
+void emit_base(uint ci) {
+    uint b = ci * CLUSTER_W;
+    uint tris = cluster_data[b + 2u];
+    uint slot = atomicAdd(draw_count, 1u);
+    draws[slot].draw_vertex_count = tris * 3u;
+    draws[slot].draw_instance_count = 1u;
+    draws[slot].draw_first_vertex = 0u;
+    draws[slot].draw_first_instance = slot;
+    draws[slot].cluster_index = ci;
+    draws[slot].geometry_kind = 0u;
+    draws[slot].payload_offset = cluster_data[b + 4u];
+    draws[slot].local_vertex_count = cluster_data[b + 1u];
+}
+
+void emit_lod(uint ci) {
+    uint b = ci * LOD_CLUSTER_W;
+    uint tris = lod_cluster_data[b + 3u];
+    uint slot = atomicAdd(draw_count, 1u);
+    draws[slot].draw_vertex_count = tris * 3u;
+    draws[slot].draw_instance_count = 1u;
+    draws[slot].draw_first_vertex = 0u;
+    draws[slot].draw_first_instance = slot;
+    draws[slot].cluster_index = ci;
+    draws[slot].geometry_kind = 1u;
+    draws[slot].payload_offset = lod_cluster_data[b + 5u];
+    draws[slot].local_vertex_count = lod_cluster_data[b + 2u];
+}
+
+bool try_lod_group(uint gi) {
+    uint gb = gi * LOD_GROUP_W;
+    uint first = lod_group_data[gb + 1u];
+    uint count = lod_group_data[gb + 2u];
+    for (uint i = 0u; i < count; i++) {
+        uint page = lod_cluster_data[(first + i) * LOD_CLUSTER_W + 4u];
+        if (!is_page_resident(page)) return false;
+    }
+    for (uint i = 0u; i < count; i++) {
+        emit_lod(first + i);
+    }
+    return true;
+}
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= cull_visible_count) return;
+
+    uint inst_idx = visible_indices[id];
+    uint root = instance_data[inst_idx * INSTANCE_W + 25u];
+
+    uint stack[2048];
+    int sp = 0;
+    stack[sp++] = root;
+
+    while (sp > 0) {
+        uint ni = stack[--sp];
+        uint nb = ni * NODE_W;
+
+        uint first_child = node_data[nb + 1u];
+        uint child_count = node_data[nb + 2u];
+        uint first_cluster = node_data[nb + 3u];
+        uint cluster_count = node_data[nb + 4u];
+        uint first_lod_link = node_data[nb + 5u];
+        uint lod_link_count = node_data[nb + 6u];
+        float node_error = uintBitsToFloat(node_data[nb + 9u]);
+
+        // Try LOD group selection
+        uint sel_group = 0xFFFFFFFFu;
+        for (uint l = 0u; l < lod_link_count; l++) {
+            uint gi = lod_link_data[first_lod_link + l];
+            float ge = uintBitsToFloat(lod_group_data[gi * LOD_GROUP_W + 4u]);
+            if (ge <= params.error_threshold) {
+                sel_group = gi;
+            }
+        }
+        if (sel_group != 0xFFFFFFFFu && try_lod_group(sel_group)) {
+            continue;
+        }
+
+        // Leaf or error acceptable: emit base clusters
+        if (node_error <= params.error_threshold || child_count == 0u) {
+            bool all_res = true;
+            for (uint c = 0u; c < cluster_count; c++) {
+                uint page = cluster_data[(first_cluster + c) * CLUSTER_W + 3u];
+                if (!is_page_resident(page)) { all_res = false; break; }
+            }
+            if (all_res) {
+                for (uint c = 0u; c < cluster_count; c++) {
+                    if (!is_base_cluster_backfacing(first_cluster + c)) {
+                        emit_base(first_cluster + c);
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Push children
+        for (uint c = 0u; c < child_count && sp < 2048; c++) {
+            stack[sp++] = first_child + c;
+        }
+    }
+}

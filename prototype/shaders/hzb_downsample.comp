@@ -1,0 +1,28 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(push_constant) uniform HzbParams {
+    uint src_width;
+    uint src_height;
+} params;
+
+layout(set = 0, binding = 0) uniform sampler2D src_mip;
+layout(set = 0, binding = 1, r32f) writeonly uniform image2D dst_mip;
+
+void main() {
+    ivec2 dst_coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dst_size = imageSize(dst_mip);
+    if (dst_coord.x >= dst_size.x || dst_coord.y >= dst_size.y) return;
+
+    // Sample 4 texels from the source mip
+    vec2 src_uv = (vec2(dst_coord) * 2.0 + 1.0) / vec2(params.src_width, params.src_height);
+    vec2 texel = 1.0 / vec2(params.src_width, params.src_height);
+
+    float d00 = texture(src_mip, src_uv + vec2(-0.25, -0.25) * texel).r;
+    float d10 = texture(src_mip, src_uv + vec2( 0.25, -0.25) * texel).r;
+    float d01 = texture(src_mip, src_uv + vec2(-0.25,  0.25) * texel).r;
+    float d11 = texture(src_mip, src_uv + vec2( 0.25,  0.25) * texel).r;
+
+    float max_depth = max(max(d00, d10), max(d01, d11));
+    imageStore(dst_mip, dst_coord, vec4(max_depth));
+}

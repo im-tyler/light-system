@@ -1,0 +1,114 @@
+#version 450
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform OccParams {
+    mat4 view_projection;
+    uint hzb_width;
+    uint hzb_height;
+} params;
+
+struct DrawEntry {
+    uint draw_vertex_count;
+    uint draw_instance_count;
+    uint draw_first_vertex;
+    uint draw_first_instance;
+    uint cluster_index;
+    uint geometry_kind;
+    uint payload_offset;
+    uint local_vertex_count;
+};
+
+layout(set = 0, binding = 0) readonly buffer InputDraws { DrawEntry input_draws[]; };
+layout(set = 0, binding = 1) readonly buffer InputCount { uint input_draw_count; };
+layout(set = 0, binding = 2) readonly buffer ClusterData { uint cluster_data[]; };
+layout(set = 0, binding = 3) readonly buffer LodClusterData { uint lod_cluster_data[]; };
+layout(set = 0, binding = 4) uniform sampler2D hzb_texture;
+layout(set = 0, binding = 5) writeonly buffer OutputDraws { DrawEntry output_draws[]; };
+layout(set = 0, binding = 6) buffer OutputCount { uint output_count; };
+
+const uint CLUSTER_W = 24;
+const uint LOD_CLUSTER_W = 20;
+
+vec4 project(vec3 p) {
+    return params.view_projection * vec4(p, 1.0);
+}
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= input_draw_count) return;
+
+    DrawEntry entry = input_draws[id];
+
+    // Read AABB from cluster or lod_cluster record
+    vec3 bmin, bmax;
+    if (entry.geometry_kind == 0u) {
+        uint b = entry.cluster_index * CLUSTER_W;
+        bmin = vec3(uintBitsToFloat(cluster_data[b+12u]), uintBitsToFloat(cluster_data[b+13u]),
+                    uintBitsToFloat(cluster_data[b+14u]));
+        bmax = vec3(uintBitsToFloat(cluster_data[b+16u]), uintBitsToFloat(cluster_data[b+17u]),
+                    uintBitsToFloat(cluster_data[b+18u]));
+    } else {
+        uint b = entry.cluster_index * LOD_CLUSTER_W;
+        bmin = vec3(uintBitsToFloat(lod_cluster_data[b+12u]), uintBitsToFloat(lod_cluster_data[b+13u]),
+                    uintBitsToFloat(lod_cluster_data[b+14u]));
+        bmax = vec3(uintBitsToFloat(lod_cluster_data[b+16u]), uintBitsToFloat(lod_cluster_data[b+17u]),
+                    uintBitsToFloat(lod_cluster_data[b+18u]));
+    }
+
+    // Project all 8 AABB corners to clip space, find screen-space rect and nearest depth
+    float min_ndc_x = 1.0, max_ndc_x = -1.0;
+    float min_ndc_y = 1.0, max_ndc_y = -1.0;
+    float min_depth = 1.0;
+    bool any_behind = false;
+
+    for (uint i = 0u; i < 8u; i++) {
+        vec3 corner = vec3(
+            ((i & 1u) != 0u) ? bmax.x : bmin.x,
+            ((i & 2u) != 0u) ? bmax.y : bmin.y,
+            ((i & 4u) != 0u) ? bmax.z : bmin.z
+        );
+        vec4 clip = project(corner);
+        if (clip.w <= 0.0) { any_behind = true; break; }
+        vec3 ndc = clip.xyz / clip.w;
+        min_ndc_x = min(min_ndc_x, ndc.x);
+        max_ndc_x = max(max_ndc_x, ndc.x);
+        min_ndc_y = min(min_ndc_y, ndc.y);
+        max_ndc_y = max(max_ndc_y, ndc.y);
+        min_depth = min(min_depth, ndc.z);
+    }
+
+    // If any corner is behind camera, conservatively pass
+    if (any_behind) {
+        uint slot = atomicAdd(output_count, 1u);
+        output_draws[slot] = entry;
+        return;
+    }
+
+    // Clamp to screen
+    min_ndc_x = clamp(min_ndc_x, -1.0, 1.0);
+    max_ndc_x = clamp(max_ndc_x, -1.0, 1.0);
+    min_ndc_y = clamp(min_ndc_y, -1.0, 1.0);
+    max_ndc_y = clamp(max_ndc_y, -1.0, 1.0);
+
+    // Convert NDC to pixel extent
+    float px_w = (max_ndc_x - min_ndc_x) * 0.5 * float(params.hzb_width);
+    float px_h = (max_ndc_y - min_ndc_y) * 0.5 * float(params.hzb_height);
+    float max_extent = max(px_w, px_h);
+
+    // Select HZB mip level based on extent
+    float mip_level = max_extent > 0.0 ? ceil(log2(max_extent)) : 0.0;
+
+    // Sample HZB at the center of the screen-space rect
+    vec2 uv = vec2((min_ndc_x + max_ndc_x) * 0.25 + 0.5,
+                   (min_ndc_y + max_ndc_y) * 0.25 + 0.5);
+    float hzb_depth = textureLod(hzb_texture, uv, mip_level).r;
+
+    // If cluster's nearest depth is behind the HZB depth, it's occluded
+    if (min_depth > hzb_depth) {
+        return; // occluded
+    }
+
+    // Passed -- emit to output
+    uint slot = atomicAdd(output_count, 1u);
+    output_draws[slot] = entry;
+}

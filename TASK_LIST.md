@@ -1,6 +1,6 @@
 # Task List
 
-Last updated: 2026-03-25
+Last updated: 2026-04-02
 
 ## Completed
 
@@ -25,8 +25,8 @@ Last updated: 2026-03-25
 
 ### Pipeline Integration
 - [x] per-frame UBO (view_projection, light_vp, light_dir -- push constants reduced to 16 bytes)
-- [x] GPU draw list readback drives main raster pass (frame 0 CPU fallback)
-- [x] GPU draw list readback drives shadow pass
+- [x] vkCmdDrawIndirect for main and shadow passes (placeholder depth image resolves MoltenVK descriptor binding)
+- [x] smooth vertex normals stored in payload (builder_cluster.cpp) and interpolated in vertex shader
 - [x] shadow map sampling in main fragment shader (sampler2DShadow, world-to-light transform)
 - [x] visibility buffer encoding matches spec (RG32_UINT, two-word format per visibility_format.h)
 - [x] interactive camera (WASD/mouse, --interactive CLI flag, FPS in title)
@@ -43,14 +43,14 @@ Last updated: 2026-03-25
 
 These directly affect visual output and must be fixed before the renderer looks credible:
 
-- [ ] smooth vertex normals from source mesh (store normals in payload, interpolate in shader)
-- [ ] fix meshlet boundary seams (shared-vertex or averaged normals at cluster boundaries)
+- [x] smooth vertex normals from source mesh (normals stored in payload, interpolated in vertex shader)
+- [-] fix meshlet boundary seams (partially addressed by smooth normals; shared-vertex merging at cluster boundaries still needed)
 - [ ] per-cluster backface culling using meshlet normal cones
 - [ ] better shadow map quality (PCF filtering, cascaded shadow maps for large scenes)
 
 ## Next Priority: Performance
 
-- [ ] vkCmdDrawIndirect migration (blocked on MoltenVK descriptor lifecycle -- needs VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT or restructured creation order)
+- [ ] vkCmdDrawIndirectCount optimization (vkCmdDrawIndirect works but uses max_draws, causing no-op draws for zero-instance entries; needs actual count buffer)
 - [ ] frame timing and GPU profiling (Vulkan timestamp queries per pass)
 
 ## Next Priority: Streaming
