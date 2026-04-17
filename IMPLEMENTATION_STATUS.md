@@ -60,10 +60,15 @@ GPU timestamp profiler emits `MERIDIAN_GPU: cull=.. sel=.. occ=.. shadow=.. main
 
 ### Performance (Apple M4, MoltenVK, 1280x720)
 
-Stanford Dragon (871K tris): median 17.1ms / 55-70 FPS
-Massive City (1M tris): median 53.2ms / 18-20 FPS (bottlenecked by sparse-LOD selection + lack of cluster frustum cull, not by the renderer architecture)
+Stanford Dragon (871K tris): median 17.1ms / 53-72 FPS
+Massive City (1M tris): median 53-56ms / 18-20 FPS (bottlenecked by sparse-LOD selection + degenerate normal cones + vkQueueSubmit translation cost scaling with draw count)
 
 Per-pass GPU (Dragon, steady state): cull 0.1ms, sel 0.0ms (CPU), occ 0.05ms, shadow 3-4ms, main 3-4ms, hzb 0.1-0.2ms.
+
+Per-frame CPU (emitted every 60 frames as `MERIDIAN_CPU: ...`):
+- Application-side work (traverse, residency, build, upload, cmdrec) is under 1ms on both scenes.
+- `vkQueueSubmit` is 3.8ms on Dragon, 10.6ms on city -- scales with draw count because MoltenVK translates vkCmdDrawIndirectCount into a Metal draw-call loop on the CPU thread. Fundamental MoltenVK overhead; only addressable by reducing draws or a native Metal backend.
+- `vkWaitForFences` reflects GPU execution time, not CPU overhead.
 
 ## Not Yet Implemented
 
