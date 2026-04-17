@@ -63,7 +63,7 @@ Last updated: 2026-04-16
 - [x] connect streaming_scheduler.cpp to frame loop (request/load/evict state machine, gated behind `--demand-streaming`)
 - [ ] real async disk I/O for non-blocking page loads (currently simulated via N-frame latency window; next step is mmapped .vgeo + GCD or POSIX AIO for actual reads)
 - [ ] staging buffer for device-local memory
-- [ ] root-page autodetect so the demand-streaming seed set doesn't rely on index-0 ordering
+- [x] root-page autodetect so the demand-streaming seed set doesn't rely on index-0 ordering (seed = pages picked by a coarse `simulate_traversal` with all-resident mask + infinite error threshold, capped at `streaming_seed_pages`)
 
 ## Traversal (deferred)
 

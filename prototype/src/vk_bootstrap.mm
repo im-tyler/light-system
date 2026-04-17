@@ -1815,18 +1815,36 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                 entry.state = PageResidencyState::unloaded;
                 entry.last_touched_frame = 0xffffffffu;
             }
-            // Seed the lowest-indexed pages as resident so the traversal has
-            // something to descend into on frame 0. Without a seed the root
-            // hierarchy's own pages aren't resident either, so `missing_pages`
-            // stays tiny and the scheduler can't do anything useful. The seed
-            // count is tuned so dragon converges inside a 117-frame benchmark
-            // window and city reaches a useful subset.
-            const uint32_t seed_count = std::min<uint32_t>(
+            // Root-page autodetect: run a coarse traversal with all pages
+            // marked resident and a very large error threshold to discover
+            // which pages the hierarchy actually needs for its minimum-detail
+            // render. This is the correct seed set regardless of storage
+            // layout (previously we seeded the first N pages by index, which
+            // happened to work only because the DFS flatten pass tends to
+            // land low-detail clusters at the front of the linear layout).
+            const std::vector<uint8_t> all_resident_mask(residency_model.pages.size(), 1);
+            const TraversalSelection coarse =
+                simulate_traversal(resource, /*error_threshold=*/1e30f, all_resident_mask);
+            const uint32_t seed_cap = std::min<uint32_t>(
                 config.streaming_seed_pages,
                 static_cast<uint32_t>(residency_model.pages.size()));
-            for (uint32_t p = 0; p < seed_count; ++p) {
+            uint32_t seeded = 0;
+            for (uint32_t p : coarse.selected_page_indices) {
+                if (p >= residency_model.pages.size()) continue;
+                if (residency_model.pages[p].state == PageResidencyState::resident) continue;
                 residency_model.pages[p].state = PageResidencyState::resident;
                 residency_model.pages[p].last_touched_frame = 0;
+                if (++seeded >= seed_cap) break;
+            }
+            // Fall back to linear seed only if the coarse traversal produced
+            // fewer pages than the seed cap (unlikely but defensive against
+            // scenes where the root has zero LOD links and an empty base
+            // span -- e.g. a completely uninitialised hierarchy).
+            for (uint32_t p = 0; seeded < seed_cap && p < residency_model.pages.size(); ++p) {
+                if (residency_model.pages[p].state == PageResidencyState::resident) continue;
+                residency_model.pages[p].state = PageResidencyState::resident;
+                residency_model.pages[p].last_touched_frame = 0;
+                ++seeded;
             }
             StreamingConfig sc;
             sc.max_resident_pages = config.resident_budget == 0xffffffffu
