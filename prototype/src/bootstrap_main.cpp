@@ -9,7 +9,7 @@
 namespace {
 
 void print_usage() {
-    std::cerr << "Usage: meridian_vk_bootstrap --manifest <path> [--interactive] [--screenshot <path>] [--budget <pages>]\n";
+    std::cerr << "Usage: meridian_vk_bootstrap --manifest <path> [--interactive] [--screenshot <path>] [--budget <pages>] [--demand-streaming]\n";
 }
 
 }  // namespace
@@ -19,6 +19,7 @@ int main(int argc, char** argv) {
     std::string screenshot_path;
     uint32_t resident_budget = 0xffffffffu;
     bool interactive = false;
+    bool demand_streaming = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg = argv[i];
         if (arg == "--manifest" && i + 1 < argc) {
@@ -29,6 +30,8 @@ int main(int argc, char** argv) {
             resident_budget = static_cast<uint32_t>(std::atoi(argv[++i]));
         } else if (arg == "--interactive") {
             interactive = true;
+        } else if (arg == "--demand-streaming") {
+            demand_streaming = true;
         } else {
             print_usage();
             return 1;
@@ -52,6 +55,7 @@ int main(int argc, char** argv) {
         }
         config.screenshot_path = screenshot_path;
         config.resident_budget = resident_budget;
+        config.demand_streaming = demand_streaming;
         const meridian::VkBootstrapReport report =
             meridian::build_vk_bootstrap_report(resource, config);
 

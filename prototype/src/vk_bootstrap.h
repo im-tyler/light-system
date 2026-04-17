@@ -17,6 +17,13 @@ struct VkBootstrapConfig {
     float debug_error_threshold = 0.001f;
     uint32_t resident_budget = 0xffffffffu;
     uint32_t eviction_grace_frames = 1;
+    // When true, pages start in the unloaded state and the streaming
+    // scheduler drives per-frame load/evict decisions. Simulated async
+    // loads land in the resident state after a small number of frames.
+    bool demand_streaming = false;
+    uint32_t streaming_max_loads_per_frame = 32;
+    uint32_t streaming_load_latency_frames = 2;
+    uint32_t streaming_seed_pages = 64;
     std::string screenshot_path;
 };
 

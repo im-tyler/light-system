@@ -5,6 +5,7 @@
 #include "math_utils.h"
 #include "runtime_model.h"
 #include "shader_loader.h"
+#include "streaming_scheduler.h"
 #include "visibility_format.h"
 
 #if __has_include(<vulkan/vulkan.h>)
@@ -1797,6 +1798,37 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
         std::vector<double> frame_times_ms;
 
         ResidencyModel residency_model = create_residency_model(resource);
+        // Demand-streaming: start pages unloaded so the scheduler drives the
+        // loads from frame 0. Default path leaves every page resident for the
+        // existing "all-in-memory" benchmark behavior.
+        std::vector<uint32_t> page_load_start_frame(residency_model.pages.size(), 0xffffffffu);
+        StreamingScheduler streaming_scheduler;
+        if (config.demand_streaming) {
+            for (PageResidencyEntry& entry : residency_model.pages) {
+                entry.state = PageResidencyState::unloaded;
+                entry.last_touched_frame = 0xffffffffu;
+            }
+            // Seed the lowest-indexed pages as resident so the traversal has
+            // something to descend into on frame 0. Without a seed the root
+            // hierarchy's own pages aren't resident either, so `missing_pages`
+            // stays tiny and the scheduler can't do anything useful. The seed
+            // count is tuned so dragon converges inside a 117-frame benchmark
+            // window and city reaches a useful subset.
+            const uint32_t seed_count = std::min<uint32_t>(
+                config.streaming_seed_pages,
+                static_cast<uint32_t>(residency_model.pages.size()));
+            for (uint32_t p = 0; p < seed_count; ++p) {
+                residency_model.pages[p].state = PageResidencyState::resident;
+                residency_model.pages[p].last_touched_frame = 0;
+            }
+            StreamingConfig sc;
+            sc.max_resident_pages = config.resident_budget == 0xffffffffu
+                                        ? static_cast<uint32_t>(residency_model.pages.size())
+                                        : config.resident_budget;
+            sc.max_loads_per_frame = config.streaming_max_loads_per_frame;
+            sc.eviction_grace_frames = config.eviction_grace_frames;
+            streaming_scheduler = create_streaming_scheduler(resource, sc);
+        }
         snapshot_page_residency(report.uploadable_scene, residency_model);
         result = update_vector_buffer(device, report.uploadable_scene.page_residency,
                                       scene_buffers.page_residency);
@@ -1999,7 +2031,28 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                 last_frame_time = frame_now;
             }
 
-            report.runtime_completed_page_count = complete_loading_pages(residency_model, frame_index);
+            // Async-load completion: when demand streaming is active, each
+            // page that entered the loading state `streaming_load_latency_frames`
+            // ago now becomes resident. The default (non-streaming) path keeps
+            // the old "complete instantly" behavior so benchmark numbers stay
+            // comparable to prior sessions.
+            std::vector<uint32_t> completed_this_frame;
+            if (config.demand_streaming) {
+                for (uint32_t p = 0; p < residency_model.pages.size(); ++p) {
+                    if (residency_model.pages[p].state == PageResidencyState::loading &&
+                        page_load_start_frame[p] != 0xffffffffu &&
+                        frame_index - page_load_start_frame[p] >=
+                            config.streaming_load_latency_frames) {
+                        completed_this_frame.push_back(p);
+                        page_load_start_frame[p] = 0xffffffffu;
+                    }
+                }
+                report.runtime_completed_page_count =
+                    static_cast<uint32_t>(completed_this_frame.size());
+            } else {
+                report.runtime_completed_page_count =
+                    complete_loading_pages(residency_model, frame_index);
+            }
 
             using clock_t = std::chrono::steady_clock;
             auto t_traverse_start = clock_t::now();
@@ -2022,11 +2075,43 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             residency_input.resident_budget = config.resident_budget;
             residency_input.eviction_grace_frames = config.eviction_grace_frames;
             residency_input.selected_pages = selection_for_frame.selected_page_indices;
-            residency_input.missing_pages = selection_for_frame.missing_page_indices;
-            residency_input.prefetch_pages = selection_for_frame.prefetch_page_indices;
+            if (config.demand_streaming) {
+                // Run the scheduler against the current selection to get a
+                // throttled load queue (cap max_loads_per_frame) and evict
+                // queue (oldest zero-priority pages when over budget). The
+                // scheduler's own ResidencyUpdateInput return value sets the
+                // frame/budget fields; override missing/prefetch with the
+                // throttled queue so step_residency requests only those.
+                ResidencyUpdateInput sched_in = update_streaming_scheduler(
+                    streaming_scheduler, residency_model, selection_for_frame, frame_index);
+                residency_input.missing_pages = streaming_scheduler.load_queue;
+                residency_input.prefetch_pages.clear(); // load_queue already covers prefetch priority
+                residency_input.completed_pages = std::move(completed_this_frame);
+                // Explicit eviction: step_residency does not take an evict
+                // list, so transition the scheduler-selected pages directly.
+                for (uint32_t p : streaming_scheduler.evict_queue) {
+                    if (p < residency_model.pages.size()) {
+                        residency_model.pages[p].state = PageResidencyState::unloaded;
+                    }
+                }
+                (void)sched_in; // we use the scheduler state directly.
+            } else {
+                residency_input.missing_pages = selection_for_frame.missing_page_indices;
+                residency_input.prefetch_pages = selection_for_frame.prefetch_page_indices;
+            }
             auto t_residency_start = clock_t::now();
             const ResidencyUpdateResult residency_update =
                 step_residency(residency_model, residency_input);
+            if (config.demand_streaming) {
+                // Any page that step_residency advanced to `loading` this
+                // frame needs its load-start timestamp recorded so we can
+                // later complete it after the latency window.
+                for (uint32_t p : residency_update.loading_pages) {
+                    if (p < page_load_start_frame.size()) {
+                        page_load_start_frame[p] = frame_index;
+                    }
+                }
+            }
 
             snapshot_page_residency(report.uploadable_scene, residency_model);
             result = update_vector_buffer(device, report.uploadable_scene.page_residency,
