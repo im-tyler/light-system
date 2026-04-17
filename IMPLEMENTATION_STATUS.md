@@ -51,7 +51,6 @@ GPU timestamp profiler emits `MERIDIAN_GPU: cull=.. sel=.. occ=.. shadow=.. main
 - **Page residency initialized as all-resident by default**; pass `--demand-streaming` to run the StreamingScheduler + simulated-async-load path. Under that flag pages start unloaded (except the first 64 seeded so the hierarchy root has something to descend into), the scheduler throttles loads to `streaming_max_loads_per_frame` per frame, and a page's `loading -> resident` transition is delayed by `streaming_load_latency_frames` frames. Real disk I/O (mmap or GCD/AIO) is still not wired -- loads don't touch the filesystem yet, the .vgeo payload is already in memory from startup.
 - **City has sparse node-LOD links (architectural, not a bug in a specific call site)**: `meridian_dump` on `massive_city.vgeo` reports 6230 LOD groups but only 8 node-LOD links, vs Stanford Dragon's 2509 groups -> 946 links (~10% of nodes). Root cause: `build_node_lod_links` (builder_cluster.cpp) requires an EXACT span match between an LOD group's runtime cluster indices and a hierarchy node's cluster span, because `try_select_lod_group` replaces the node's entire base-cluster subtree with the group's LOD clusters; relaxing to "contains" would leave uncovered base clusters unrendered. The builder generates hierarchy partitions via `meshopt_partitionClusters` and LOD groups via `clusterlod` -- both spatial, but using different algorithms that don't align for topologically diverse scenes. Dragon is a single connected mesh and aligns well; city (glTF with many building instances, reordered across material sections) does not. A proper fix is either (a) align partitioning with clusterlod's groupings, (b) teach traversal to stitch partial LOD coverage with complement base-span emits, or (c) rebuild the hierarchy from LOD group boundaries. All three are substantial refactors and not yet attempted.
 - **CPU cluster selection divergence on sparse-LOD-link scenes**: on `massive_city` the CPU `simulate_traversal` returns 0 LOD clusters + 31394 base clusters while the pre-hoist GPU `compute_select.comp` produced 15106 draws on the same data. CPU path is semantically identical to GPU shader (LOD-group-first, then base emit if leaf/acceptable error, else descend). Diagnostic pass showed 99.997% of city's base clusters have `normal_cone.w = 1.0` (meshoptimizer-marked degenerate), so backface culling is a no-op regardless of path. Root cause of the GPU's 15106 figure is unexplained -- possibly a pre-existing bug, stale residency state, or compute_cull producing `cull_visible_instances=0` in some frames (which makes compute_select a no-op). Not worth further investigation until city has a usable LOD hierarchy.
-- **No CPU cluster-level frustum culling**: only instance-level frustum cull runs (on GPU `compute_cull`). A cluster-level test would help scenes where the camera sees a small portion of the asset.
 
 ### What's Validated
 
@@ -69,15 +68,14 @@ Per-cascade culling closed ~8ms of the CSM regression on Dragon (32 -> 24ms) and
 
 Per-pass GPU (Dragon, steady state): cull 0.1ms, sel 0.0ms (CPU), occ 0.05ms, shadow 3-4ms, main 3-4ms, hzb 0.1-0.2ms.
 
-Per-frame CPU (emitted every 60 frames as `MERIDIAN_CPU: ...`):
-- Application-side work (traverse, residency, build, upload, cmdrec) is under 1ms on both scenes.
-- `vkQueueSubmit` is 3.8ms on Dragon, 10.6ms on city -- scales with draw count because MoltenVK translates vkCmdDrawIndirectCount into a Metal draw-call loop on the CPU thread. Fundamental MoltenVK overhead; only addressable by reducing draws or a native Metal backend.
+Per-frame CPU (emitted every 60 frames as `MERIDIAN_CPU: ...`, measured post-CSM + per-cascade culling):
+- Application-side work (traverse, residency, build, upload, cmdrec) is under 1ms on both scenes (dragon ~0.35ms, city ~1.0ms).
+- `vkQueueSubmit` is 7.8ms on Dragon, 21.8ms on City. Roughly 2x the pre-CSM numbers (3.8ms / 10.6ms) because we now issue 4 indirect-draw calls per frame (main + 3 shadow cascades) instead of 1; per-cascade culling trimmed each cascade's draw count substantially but the per-submission Metal translation cost still scales with total draws across all passes. Only addressable further by reducing total draws (e.g. GPU-side draw packing, texture-array draws) or a native Metal backend.
 - `vkWaitForFences` reflects GPU execution time, not CPU overhead.
 
 ## Not Yet Implemented
 
 - Per-cluster backface culling with normal cones on LOD clusters (currently base only; many LOD clusters have cones but shader `emit_lod` skips the test)
-- CPU cluster-level frustum culling
 - Real streaming scheduler (CPU prototype exists but pages start all-resident)
 - Async disk I/O for page loading
 - Benchmark automation vs stock Godot

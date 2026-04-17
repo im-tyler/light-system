@@ -47,8 +47,8 @@ Last updated: 2026-04-16
 - [x] per-cluster backface culling via meshlet normal cones (base clusters only; LOD clusters still unculled)
 - [ ] reconcile CPU/GPU selection divergence on sparse-LOD-link scenes (city emits 0 LOD on CPU vs LOD-heavy on GPU)
 - [x] investigate city builder producing only 8 node-LOD links for 6230 LOD groups (architectural mismatch between meshopt_partitionClusters partitioning and clusterlod grouping; exact-span match is semantically required by current traversal -- see IMPLEMENTATION_STATUS.md for fix options)
-- [ ] CPU cluster-level frustum culling (only instance-level runs today)
-- [ ] profile the ~9ms CPU-side overhead still remaining after the sel hoist
+- [x] CPU cluster-level frustum culling (landed in 6e19a34; each cluster's AABB is tested against the camera frustum in the CPU draw-build loop before emit)
+- [x] profile the ~9ms CPU-side overhead still remaining after the sel hoist (attributed to vkQueueSubmit MoltenVK translation: Dragon 7.8ms, City 21.8ms submit; application work <1ms on both)
 
 ## Rendering Quality
 
