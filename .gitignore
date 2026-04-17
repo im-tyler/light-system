@@ -1,9 +1,13 @@
 # Build artifacts
 prototype/build/
+prototype/.cache/
 benchmarks/build/
 build/
 *.o
 *.a
+
+# Vendored third-party (cloned, not committed)
+prototype/thirdparty/meshoptimizer/
 
 # Godot
 .godot/
@@ -11,6 +15,9 @@ build/
 # External assets (large files)
 benchmarks/assets/
 benchmarks/scenes/generated/*.glb
+
+# Tool state
+.claude/
 
 # OS
 .DS_Store
