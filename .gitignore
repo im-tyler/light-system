@@ -18,6 +18,7 @@ benchmarks/scenes/generated/*.glb
 
 # Tool state
 .claude/
+_internal/
 
 # OS
 .DS_Store
