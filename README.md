@@ -4,7 +4,7 @@ Dense / virtualized geometry renderer for Godot 4 — Nanite as the parity bar. 
 
 **Status: working — Phase 1 complete, Phase 2 in progress.** The offline builder is functional on glTF, OBJ, and synthetic benchmarks (Stanford Dragon, generated 1M-triangle city). The standalone Vulkan renderer runs an interactive present loop on Apple M4 / MoltenVK with measured per-pass GPU timings.
 
-This is a separate Forgejo repository ([Tyler/meridian](http://100.108.123.49:49152/Tyler/meridian.git)) within the [Light System umbrella](https://github.com/) — it is gitignored from the umbrella repo because it has its own commit history, its own build system, and a much faster iteration cadence than the umbrella docs.
+This is a separate repository ([im-tyler/meridian](https://github.com/im-tyler/meridian)) within the [Light System umbrella](https://github.com/im-tyler/light-system) — it is gitignored from the umbrella repo because it has its own commit history, its own build system, and a much faster iteration cadence than the umbrella docs.
 
 ## Documentation
 

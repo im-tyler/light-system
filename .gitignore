@@ -22,3 +22,6 @@ _internal/
 
 # OS
 .DS_Store
+
+# Local-only working notes. Public design docs live in docs/.
+notes/
