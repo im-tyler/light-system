@@ -1,8 +1,8 @@
 # AGENTS.md
 
-This repository is **public** and mirrored to GitHub at https://github.com/im-tyler/meridian.
-It is the renderer component of the [Light System](https://github.com/im-tyler/light-system)
-umbrella — a separate repo on purpose (own history, own build system, faster cadence).
+This repository is **public** and mirrored to GitHub at https://github.com/im-tyler/light-system.
+It is a standalone Vulkan renderer (formerly "Project Meridian," the renderer
+subsystem of the retired Godot-parity umbrella; docs/ADRs still use the old name).
 Every commit is publicly visible — treat all work as public-facing.
 
 ## Do not commit private/transient context

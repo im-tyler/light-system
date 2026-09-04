@@ -1,10 +1,10 @@
-# Project Meridian
+# Light System
 
-Dense / virtualized geometry renderer for Godot 4 — Nanite as the parity bar. C++ standalone Vulkan prototype plus Godot importer plugin. Builds an offline cluster + page format (`.vgeo`), then streams and renders it with compute culling, hierarchical traversal, visibility-buffer rasterization, and cascaded shadow maps.
+Dense / virtualized geometry renderer — Nanite as the parity bar. C++ standalone Vulkan prototype plus Godot importer plugin. Builds an offline cluster + page format (`.vgeo`), then streams and renders it with compute culling, hierarchical traversal, visibility-buffer rasterization, and cascaded shadow maps.
 
 **Status: working — Phase 1 complete, Phase 2 in progress.** The offline builder is functional on glTF, OBJ, and synthetic benchmarks (Stanford Dragon, generated 1M-triangle city). The standalone Vulkan renderer runs an interactive present loop on Apple M4 / MoltenVK with measured per-pass GPU timings.
 
-This is a separate repository ([im-tyler/meridian](https://github.com/im-tyler/meridian)) within the [Light System umbrella](https://github.com/im-tyler/light-system) — it is gitignored from the umbrella repo because it has its own commit history, its own build system, and a much faster iteration cadence than the umbrella docs.
+This is a standalone renderer project ([im-tyler/light-system](https://github.com/im-tyler/light-system)). It began (2026-03) as "Project Meridian," a subsystem of a nine-part Godot-parity umbrella; the umbrella is retired (preserved privately as `godot-parity-archive`) and the renderer now carries the name on its own. Internal docs and ADRs still say "Meridian" — same project.
 
 ## Documentation
 
@@ -96,6 +96,6 @@ Vulkan SDK 1.2+ is required. The renderer is developed on Apple Silicon via Molt
 
 ## License
 
-See the umbrella [Light System LICENSE](../LICENSE) — MIT for project-authored code.
+MIT — see [LICENSE](LICENSE).
 
 The `prototype/thirdparty/meshoptimizer/` checkout is vendored at build time and is gitignored. Honor its upstream license.
