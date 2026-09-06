@@ -97,6 +97,7 @@ struct GpuLodClusterRecord {
     std::array<float, 2> padding0 = {0.0f, 0.0f};
     std::array<float, 4> bounds_min = {0.0f, 0.0f, 0.0f, 0.0f};
     std::array<float, 4> bounds_max = {0.0f, 0.0f, 0.0f, 0.0f};
+    std::array<float, 4> normal_cone = {0.0f, 0.0f, 0.0f, 1.0f};
 };
 
 struct GpuNodeLodLinkRecord {
@@ -137,7 +138,7 @@ static_assert(std::is_standard_layout<GpuPageResidencyEntry>::value);
 static_assert(sizeof(GpuHierarchyNodeRecord) == 76);
 static_assert(sizeof(GpuClusterRecord) == 96);
 static_assert(sizeof(GpuLodGroupRecord) == 64);
-static_assert(sizeof(GpuLodClusterRecord) == 80);
+static_assert(sizeof(GpuLodClusterRecord) == 96);
 static_assert(sizeof(GpuNodeLodLinkRecord) == 4);
 static_assert(sizeof(GpuPageResidencyEntry) == 16);
 static_assert(sizeof(GpuInstanceRecord) == 112);

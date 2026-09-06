@@ -77,6 +77,7 @@ struct LodClusterRecord {
     uint32_t geometry_payload_size = 0;
     uint32_t page_index = 0;
     Bounds3f bounds;
+    float normal_cone_axis[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     float local_error = 0.0f;
     uint32_t material_section_index = 0;
     uint32_t flags = 0;

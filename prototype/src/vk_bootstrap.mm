@@ -2604,6 +2604,25 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                     push_to_cascades(cascade_entry, c.bounds_min.data(), c.bounds_max.data());
 
                     if (aabb_outside_frustum(c.bounds_min.data(), c.bounds_max.data())) continue;
+                    // Normal-cone backface cull, same test as the base-cluster path.
+                    const float cone_cutoff = c.normal_cone[3];
+                    if (cone_cutoff < 1.0f) {
+                        const float cx = (c.bounds_min[0] + c.bounds_max[0]) * 0.5f;
+                        const float cy = (c.bounds_min[1] + c.bounds_max[1]) * 0.5f;
+                        const float cz = (c.bounds_min[2] + c.bounds_max[2]) * 0.5f;
+                        float vx = cx - cam.x;
+                        float vy = cy - cam.y;
+                        float vz = cz - cam.z;
+                        const float len = std::sqrt(vx * vx + vy * vy + vz * vz);
+                        if (len > 1e-6f) {
+                            const float inv = 1.0f / len;
+                            vx *= inv; vy *= inv; vz *= inv;
+                        }
+                        const float d = vx * c.normal_cone[0] +
+                                        vy * c.normal_cone[1] +
+                                        vz * c.normal_cone[2];
+                        if (d < -cone_cutoff) continue;
+                    }
                     GpuDrawEntry e = cascade_entry;
                     e.draw_first_instance = static_cast<uint32_t>(cpu_draws.size());
                     cpu_draws.push_back(e);

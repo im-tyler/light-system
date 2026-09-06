@@ -27,7 +27,7 @@ layout(set = 0, binding = 5) writeonly buffer OutputDraws { DrawEntry output_dra
 layout(set = 0, binding = 6) buffer OutputCount { uint output_count; };
 
 const uint CLUSTER_W = 24;
-const uint LOD_CLUSTER_W = 20;
+const uint LOD_CLUSTER_W = 24;
 
 vec4 project(vec3 p) {
     return params.view_projection * vec4(p, 1.0);

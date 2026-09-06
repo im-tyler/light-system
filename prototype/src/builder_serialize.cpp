@@ -71,6 +71,8 @@ LodClusterRecordDisk to_disk(const LodClusterRecord& cluster) {
     disk.geometry_payload_size = cluster.geometry_payload_size;
     disk.page_index = cluster.page_index;
     disk.bounds = cluster.bounds;
+    std::copy(std::begin(cluster.normal_cone_axis), std::end(cluster.normal_cone_axis),
+              std::begin(disk.normal_cone_axis));
     disk.local_error = cluster.local_error;
     disk.material_section_index = cluster.material_section_index;
     disk.flags = cluster.flags;

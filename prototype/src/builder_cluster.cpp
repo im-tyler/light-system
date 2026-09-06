@@ -600,6 +600,10 @@ LodClusterRecord append_lod_cluster_payload(const MeshData& mesh, const unsigned
         append_bytes(payload, widened);
     }
 
+    const meshopt_Bounds cone_bounds = meshopt_computeClusterBounds(
+        global_indices, index_count, reinterpret_cast<const float*>(mesh.positions.data()),
+        mesh.positions.size(), sizeof(Vec3f));
+
     LodClusterRecord cluster;
     cluster.refined_group_index = refined_group_index;
     cluster.group_index = group_index;
@@ -608,6 +612,10 @@ LodClusterRecord append_lod_cluster_payload(const MeshData& mesh, const unsigned
     cluster.geometry_payload_offset = payload_offset;
     cluster.geometry_payload_size = static_cast<uint32_t>(payload.size()) - payload_offset;
     cluster.bounds = sphere_bounds_to_aabb(cluster_bounds);
+    cluster.normal_cone_axis[0] = cone_bounds.cone_axis[0];
+    cluster.normal_cone_axis[1] = cone_bounds.cone_axis[1];
+    cluster.normal_cone_axis[2] = cone_bounds.cone_axis[2];
+    cluster.normal_cone_axis[3] = cone_bounds.cone_cutoff;
     cluster.local_error = cluster_bounds.error;
     cluster.material_section_index = material_section_index;
     return cluster;

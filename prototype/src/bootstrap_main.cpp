@@ -9,8 +9,10 @@
 namespace {
 
 void print_usage() {
-    std::cerr << "Usage: meridian_vk_bootstrap --manifest <path> [--interactive] [--screenshot <path>] [--budget <pages>] [--demand-streaming]\n"
-                 "  --screenshot writes a raw PPM image (extension forced to .ppm)\n";
+    std::cerr << "Usage: meridian_vk_bootstrap --manifest <path> [--interactive] [--screenshot <path>] [--budget <pages>] [--demand-streaming] [--error-threshold <value>]\n"
+                 "  --screenshot writes a raw PPM image (extension forced to .ppm)\n"
+                 "  --error-threshold sets the LOD selection threshold (default 0.001; scene-appropriate\n"
+                 "  values vary, e.g. the generated city needs ~0.05+ for its LOD groups to activate)\n";
 }
 
 }  // namespace
@@ -19,6 +21,7 @@ int main(int argc, char** argv) {
     std::filesystem::path manifest_path;
     std::string screenshot_path;
     uint32_t resident_budget = 0xffffffffu;
+    float error_threshold = 0.001f;
     bool interactive = false;
     bool demand_streaming = false;
     for (int i = 1; i < argc; ++i) {
@@ -29,6 +32,8 @@ int main(int argc, char** argv) {
             screenshot_path = argv[++i];
         } else if (arg == "--budget" && i + 1 < argc) {
             resident_budget = static_cast<uint32_t>(std::atoi(argv[++i]));
+        } else if (arg == "--error-threshold" && i + 1 < argc) {
+            error_threshold = std::atof(argv[++i]);
         } else if (arg == "--interactive") {
             interactive = true;
         } else if (arg == "--demand-streaming") {
@@ -56,6 +61,7 @@ int main(int argc, char** argv) {
         }
         config.screenshot_path = screenshot_path;
         config.resident_budget = resident_budget;
+        config.debug_error_threshold = error_threshold;
         config.demand_streaming = demand_streaming;
         const meridian::VkBootstrapReport report =
             meridian::build_vk_bootstrap_report(resource, config);

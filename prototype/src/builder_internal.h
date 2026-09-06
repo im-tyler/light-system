@@ -25,7 +25,7 @@
 namespace meridian::detail {
 
 constexpr std::array<char, 4> kMagic = {'V', 'G', 'E', 'O'};
-constexpr uint32_t kSchemaVersion = 2;
+constexpr uint32_t kSchemaVersion = 3;
 constexpr uint32_t kBuilderVersion = 2;
 constexpr uint32_t kPageFlagLodPayload = 1u << 0;
 
@@ -127,6 +127,7 @@ struct LodClusterRecordDisk {
     uint32_t geometry_payload_size;
     uint32_t page_index;
     Bounds3f bounds;
+    float normal_cone_axis[4];
     float local_error;
     uint32_t material_section_index;
     uint32_t flags;

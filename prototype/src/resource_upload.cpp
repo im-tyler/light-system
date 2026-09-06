@@ -105,6 +105,8 @@ UploadableScene build_uploadable_scene(const VGeoResource& resource) {
         record.flags = cluster.flags;
         record.bounds_min = to_float4(cluster.bounds.min);
         record.bounds_max = to_float4(cluster.bounds.max);
+        record.normal_cone = {cluster.normal_cone_axis[0], cluster.normal_cone_axis[1],
+                              cluster.normal_cone_axis[2], cluster.normal_cone_axis[3]};
         scene.lod_clusters.push_back(record);
     }
 

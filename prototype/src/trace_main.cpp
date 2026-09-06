@@ -1,5 +1,6 @@
 #include "vgeo_builder.h"
 
+#include <algorithm>
 #include <exception>
 #include <filesystem>
 #include <iostream>
@@ -105,6 +106,18 @@ int main(int argc, char** argv) {
         std::cout << "asset_id=" << resource.asset_id << '\n';
         std::cout << "error_threshold=" << error_threshold << '\n';
         std::cout << "resident_pages_mode=" << resident_mode << '\n';
+        if (!resource.lod_groups.empty()) {
+            std::vector<float> group_errors;
+            group_errors.reserve(resource.lod_groups.size());
+            for (const meridian::LodGroupRecord& group : resource.lod_groups) {
+                group_errors.push_back(group.geometric_error);
+            }
+            std::sort(group_errors.begin(), group_errors.end());
+            std::cout << "lod_group_error_min=" << group_errors.front() << '\n';
+            std::cout << "lod_group_error_median="
+                      << group_errors[group_errors.size() / 2] << '\n';
+            std::cout << "lod_group_error_max=" << group_errors.back() << '\n';
+        }
         std::cout << "selected_clusters=" << selection.selected_cluster_indices.size() << '\n';
         std::cout << "selected_lod_groups=" << selection.selected_lod_group_indices.size() << '\n';
         std::cout << "selected_lod_clusters=" << selection.selected_lod_cluster_indices.size() << '\n';
