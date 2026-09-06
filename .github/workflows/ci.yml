@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-smoke:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Vendor dependencies
+        run: ./tools/vendor_thirdparty.sh
+      - name: Install build dependencies
+        run: brew install glfw shaderc vulkan-headers vulkan-loader pkg-config
+      - name: Configure
+        run: cmake -S prototype -B prototype/build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build prototype/build -j
+      - name: Builder smoke (committed scenes)
+        run: |
+          ./prototype/build/meridian_builder --manifest tools/sample_asset_manifest.txt
+          ./prototype/build/meridian_builder --manifest benchmarks/scenes/benchmark_terrace_manifest.txt
+          ./prototype/build/meridian_builder --manifest benchmarks/scenes/benchmark_gltf_block_manifest.txt
+          ./prototype/build/meridian_builder --manifest benchmarks/scenes/benchmark_uv_seam_gltf_manifest.txt
+      - name: Tool smoke (dump, trace, replay)
+        run: |
+          ./prototype/build/meridian_dump --input build/benchmark_terrace_grid.vgeo
+          ./prototype/build/meridian_trace --manifest benchmarks/scenes/benchmark_terrace_manifest.txt --error-threshold 0.03
+          ./prototype/build/meridian_replay --manifest benchmarks/scenes/benchmark_terrace_manifest.txt --script benchmarks/replays/terrace_streaming_replay.txt
+          ./prototype/build/meridian_replay --manifest benchmarks/scenes/benchmark_uv_seam_gltf_manifest.txt --script benchmarks/replays/uv_seam_gltf_replay.txt

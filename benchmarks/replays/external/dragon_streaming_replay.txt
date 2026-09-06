@@ -1,0 +1,6 @@
+name = dragon_streaming_replay
+frame_count = 8
+resident_budget = 96
+eviction_grace_frames = 2
+bootstrap_resident = none
+error_thresholds = 0.0001, 0.001, 0.005, 0.01, 0.01, 0.005, 0.001, 0.0001
