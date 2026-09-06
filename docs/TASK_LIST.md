@@ -39,6 +39,15 @@ Last updated: 2026-09-05
 - [x] Stanford Dragon downloaded and built (871K tris, 8871 clusters, 56MB .vgeo)
 - [x] 1M-triangle procedural city generated (31K clusters, 104MB .vgeo)
 
+## Robustness (2026-09-05)
+
+- [x] Vulkan validation layers + debug-utils messenger behind `--validate` (repairs: render-pass depth format ordering, indirect buffer usages, per-image present semaphores, HZB layout tracking, sampled usage on the depth image)
+- [x] window resize + swapchain recreation (dynamic viewport/scissor, out-of-date/suboptimal recovery, surface-resource recreation)
+- [x] temp .vgeo leak on error paths (cleanup owns the file)
+- [x] indirect fallback ghost draws (zeroed draw-list tails via high-water upload)
+- [x] CI (GitHub Actions: build + builder/dump/trace/replay smoke)
+- [x] dragon + city replay scripts
+
 ## Performance (done / open)
 
 - [x] GPU profiler -- Vulkan timestamp queries per pass, `MERIDIAN_GPU:` line every frame

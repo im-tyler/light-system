@@ -1,6 +1,6 @@
 # Architecture Decisions
 
-Last updated: 2026-03-23
+Last updated: 2026-09-05
 
 This file records the current architectural decisions for Project Meridian.
 
@@ -153,6 +153,12 @@ Reason:
 Status:
 
 - accepted (with Phase 0 validation gate)
+- update 2026-09-04: the gate's depth question was resolved by source reading
+  (pre-opaque effect depth survives into Forward+'s opaque pass — see
+  PHASE0-DEPTH-GATE.md). The decision stands but remains unbuilt: no
+  CompositorEffect or GDExtension code exists. The gate's remaining work
+  (4.6 line-for-line verification + smoke test project) is the entry point
+  for any future runtime integration.
 
 Decision:
 

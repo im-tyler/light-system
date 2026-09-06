@@ -45,6 +45,8 @@ GPU timestamp profiler emits `MERIDIAN_GPU: cull=.. sel=.. occ=.. shadow=.. main
 - `--interactive` CLI flag: continuous present loop until ESC
 - WASD movement, mouse look, Q/E vertical, camera auto-oriented toward scene center
 - FPS and draw count displayed in window title
+- Resizable window: framebuffer-size changes and swapchain out-of-date/suboptimal recreate the surface resources instead of exiting
+- `--validate` enables the Khronos validation layer + debug-utils messenger (clean on the benchmark scenes; one known MoltenVK warning about blend state on the uint visibility target with blending disabled)
 
 ### Known Issues
 
