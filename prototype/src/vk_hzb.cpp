@@ -182,7 +182,7 @@ VkResult create_hzb_context(VkPhysicalDevice physical_device, VkDevice device,
         VkDescriptorImageInfo src_info{};
         src_info.sampler = context.sampler;
         src_info.imageView = context.mip_views[i];
-        src_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        src_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
         VkDescriptorImageInfo dst_info{};
         dst_info.imageView = context.mip_views[i + 1];

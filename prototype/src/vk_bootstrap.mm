@@ -129,10 +129,43 @@ void configure_macos_moltenvk_environment() {
             "/usr/local/opt/vulkan-validationlayers/share/vulkan/explicit_layer.d",
         };
         for (const char* candidate : candidates) {
-            if (std::filesystem::exists(candidate)) {
-                setenv("VK_LAYER_PATH", candidate, 0);
-                break;
+            const std::filesystem::path manifest =
+                std::filesystem::path(candidate) / "VkLayer_khronos_validation.json";
+            const std::filesystem::path library =
+                std::filesystem::path(candidate) / ".." / ".." / ".." / "lib" /
+                "libVkLayer_khronos_validation.dylib";
+            if (!std::filesystem::exists(manifest)) {
+                continue;
             }
+            if (std::filesystem::exists(library)) {
+                // Homebrew's manifest lists a bare library filename that the
+                // loader cannot dlopen outside default search paths. Write a
+                // shadow manifest with an absolute path and point VK_LAYER_PATH
+                // at it.
+                std::ifstream input(manifest);
+                std::ostringstream buffer;
+                buffer << input.rdbuf();
+                std::string text = buffer.str();
+                const std::string from = "\"library_path\": \"libVkLayer_khronos_validation.dylib\"";
+                const std::string to = "\"library_path\": \"" + std::filesystem::absolute(library).string() + "\"";
+                if (text.find(from) != std::string::npos) {
+                    std::error_code ec;
+                    const std::filesystem::path shadow_dir =
+                        std::filesystem::temp_directory_path(ec) / "meridian-vklayer";
+                    if (!std::filesystem::exists(shadow_dir)) {
+                        std::filesystem::create_directories(shadow_dir, ec);
+                    }
+                    if (!ec) {
+                        const std::filesystem::path shadow = shadow_dir / manifest.filename();
+                        std::ofstream output(shadow, std::ios::trunc);
+                        output << text.replace(text.find(from), from.size(), to);
+                        setenv("VK_LAYER_PATH", shadow_dir.c_str(), 0);
+                        break;
+                    }
+                }
+            }
+            setenv("VK_LAYER_PATH", candidate, 0);
+            break;
         }
     }
 #endif
@@ -880,8 +913,21 @@ std::vector<const char*> collect_instance_extensions() {
     return extensions;
 }
 
-std::vector<const char*> collect_validation_layers(bool enable_validation) {
-    std::vector<const char*> layers;
+VKAPI_ATTR VkBool32 VKAPI_CALL meridian_debug_callback(
+    VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+    VkDebugUtilsMessageTypeFlagsEXT types,
+    const VkDebugUtilsMessengerCallbackDataEXT* callback_data,
+    void* user_data) {
+    (void)types;
+    (void)user_data;
+    const char* tag = (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) != 0
+                          ? "VALIDATION ERROR"
+                          : "VALIDATION WARNING";
+    std::cerr << tag << ": " << callback_data->pMessage << std::endl;
+    return VK_FALSE;
+}
+
+std::vector<const char*> collect_validation_layers(bool enable_validation) {    std::vector<const char*> layers;
     if (!enable_validation) {
         return layers;
     }
@@ -1160,7 +1206,8 @@ VkResult create_swapchain(VkPhysicalDevice physical_device, VkDevice device, VkS
     return VK_SUCCESS;
 }
 
-VkResult create_frame_context(VkDevice device, const QueueFamilySelection& queues, FrameContext& frame) {
+VkResult create_frame_context(VkDevice device, const QueueFamilySelection& queues, uint32_t swapchain_image_count,
+                              FrameContext& frame) {
     VkCommandPoolCreateInfo pool_info{};
     pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -1189,6 +1236,18 @@ VkResult create_frame_context(VkDevice device, const QueueFamilySelection& queue
     result = vkCreateSemaphore(device, &semaphore_info, nullptr, &frame.render_finished);
     if (result != VK_SUCCESS) {
         return result;
+    }
+
+    // Per-swapchain-image signal semaphores: presenting retires a semaphore
+    // only when that image is reacquired, so a single reused render_finished
+    // can still be "in use by the swapchain" at the next submit.
+    frame.render_finished_per_image.resize(swapchain_image_count, VK_NULL_HANDLE);
+    for (uint32_t i = 0; i < swapchain_image_count; ++i) {
+        result = vkCreateSemaphore(device, &semaphore_info, nullptr,
+                                   &frame.render_finished_per_image[i]);
+        if (result != VK_SUCCESS) {
+            return result;
+        }
     }
 
     VkFenceCreateInfo fence_info{};
@@ -1225,6 +1284,12 @@ void destroy_frame_context(VkDevice device, FrameContext& frame) {
     if (frame.render_finished != VK_NULL_HANDLE) {
         vkDestroySemaphore(device, frame.render_finished, nullptr);
     }
+    for (VkSemaphore semaphore : frame.render_finished_per_image) {
+        if (semaphore != VK_NULL_HANDLE) {
+            vkDestroySemaphore(device, semaphore, nullptr);
+        }
+    }
+    frame.render_finished_per_image.clear();
     if (frame.image_available != VK_NULL_HANDLE) {
         vkDestroySemaphore(device, frame.image_available, nullptr);
     }
@@ -1539,23 +1604,14 @@ VkResult record_debug_command_buffer(FrameContext& frame, const DebugRenderConte
                                 &hzb.depth_copy_descriptor_set, 0, nullptr);
         vkCmdDispatch(frame.command_buffer, (hzb.width + 7) / 8, (hzb.height + 7) / 8, 1);
 
-        // Barrier: mip 0 written -> readable for downsample
-        VkImageMemoryBarrier mip0_to_read{};
-        mip0_to_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        mip0_to_read.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        mip0_to_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        mip0_to_read.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-        mip0_to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        mip0_to_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        mip0_to_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        mip0_to_read.image = hzb.image;
-        mip0_to_read.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        mip0_to_read.subresourceRange.baseMipLevel = 0;
-        mip0_to_read.subresourceRange.levelCount = 1;
-        mip0_to_read.subresourceRange.layerCount = 1;
+        // Barrier: mip 0 writes visible to the downsample reads (layout stays GENERAL)
+        VkMemoryBarrier mip0_visibility{};
+        mip0_visibility.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mip0_visibility.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mip0_visibility.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         vkCmdPipelineBarrier(frame.command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
-                             1, &mip0_to_read);
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mip0_visibility, 0,
+                             nullptr, 0, nullptr);
 
         // Downsample each mip level
         vkCmdBindPipeline(frame.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, hzb.pipeline);
@@ -1573,24 +1629,15 @@ VkResult record_debug_command_buffer(FrameContext& frame, const DebugRenderConte
             const uint32_t dst_h = std::max(src_h / 2, 1u);
             vkCmdDispatch(frame.command_buffer, (dst_w + 7) / 8, (dst_h + 7) / 8, 1);
 
-            // Barrier: written mip -> readable for next iteration
+            // Barrier: written mip visible to the next downsample step (layout stays GENERAL)
             if (mip + 2 < hzb.mip_count) {
-                VkImageMemoryBarrier mip_barrier{};
-                mip_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-                mip_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-                mip_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-                mip_barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-                mip_barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-                mip_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                mip_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                mip_barrier.image = hzb.image;
-                mip_barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-                mip_barrier.subresourceRange.baseMipLevel = mip + 1;
-                mip_barrier.subresourceRange.levelCount = 1;
-                mip_barrier.subresourceRange.layerCount = 1;
+                VkMemoryBarrier mip_visibility{};
+                mip_visibility.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+                mip_visibility.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                mip_visibility.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
                 vkCmdPipelineBarrier(frame.command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
-                                     1, &mip_barrier);
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mip_visibility,
+                                     0, nullptr, 0, nullptr);
             }
             src_w = dst_w;
             src_h = dst_h;
@@ -1692,6 +1739,7 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
     GLFWwindow* window = nullptr;
     VkInstance instance = VK_NULL_HANDLE;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
+    VkDebugUtilsMessengerEXT debug_messenger = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
     VkQueue graphics_queue = VK_NULL_HANDLE;
     VkQueue present_queue = VK_NULL_HANDLE;
@@ -1705,11 +1753,16 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
     OcclusionRefineContext occlusion_refine;
     ShadowContext shadow;
     TraversalSelection last_submitted_selection;
+    std::filesystem::path temp_vgeo_path;
     uint32_t gpu_draw_count = 0;
     bool has_draw_indirect_count = false;
     GpuProfiler gpu_profiler;
 
     const auto cleanup = [&]() {
+        if (!temp_vgeo_path.empty()) {
+            std::error_code ec;
+            std::filesystem::remove(temp_vgeo_path, ec);
+        }
         if (device != VK_NULL_HANDLE) {
             vkDeviceWaitIdle(device);
             destroy_gpu_profiler(device, gpu_profiler);
@@ -1727,6 +1780,13 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
         if (surface != VK_NULL_HANDLE && instance != VK_NULL_HANDLE) {
             vkDestroySurfaceKHR(instance, surface, nullptr);
         }
+        if (debug_messenger != VK_NULL_HANDLE && instance != VK_NULL_HANDLE) {
+            auto destroy_messenger = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(
+                vkGetInstanceProcAddr(instance, "vkDestroyDebugUtilsMessengerEXT"));
+            if (destroy_messenger != nullptr) {
+                destroy_messenger(instance, debug_messenger, nullptr);
+            }
+        }
         if (instance != VK_NULL_HANDLE) {
             vkDestroyInstance(instance, nullptr);
         }
@@ -1743,6 +1803,9 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
 
         std::vector<const char*> instance_extensions = collect_instance_extensions();
         std::vector<const char*> validation_layers = collect_validation_layers(config.enable_validation);
+        if (!validation_layers.empty()) {
+            instance_extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+        }
 
         VkApplicationInfo application_info{};
         application_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
@@ -1771,6 +1834,23 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             return report;
         }
         report.instance_created = true;
+
+        if (!validation_layers.empty()) {
+            auto create_messenger = reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(
+                vkGetInstanceProcAddr(instance, "vkCreateDebugUtilsMessengerEXT"));
+            if (create_messenger != nullptr) {
+                VkDebugUtilsMessengerCreateInfoEXT messenger_info{};
+                messenger_info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
+                messenger_info.messageSeverity =
+                    VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+                    VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+                messenger_info.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                                             VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                                             VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+                messenger_info.pfnUserCallback = &meridian_debug_callback;
+                create_messenger(instance, &messenger_info, nullptr, &debug_messenger);
+            }
+        }
 
         window = glfwCreateWindow(static_cast<int>(config.window_width),
                                   static_cast<int>(config.window_height), "Meridian Bootstrap", nullptr,
@@ -1822,7 +1902,12 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             device_extensions.push_back(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME);
         }
 
+        VkPhysicalDeviceFeatures supported_features{};
+        vkGetPhysicalDeviceFeatures(selection.physical_device, &supported_features);
         VkPhysicalDeviceFeatures device_features{};
+        device_features.multiDrawIndirect = supported_features.multiDrawIndirect;
+        device_features.drawIndirectFirstInstance = supported_features.drawIndirectFirstInstance;
+        device_features.independentBlend = supported_features.independentBlend;
         VkDeviceCreateInfo device_info{};
         device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
         device_info.queueCreateInfoCount = static_cast<uint32_t>(queue_infos.size());
@@ -1943,6 +2028,13 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
         }
         double last_frame_time = glfwGetTime();
         uint32_t fps_frame_count = 0;
+        // Draw-list upload scratch: entries past the live count are zeroed so the
+        // vkCmdDrawIndirect fallback (no draw_indirect_count extension) never
+        // replays stale draws with instanceCount=1 after the visible set shrinks.
+        std::vector<GpuDrawEntry> draw_upload_scratch;
+        std::vector<GpuDrawEntry> cascade_upload_scratch[kShadowCascadeCount];
+        uint32_t draw_list_high_water = 0;
+        uint32_t cascade_high_water[kShadowCascadeCount] = {};
         double fps_timer = last_frame_time;
         std::vector<double> frame_times_ms;
 
@@ -1955,7 +2047,6 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
         struct PageFileRange { uint64_t offset = 0; uint32_t size = 0; };
         std::vector<PageFileRange> page_file_ranges(residency_model.pages.size());
         AsyncReader async_reader;
-        std::filesystem::path temp_vgeo_path;
         bool async_io_active = false;
         StreamingScheduler streaming_scheduler;
         if (config.demand_streaming) {
@@ -2128,7 +2219,8 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             report.debug_rendered_cluster_count == report.replay_selected_cluster_count &&
             report.debug_rendered_lod_cluster_count == report.replay_selected_lod_cluster_count;
 
-        result = create_frame_context(device, selection.queues, frame);
+        result = create_frame_context(device, selection.queues,
+                                      static_cast<uint32_t>(swapchain.images.size()), frame);
         if (result != VK_SUCCESS) {
             std::ostringstream message;
             message << "create_frame_context failed with code " << result;
@@ -2632,10 +2724,14 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                 acc_build_ms +=
                     std::chrono::duration<double, std::milli>(t_build_end - t_build_start).count();
                 auto t_upload_start = clock_t::now();
-                if (cpu_draw_count > 0 &&
-                    compute_selection.draw_list.buffer != VK_NULL_HANDLE) {
-                    update_uploaded_buffer(device, cpu_draws.data(),
-                                           static_cast<VkDeviceSize>(cpu_draw_count) *
+                if (compute_selection.draw_list.buffer != VK_NULL_HANDLE) {
+                    if (cpu_draw_count > draw_list_high_water) {
+                        draw_list_high_water = cpu_draw_count;
+                    }
+                    draw_upload_scratch.assign(draw_list_high_water, GpuDrawEntry{});
+                    std::copy(cpu_draws.begin(), cpu_draws.end(), draw_upload_scratch.begin());
+                    update_uploaded_buffer(device, draw_upload_scratch.data(),
+                                           static_cast<VkDeviceSize>(draw_upload_scratch.size()) *
                                                sizeof(GpuDrawEntry),
                                            compute_selection.draw_list);
                 }
@@ -2643,9 +2739,16 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                 // HOST_COHERENT buffer; the shadow pass reads them per pass.
                 for (uint32_t c = 0; c < kShadowCascadeCount; ++c) {
                     const uint32_t ccount = static_cast<uint32_t>(cascade_draws[c].size());
-                    if (ccount > 0 && shadow.cascade_draw_lists[c].buffer != VK_NULL_HANDLE) {
-                        update_uploaded_buffer(device, cascade_draws[c].data(),
-                                               static_cast<VkDeviceSize>(ccount) *
+                    if (shadow.cascade_draw_lists[c].buffer != VK_NULL_HANDLE) {
+                        if (ccount > cascade_high_water[c]) {
+                            cascade_high_water[c] = ccount;
+                        }
+                        cascade_upload_scratch[c].assign(cascade_high_water[c], GpuDrawEntry{});
+                        std::copy(cascade_draws[c].begin(), cascade_draws[c].end(),
+                                  cascade_upload_scratch[c].begin());
+                        update_uploaded_buffer(device, cascade_upload_scratch[c].data(),
+                                               static_cast<VkDeviceSize>(
+                                                   cascade_upload_scratch[c].size()) *
                                                    sizeof(GpuDrawEntry),
                                                shadow.cascade_draw_lists[c]);
                     }
@@ -2690,8 +2793,12 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             submit_info.pWaitDstStageMask = &wait_stage;
             submit_info.commandBufferCount = 1;
             submit_info.pCommandBuffers = &frame.command_buffer;
+            VkSemaphore signal_semaphore =
+                image_index < frame.render_finished_per_image.size()
+                    ? frame.render_finished_per_image[image_index]
+                    : frame.render_finished;
             submit_info.signalSemaphoreCount = 1;
-            submit_info.pSignalSemaphores = &frame.render_finished;
+            submit_info.pSignalSemaphores = &signal_semaphore;
 
             auto t_submit_start = clock_t::now();
             result = vkQueueSubmit(graphics_queue, 1, &submit_info, frame.in_flight);
@@ -2720,10 +2827,14 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                 return report;
             }
 
+            VkSemaphore present_wait_semaphore =
+                image_index < frame.render_finished_per_image.size()
+                    ? frame.render_finished_per_image[image_index]
+                    : frame.render_finished;
             VkPresentInfoKHR present_info{};
             present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
             present_info.waitSemaphoreCount = 1;
-            present_info.pWaitSemaphores = &frame.render_finished;
+            present_info.pWaitSemaphores = &present_wait_semaphore;
             present_info.swapchainCount = 1;
             present_info.pSwapchains = &swapchain.swapchain;
             present_info.pImageIndices = &image_index;

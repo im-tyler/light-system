@@ -57,6 +57,7 @@ struct FrameContext {
     VkCommandPool command_pool = VK_NULL_HANDLE;
     VkCommandBuffer command_buffer = VK_NULL_HANDLE;
     VkSemaphore image_available = VK_NULL_HANDLE;
+    std::vector<VkSemaphore> render_finished_per_image;
     VkSemaphore render_finished = VK_NULL_HANDLE;
     VkFence in_flight = VK_NULL_HANDLE;
 };

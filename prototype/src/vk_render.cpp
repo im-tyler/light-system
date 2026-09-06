@@ -37,7 +37,7 @@ VkResult create_depth_resources(VkPhysicalDevice physical_device, VkDevice devic
     image_info.format = context.depth_format;
     image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
     image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    image_info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    image_info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     image_info.samples = VK_SAMPLE_COUNT_1_BIT;
     image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
@@ -162,6 +162,14 @@ VkResult create_debug_render_context(VkPhysicalDevice physical_device, VkDevice 
     (void)context;
     return VK_ERROR_FEATURE_NOT_PRESENT;
 #else
+    VkResult result = create_depth_resources(physical_device, device, swapchain.extent, context);
+    if (result != VK_SUCCESS) {
+        return result;
+    }
+    result = create_visibility_resources(physical_device, device, swapchain.extent, context);
+    if (result != VK_SUCCESS) {
+        return result;
+    }
     VkAttachmentDescription color_attachment{};
     color_attachment.format = swapchain.surface_format.format;
     color_attachment.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -213,26 +221,26 @@ VkResult create_debug_render_context(VkPhysicalDevice physical_device, VkDevice 
     const VkAttachmentReference color_attachments[] = {color_attachment_ref, visibility_attachment_ref};
     subpass.pColorAttachments = color_attachments;
 
-    VkSubpassDependency dependency{};
-    dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
-    dependency.dstSubpass = 0;
-    dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                              VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
-    dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                              VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
-    dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-                               VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    VkSubpassDependency dependencies[2]{};
+    // Swapchain presentation -> color/depth writes of this pass
+    dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+    dependencies[0].dstSubpass = 0;
+    dependencies[0].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                   VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    dependencies[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                   VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    dependencies[0].srcAccessMask = 0;
+    dependencies[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    // Shadow-pass depth-array writes (earlier in the same command buffer) -> fragment sampling
+    dependencies[1].srcSubpass = VK_SUBPASS_EXTERNAL;
+    dependencies[1].dstSubpass = 0;
+    dependencies[1].srcStageMask = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    dependencies[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    dependencies[1].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    dependencies[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 
     const VkAttachmentDescription attachments[] = {color_attachment, depth_attachment, visibility_attachment};
-
-    VkResult result = create_depth_resources(physical_device, device, swapchain.extent, context);
-    if (result != VK_SUCCESS) {
-        return result;
-    }
-    result = create_visibility_resources(physical_device, device, swapchain.extent, context);
-    if (result != VK_SUCCESS) {
-        return result;
-    }
 
     VkRenderPassCreateInfo render_pass_info{};
     render_pass_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
@@ -240,8 +248,8 @@ VkResult create_debug_render_context(VkPhysicalDevice physical_device, VkDevice 
     render_pass_info.pAttachments = attachments;
     render_pass_info.subpassCount = 1;
     render_pass_info.pSubpasses = &subpass;
-    render_pass_info.dependencyCount = 1;
-    render_pass_info.pDependencies = &dependency;
+    render_pass_info.dependencyCount = 2;
+    render_pass_info.pDependencies = dependencies;
     result = vkCreateRenderPass(device, &render_pass_info, nullptr, &context.render_pass);
     if (result != VK_SUCCESS) {
         return result;

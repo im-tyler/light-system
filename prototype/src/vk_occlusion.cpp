@@ -87,14 +87,14 @@ VkResult create_occlusion_refine_context(VkPhysicalDevice physical_device, VkDev
     result = create_uploaded_buffer(physical_device, device, nullptr,
                                    std::max(draw_size, static_cast<VkDeviceSize>(sizeof(GpuDrawEntry))),
                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                                   VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                   VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
                                    context.output_draws);
     if (result != VK_SUCCESS) return result;
 
     const uint32_t zero = 0;
     result = create_uploaded_buffer(physical_device, device, &zero, sizeof(uint32_t),
                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                                   VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                   VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
                                    context.output_count);
     if (result != VK_SUCCESS) return result;
 
