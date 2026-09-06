@@ -341,6 +341,9 @@ clodConfig make_clod_config(const BuildManifest& manifest) {
     config.partition_size = manifest.hierarchy_partition_size;
     config.optimize_bounds = true;
     config.optimize_clusters = true;
+    // Must match meshopt_optimizeMeshlet (level 0) used by build_section_base_clusters:
+    // provenance matching relies on clod level-0 clusters having identical index order.
+    config.optimize_clusters_level = 0;
     config.simplify_permissive = false;
     config.simplify_fallback_permissive = false;
     return config;
