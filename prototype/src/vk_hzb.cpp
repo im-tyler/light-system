@@ -307,6 +307,75 @@ VkResult create_hzb_context(VkPhysicalDevice physical_device, VkDevice device,
     dc_writes[1].pImageInfo = &dc_dst_info;
     vkUpdateDescriptorSets(device, 2, dc_writes, 0, nullptr);
 
+    // Bring the freshly created HZB into a valid sampled layout with harmless
+    // contents (far depth: occlusion refinement culls nothing) so a first-frame
+    // occlusion pass that runs before any HZB build is layout-legal.
+    {
+        VkCommandPoolCreateInfo pool_info{};
+        pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        pool_info.queueFamilyIndex = 0;
+        VkCommandPool pool = VK_NULL_HANDLE;
+        if (vkCreateCommandPool(device, &pool_info, nullptr, &pool) == VK_SUCCESS) {
+            VkCommandBufferAllocateInfo alloc_info{};
+            alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            alloc_info.commandPool = pool;
+            alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            alloc_info.commandBufferCount = 1;
+            VkCommandBuffer cmd = VK_NULL_HANDLE;
+            if (vkAllocateCommandBuffers(device, &alloc_info, &cmd) == VK_SUCCESS) {
+                VkCommandBufferBeginInfo begin{};
+                begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+                begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                if (vkBeginCommandBuffer(cmd, &begin) == VK_SUCCESS) {
+                    VkImageMemoryBarrier to_dst{};
+                    to_dst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                    to_dst.srcAccessMask = 0;
+                    to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                    to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                    to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                    to_dst.image = context.image;
+                    to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, context.mip_count, 0, 1};
+                    VkImageMemoryBarrier to_read{};
+                    to_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                    to_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                    to_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                    to_read.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                    to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                    to_read.image = context.image;
+                    to_read.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, context.mip_count, 0, 1};
+
+                    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                                         nullptr, 1, &to_dst);
+                    VkClearColorValue clear_value{};
+                    clear_value.float32[0] = 1.0f;
+                    VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0,
+                                                     context.mip_count, 0, 1};
+                    vkCmdClearColorImage(cmd, context.image,
+                                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear_value, 1,
+                                         &range);
+                    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                         0, 0, nullptr, 0, nullptr, 1, &to_read);
+                    if (vkEndCommandBuffer(cmd) == VK_SUCCESS) {
+                        VkQueue init_queue = VK_NULL_HANDLE;
+                        vkGetDeviceQueue(device, 0, 0, &init_queue);
+                        if (init_queue != VK_NULL_HANDLE) {
+                            VkSubmitInfo submit{};
+                            submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+                            submit.commandBufferCount = 1;
+                            submit.pCommandBuffers = &cmd;
+                            vkQueueSubmit(init_queue, 1, &submit, VK_NULL_HANDLE);
+                            vkQueueWaitIdle(init_queue);
+                        }
+                    }
+                }
+            }
+            vkDestroyCommandPool(device, pool, nullptr);
+        }
+    }
+
     return VK_SUCCESS;
 }
 

@@ -1520,6 +1520,14 @@ VkResult record_debug_command_buffer(FrameContext& frame, const DebugRenderConte
 
     vkCmdBeginRenderPass(frame.command_buffer, &render_pass_info, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(frame.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, debug_render.pipeline);
+    VkViewport dynamic_viewport{};
+    dynamic_viewport.width = static_cast<float>(swapchain.extent.width);
+    dynamic_viewport.height = static_cast<float>(swapchain.extent.height);
+    dynamic_viewport.maxDepth = 1.0f;
+    vkCmdSetViewport(frame.command_buffer, 0, 1, &dynamic_viewport);
+    VkRect2D dynamic_scissor{};
+    dynamic_scissor.extent = swapchain.extent;
+    vkCmdSetScissor(frame.command_buffer, 0, 1, &dynamic_scissor);
     if (debug_render.descriptor_set != VK_NULL_HANDLE) {
         vkCmdBindDescriptorSets(frame.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                 debug_render.pipeline_layout, 0, 1, &debug_render.descriptor_set,
@@ -1754,6 +1762,7 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
     ShadowContext shadow;
     TraversalSelection last_submitted_selection;
     std::filesystem::path temp_vgeo_path;
+    bool framebuffer_resized = false;
     uint32_t gpu_draw_count = 0;
     bool has_draw_indirect_count = false;
     GpuProfiler gpu_profiler;
@@ -1799,7 +1808,7 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
     try {
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
         glfwWindowHint(GLFW_VISIBLE, config.visible_window ? GLFW_TRUE : GLFW_FALSE);
-        glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
+        glfwWindowHint(GLFW_RESIZABLE, config.visible_window ? GLFW_TRUE : GLFW_FALSE);
 
         std::vector<const char*> instance_extensions = collect_instance_extensions();
         std::vector<const char*> validation_layers = collect_validation_layers(config.enable_validation);
@@ -1861,6 +1870,11 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             return report;
         }
         report.window_created = true;
+        glfwSetWindowUserPointer(window, &framebuffer_resized);
+        glfwSetFramebufferSizeCallback(
+            window, [](GLFWwindow* cb_window, int, int) {
+                *static_cast<bool*>(glfwGetWindowUserPointer(cb_window)) = true;
+            });
 
         result = create_window_surface(instance, window, &surface);
         if (result != VK_SUCCESS) {
@@ -2149,12 +2163,56 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             report.debug_rendered_cluster_count == report.replay_selected_cluster_count &&
             report.debug_rendered_lod_cluster_count == report.replay_selected_lod_cluster_count;
 
-        result = create_debug_render_context(selection.physical_device, device, swapchain,
-                                             scene_buffers, compute_selection.draw_list,
-                                             debug_render);
+        // Extent-dependent GPU resources: destroyed and recreated together on
+        // swapchain out-of-date / window resize.
+        const auto create_surface_resources = [&]() -> VkResult {
+            VkResult r = create_debug_render_context(selection.physical_device, device, swapchain,
+                                                     scene_buffers, compute_selection.draw_list,
+                                                     debug_render);
+            if (r != VK_SUCCESS) {
+                return r;
+            }
+            r = create_hzb_context(selection.physical_device, device,
+                                   swapchain.extent.width, swapchain.extent.height,
+                                   debug_render.depth_view, debug_render.depth_format, hzb);
+            if (r != VK_SUCCESS) {
+                return r;
+            }
+            r = create_occlusion_refine_context(selection.physical_device, device,
+                                                compute_selection, scene_buffers, hzb,
+                                                total_clusters, occlusion_refine);
+            if (r != VK_SUCCESS) {
+                return r;
+            }
+            r = create_shadow_context(selection.physical_device, device, scene_buffers,
+                                      debug_render.frame_ubo, compute_selection.max_draws,
+                                      resource, 2048, shadow);
+            if (r != VK_SUCCESS) {
+                return r;
+            }
+            // Bind cascaded shadow map (2D array) to main pass descriptor set binding 3
+            if (shadow.depth_array_view != VK_NULL_HANDLE && shadow.sampler != VK_NULL_HANDLE) {
+                VkDescriptorImageInfo shadow_img_info{};
+                shadow_img_info.sampler = shadow.sampler;
+                shadow_img_info.imageView = shadow.depth_array_view;
+                shadow_img_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+                VkWriteDescriptorSet shadow_write{};
+                shadow_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                shadow_write.dstSet = debug_render.descriptor_set;
+                shadow_write.dstBinding = 3;
+                shadow_write.descriptorCount = 1;
+                shadow_write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                shadow_write.pImageInfo = &shadow_img_info;
+                vkUpdateDescriptorSets(device, 1, &shadow_write, 0, nullptr);
+            }
+            return VK_SUCCESS;
+        };
+
+        result = create_surface_resources();
         if (result != VK_SUCCESS) {
             std::ostringstream message;
-            message << "create_debug_render_context failed with code " << result;
+            message << "create_surface_resources failed with code " << result;
             report.status = message.str();
             cleanup();
             return report;
@@ -2163,55 +2221,27 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
         report.debug_geometry_uploaded = debug_render.descriptor_set != VK_NULL_HANDLE;
         report.visibility_attachment_created = debug_render.visibility_view != VK_NULL_HANDLE;
 
-        result = create_hzb_context(selection.physical_device, device,
-                                    swapchain.extent.width, swapchain.extent.height,
-                                    debug_render.depth_view, debug_render.depth_format, hzb);
-        if (result != VK_SUCCESS) {
-            std::ostringstream message;
-            message << "create_hzb_context failed with code " << result;
-            report.status = message.str();
-            cleanup();
-            return report;
-        }
-
-        result = create_occlusion_refine_context(selection.physical_device, device,
-                                                  compute_selection, scene_buffers, hzb,
-                                                  total_clusters, occlusion_refine);
-        if (result != VK_SUCCESS) {
-            std::ostringstream message;
-            message << "create_occlusion_refine_context failed with code " << result;
-            report.status = message.str();
-            cleanup();
-            return report;
-        }
-
-        result = create_shadow_context(selection.physical_device, device, scene_buffers,
-                                       debug_render.frame_ubo, compute_selection.max_draws,
-                                       resource, 2048, shadow);
-        if (result != VK_SUCCESS) {
-            std::ostringstream message;
-            message << "create_shadow_context failed with code " << result;
-            report.status = message.str();
-            cleanup();
-            return report;
-        }
-
-        // Bind cascaded shadow map (2D array) to main pass descriptor set binding 3
-        if (shadow.depth_array_view != VK_NULL_HANDLE && shadow.sampler != VK_NULL_HANDLE) {
-            VkDescriptorImageInfo shadow_img_info{};
-            shadow_img_info.sampler = shadow.sampler;
-            shadow_img_info.imageView = shadow.depth_array_view;
-            shadow_img_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-            VkWriteDescriptorSet shadow_write{};
-            shadow_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            shadow_write.dstSet = debug_render.descriptor_set;
-            shadow_write.dstBinding = 3;
-            shadow_write.descriptorCount = 1;
-            shadow_write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            shadow_write.pImageInfo = &shadow_img_info;
-            vkUpdateDescriptorSets(device, 1, &shadow_write, 0, nullptr);
-        }
+        const auto recreate_surface = [&]() -> bool {
+            vkDeviceWaitIdle(device);
+            destroy_frame_context(device, frame);
+            destroy_shadow_context(device, shadow);
+            destroy_occlusion_refine_context(device, occlusion_refine);
+            destroy_hzb_context(device, hzb);
+            destroy_debug_render_context(device, debug_render);
+            destroy_swapchain(device, swapchain);
+            VkResult r =
+                create_swapchain(selection.physical_device, device, surface, window,
+                                 selection.queues, swapchain);
+            if (r != VK_SUCCESS) {
+                return false;
+            }
+            if (create_surface_resources() != VK_SUCCESS) {
+                return false;
+            }
+            return create_frame_context(device, selection.queues,
+                                        static_cast<uint32_t>(swapchain.images.size()),
+                                        frame) == VK_SUCCESS;
+        };
 
         update_debug_selection_report(initial_selection, report.uploadable_scene, report);
         report.replay_runtime_parity =
@@ -2236,6 +2266,15 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             glfwPollEvents();
             if (glfwWindowShouldClose(window) == GLFW_TRUE) {
                 break;
+            }
+            if (framebuffer_resized) {
+                framebuffer_resized = false;
+                if (!recreate_surface()) {
+                    report.status = "swapchain recreation failed after window resize";
+                    cleanup();
+                    return report;
+                }
+                continue;
             }
 
             // Interactive camera update
@@ -2507,6 +2546,14 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             uint32_t image_index = 0;
             result = vkAcquireNextImageKHR(device, swapchain.swapchain, UINT64_MAX,
                                            frame.image_available, VK_NULL_HANDLE, &image_index);
+            if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
+                if (!recreate_surface()) {
+                    report.status = "swapchain recreation failed after out-of-date acquire";
+                    cleanup();
+                    return report;
+                }
+                continue;
+            }
             if (result != VK_SUCCESS) {
                 std::ostringstream message;
                 message << "vkAcquireNextImageKHR failed with code " << result;
@@ -2844,7 +2891,9 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             auto t_present_end = clock_t::now();
             acc_present_ms +=
                 std::chrono::duration<double, std::milli>(t_present_end - t_present_start).count();
-            if (result != VK_SUCCESS) {
+            if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
+                framebuffer_resized = true;
+            } else if (result != VK_SUCCESS) {
                 std::ostringstream message;
                 message << "vkQueuePresentKHR failed with code " << result;
                 report.status = message.str();
