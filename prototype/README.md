@@ -86,18 +86,26 @@ Current role:
 - serialize base-cluster payloads and LOD payloads as separate sections
 - provide a stable place to begin the real mesh-processing pipeline
 
-Example direct build command in the current environment:
+Build (from the repository root):
+
+```bash
+./tools/vendor_thirdparty.sh   # clones pinned meshoptimizer into prototype/thirdparty/
+cmake -S prototype -B prototype/build -DCMAKE_BUILD_TYPE=Release
+cmake --build prototype/build -j
+```
+
+Historical single-command build that predates the CMake setup:
 
 ```bash
 c++ -std=c++20 -Wall -Wextra -pedantic \
-  renderer/prototype/src/main.cpp \
-  renderer/prototype/src/vgeo_builder.cpp \
-  renderer/prototype/thirdparty/meshoptimizer/src/allocator.cpp \
-  renderer/prototype/thirdparty/meshoptimizer/src/clusterizer.cpp \
-  renderer/prototype/thirdparty/meshoptimizer/src/indexgenerator.cpp \
-  renderer/prototype/thirdparty/meshoptimizer/src/meshletutils.cpp \
-  renderer/prototype/thirdparty/meshoptimizer/src/partition.cpp \
-  renderer/prototype/thirdparty/meshoptimizer/src/simplifier.cpp \
-  renderer/prototype/thirdparty/meshoptimizer/src/spatialorder.cpp \
-  -o renderer/prototype/build/meridian_builder
+  prototype/src/main.cpp \
+  prototype/src/vgeo_builder.cpp \
+  prototype/thirdparty/meshoptimizer/src/allocator.cpp \
+  prototype/thirdparty/meshoptimizer/src/clusterizer.cpp \
+  prototype/thirdparty/meshoptimizer/src/indexgenerator.cpp \
+  prototype/thirdparty/meshoptimizer/src/meshletutils.cpp \
+  prototype/thirdparty/meshoptimizer/src/partition.cpp \
+  prototype/thirdparty/meshoptimizer/src/simplifier.cpp \
+  prototype/thirdparty/meshoptimizer/src/spatialorder.cpp \
+  -o prototype/build/meridian_builder
 ```

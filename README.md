@@ -30,7 +30,7 @@ If you are new, read in this order: **PROJECT_PLAN -> TECHNICAL_SPEC -> IMPLEMEN
 ## Working Directories
 
 ```
-meridian/
+light-system/
   prototype/         standalone Vulkan renderer (C++)
   godot-vgeo/        Godot-side importer and runtime integration
   godot/             Godot project shell for runtime testing
@@ -98,4 +98,4 @@ Vulkan SDK 1.2+ is required. The renderer is developed on Apple Silicon via Molt
 
 MIT — see [LICENSE](LICENSE).
 
-The `prototype/thirdparty/meshoptimizer/` checkout is vendored at build time and is gitignored. Honor its upstream license.
+The `prototype/thirdparty/meshoptimizer/` checkout is vendored at build time by [`tools/vendor_thirdparty.sh`](./tools/vendor_thirdparty.sh) at a pinned commit, and is gitignored. Honor its upstream license.
