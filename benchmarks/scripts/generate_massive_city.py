@@ -100,7 +100,7 @@ print(f"Generated city: {verts:,} vertices, {tris:,} triangles")
 bmin = [min(P[i::3]) for i in range(3)]
 bmax = [max(P[i::3]) for i in range(3)]
 
-out = "/Users/tyler/Documents/renderer/benchmarks/scenes/generated/massive_city.glb"
+out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scenes", "generated", "massive_city.glb")
 os.makedirs(os.path.dirname(out), exist_ok=True)
 
 pos_bytes = struct.pack(f'{len(P)}f', *P)

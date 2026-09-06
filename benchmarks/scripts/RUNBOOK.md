@@ -54,7 +54,7 @@ Stock Godot synthetic baseline workflow:
 
 ## Required Output Per Run
 
-- one CSV row in [RESULT_TEMPLATE.csv](/Users/tyler/Documents/renderer/benchmarks/results/RESULT_TEMPLATE.csv)
+- one CSV row in [RESULT_TEMPLATE.csv](./results/RESULT_TEMPLATE.csv)
 - one markdown result note
 - screenshots
 - config notes

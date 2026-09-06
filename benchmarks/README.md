@@ -4,14 +4,13 @@ Use this directory for repeatable benchmark assets and results only.
 
 ## Layout
 
-- [scenes](/Users/tyler/Documents/renderer/benchmarks/scenes): benchmark scene manifests and scene assets
-- [scripts](/Users/tyler/Documents/renderer/benchmarks/scripts): runbooks and automation
-- [results](/Users/tyler/Documents/renderer/benchmarks/results): structured benchmark outputs
-- [captures](/Users/tyler/Documents/renderer/benchmarks/captures): screenshots, RenderDoc captures, profiler exports
+- [scenes](./scenes): benchmark scene manifests and scene assets
+- [scripts](./scripts): runbooks and automation
+- [results](./results): structured benchmark outputs
 
 External asset validation:
 
-- [IMPORT_VALIDATION_WORKFLOW.md](/Users/tyler/Documents/renderer/benchmarks/IMPORT_VALIDATION_WORKFLOW.md): real imported-asset workflow using generated manifests and replay scripts
+- [IMPORT_VALIDATION_WORKFLOW.md](./IMPORT_VALIDATION_WORKFLOW.md): real imported-asset workflow using generated manifests and replay scripts
 
 ## Rules
 
