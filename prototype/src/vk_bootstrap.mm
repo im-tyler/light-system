@@ -48,6 +48,7 @@
 #include <limits>
 #include <numeric>
 #include <set>
+#include <iostream>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -55,6 +56,7 @@
 #if defined(__APPLE__)
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/CAMetalLayer.h>
+#include <mach-o/dyld.h>
 #endif
 
 #if __has_include(<shaderc/shaderc.hpp>)
@@ -67,13 +69,33 @@
 namespace meridian {
 
 std::filesystem::path resolve_shader_path(const char* name) {
-    // Try relative to executable first, then relative to CWD
-    auto exe_dir = std::filesystem::current_path();
-    auto candidates = {
-        exe_dir / ".." / "shaders" / name,  // build/.. = prototype root
-        exe_dir / "shaders" / name,
-        std::filesystem::path("shaders") / name,
-    };
+    // Resolve relative to the executable's real location first, then fall back to CWD
+    std::filesystem::path exe_dir;
+#if defined(__APPLE__)
+    uint32_t exe_path_size = 0;
+    _NSGetExecutablePath(nullptr, &exe_path_size);
+    std::string exe_path(exe_path_size, '\0');
+    if (_NSGetExecutablePath(exe_path.data(), &exe_path_size) == 0) {
+        std::error_code ec;
+        const auto resolved = std::filesystem::canonical(exe_path, ec);
+        if (!ec) {
+            exe_dir = resolved.parent_path();
+        }
+    }
+#elif defined(__linux__)
+    std::error_code ec;
+    const auto resolved = std::filesystem::read_symlink("/proc/self/exe", ec);
+    if (!ec) {
+        exe_dir = resolved.parent_path();
+    }
+#endif
+    std::vector<std::filesystem::path> candidates;
+    if (!exe_dir.empty()) {
+        candidates.push_back(exe_dir / ".." / "shaders" / name);  // build/.. = prototype root
+        candidates.push_back(exe_dir / "shaders" / name);
+    }
+    candidates.push_back(std::filesystem::current_path() / ".." / "shaders" / name);
+    candidates.push_back(std::filesystem::path("shaders") / name);
     for (const auto& p : candidates) {
         if (std::filesystem::exists(p)) return p;
     }
@@ -422,6 +444,7 @@ void destroy_hzb_context(VkDevice device, HzbContext& context) {
     if (context.descriptor_pool != VK_NULL_HANDLE) vkDestroyDescriptorPool(device, context.descriptor_pool, nullptr);
     if (context.descriptor_set_layout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(device, context.descriptor_set_layout, nullptr);
     if (context.depth_copy_set_layout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(device, context.depth_copy_set_layout, nullptr);
+    if (context.depth_copy_descriptor_pool != VK_NULL_HANDLE) vkDestroyDescriptorPool(device, context.depth_copy_descriptor_pool, nullptr);
     if (context.pipeline != VK_NULL_HANDLE) vkDestroyPipeline(device, context.pipeline, nullptr);
     if (context.pipeline_layout != VK_NULL_HANDLE) vkDestroyPipelineLayout(device, context.pipeline_layout, nullptr);
     if (context.depth_copy_pipeline != VK_NULL_HANDLE) vkDestroyPipeline(device, context.depth_copy_pipeline, nullptr);
@@ -457,6 +480,7 @@ void destroy_occlusion_refine_context(VkDevice device, OcclusionRefineContext& c
     destroy_uploaded_buffer(device, context.output_count);
     if (context.descriptor_pool != VK_NULL_HANDLE) vkDestroyDescriptorPool(device, context.descriptor_pool, nullptr);
     if (context.descriptor_set_layout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(device, context.descriptor_set_layout, nullptr);
+    if (context.hzb_full_view != VK_NULL_HANDLE) vkDestroyImageView(device, context.hzb_full_view, nullptr);
     if (context.pipeline != VK_NULL_HANDLE) vkDestroyPipeline(device, context.pipeline, nullptr);
     if (context.pipeline_layout != VK_NULL_HANDLE) vkDestroyPipelineLayout(device, context.pipeline_layout, nullptr);
     context = {};
@@ -2113,9 +2137,9 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             return report;
         }
 
-        for (uint32_t frame_index = 1;
+        for (uint32_t frame_index = 0;
              config.interactive ? (glfwWindowShouldClose(window) != GLFW_TRUE)
-                                : (frame_index < config.present_frame_count);
+                                 : (frame_index < config.present_frame_count);
              ++frame_index) {
             glfwPollEvents();
             if (glfwWindowShouldClose(window) == GLFW_TRUE) {
@@ -2751,9 +2775,14 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                 vkUnmapMemory(device, occlusion_refine.output_count.memory);
             }
         }
-        // Screenshot capture
+        // Screenshot capture (raw PPM; extension is forced to .ppm so the
+        // container always matches the bytes)
         if (!config.screenshot_path.empty() && report.presented_frame_count > 0 &&
             !swapchain.images.empty() && frame.command_pool != VK_NULL_HANDLE) {
+            std::filesystem::path screenshot_path(config.screenshot_path);
+            if (screenshot_path.extension() != ".ppm") {
+                screenshot_path.replace_extension(".ppm");
+            }
             const uint32_t w = swapchain.extent.width;
             const uint32_t h = swapchain.extent.height;
             const VkDeviceSize pixel_size = 4; // BGRA
@@ -2800,7 +2829,7 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                 void* mapped = nullptr;
                 if (vkMapMemory(device, readback.memory, 0, buf_size, 0, &mapped) == VK_SUCCESS) {
                     const uint8_t* pixels = static_cast<const uint8_t*>(mapped);
-                    std::ofstream ppm(config.screenshot_path, std::ios::binary);
+                    std::ofstream ppm(screenshot_path, std::ios::binary);
                     if (ppm) {
                         ppm << "P6\n" << w << " " << h << "\n255\n";
                         for (uint32_t i = 0; i < w * h; ++i) {
@@ -2809,6 +2838,7 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                             ppm.put(static_cast<char>(pixels[i * 4 + 1]));
                             ppm.put(static_cast<char>(pixels[i * 4 + 0]));
                         }
+                        std::cout << "screenshot=" << screenshot_path.string() << '\n';
                     }
                     vkUnmapMemory(device, readback.memory);
                 }

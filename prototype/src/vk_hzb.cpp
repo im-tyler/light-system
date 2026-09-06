@@ -268,20 +268,8 @@ VkResult create_hzb_context(VkPhysicalDevice physical_device, VkDevice device,
     dc_pool_info.pPoolSizes = dc_pool_sizes;
     result = vkCreateDescriptorPool(device, &dc_pool_info, nullptr, &dc_pool);
     if (result != VK_SUCCESS) return result;
-    // Store it -- we'll destroy it as part of the main descriptor_pool cleanup...
-    // Actually we need to track it. For now, leak it or merge cleanup.
-    // Let's just allocate from the main pool by over-sizing it earlier.
-    // Simpler: just allocate the depth-copy set here and keep the pool handle.
-    // We'll store dc_pool in... let's just not overthink this. We already destroy descriptor_pool.
-    // The depth_copy_descriptor_set is allocated from dc_pool. We need to destroy dc_pool.
-    // But we only have one descriptor_pool field. Let me just expand the main pool.
 
-    // Actually the cleanest: just replace the main pool creation to include +1 set and +1 of each type.
-    // But that code is already executed above. Let me just use this separate pool.
-    // Store it by reusing an existing field -- or just accept the tiny leak for now and fix later.
-    // Better: store dc_pool somewhere. I don't have a field. Let me hack it into the descriptor_pool
-    // by destroying the dc_pool in cleanup. Actually I'll just make descriptor_pool be the combined one.
-
+    // Allocate the depth-copy set from dc_pool and track the pool for cleanup
     VkDescriptorSetAllocateInfo dc_alloc{};
     dc_alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     dc_alloc.descriptorPool = dc_pool;
@@ -292,6 +280,7 @@ VkResult create_hzb_context(VkPhysicalDevice physical_device, VkDevice device,
         vkDestroyDescriptorPool(device, dc_pool, nullptr);
         return result;
     }
+    context.depth_copy_descriptor_pool = dc_pool;
 
     // Write depth-copy descriptor: depth texture as sampler, HZB mip 0 as storage
     VkDescriptorImageInfo dc_src_info{};
@@ -317,12 +306,6 @@ VkResult create_hzb_context(VkPhysicalDevice physical_device, VkDevice device,
     dc_writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     dc_writes[1].pImageInfo = &dc_dst_info;
     vkUpdateDescriptorSets(device, 2, dc_writes, 0, nullptr);
-
-    // We need to destroy dc_pool on cleanup. Stash it -- swap with descriptor_pool
-    // so both get destroyed. Actually, just destroy it after the descriptor_set_layout.
-    // The simplest: just leak the tiny pool for now (4 descriptors) and fix in cleanup refactor.
-    // TODO: track dc_pool properly
-    (void)dc_pool;
 
     return VK_SUCCESS;
 }

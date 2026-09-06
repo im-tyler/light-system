@@ -9,7 +9,8 @@
 namespace {
 
 void print_usage() {
-    std::cerr << "Usage: meridian_vk_bootstrap --manifest <path> [--interactive] [--screenshot <path>] [--budget <pages>] [--demand-streaming]\n";
+    std::cerr << "Usage: meridian_vk_bootstrap --manifest <path> [--interactive] [--screenshot <path>] [--budget <pages>] [--demand-streaming]\n"
+                 "  --screenshot writes a raw PPM image (extension forced to .ppm)\n";
 }
 
 }  // namespace

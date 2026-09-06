@@ -168,8 +168,7 @@ VkResult create_occlusion_refine_context(VkPhysicalDevice physical_device, VkDev
     writes[6].pImageInfo = &hzb_info;
     vkUpdateDescriptorSets(device, 7, writes, 0, nullptr);
 
-    // TODO: track hzb_full_view for cleanup
-    (void)hzb_full_view;
+    context.hzb_full_view = hzb_full_view;
 
     return VK_SUCCESS;
 }
