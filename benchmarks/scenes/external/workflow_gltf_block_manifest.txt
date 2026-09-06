@@ -1,5 +1,5 @@
 asset_id = workflow_gltf_block
-source_asset = /Users/tyler/Documents/renderer/benchmarks/scenes/generated/gltf_block_scene.gltf
+source_asset = ../generated/gltf_block_scene.gltf
 output_path = ../../../build/workflow_gltf_block.vgeo
 emit_fallback = true
 material_slots = stone_wall, roof_cap

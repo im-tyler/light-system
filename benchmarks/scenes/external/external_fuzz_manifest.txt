@@ -1,5 +1,5 @@
 asset_id = external_fuzz
-source_asset = /Users/tyler/Documents/renderer/prototype/thirdparty/meshoptimizer/gltf/fuzz.glb
+source_asset = ../../../prototype/thirdparty/meshoptimizer/gltf/fuzz.glb
 output_path = ../../../build/external_fuzz.vgeo
 emit_fallback = true
 material_slots = Texture

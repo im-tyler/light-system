@@ -4,7 +4,7 @@ This directory holds offline builder inputs and utility scripts.
 
 ## Current files
 
-- [sample_asset_manifest.txt](/Users/tyler/Documents/renderer/tools/sample_asset_manifest.txt): first-pass builder input format
+- [sample_asset_manifest.txt](./sample_asset_manifest.txt): first-pass builder input format
 
 ## Manifest format
 
