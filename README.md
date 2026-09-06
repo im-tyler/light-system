@@ -67,20 +67,19 @@ Per-frame GPU pipeline (timed via `VK_EXT_calibrated_timestamps`):
 5. Main geometry pass (vertex pulling from payload SSBOs, smooth normals + 8-tap Poisson PCF).
 6. HZB construction (depth-copy + per-mip max downsample).
 
-Performance (Apple M4, MoltenVK, 1280x720):
+Performance (Apple M4, MoltenVK, 1280x720, meshoptimizer pinned at c645e49):
 
-- Stanford Dragon (871K tris): median 19.2ms / 52 FPS.
-- Massive City (1M tris): median 65.5ms / 15.3 FPS (improving — LOD threshold tuning pending).
+- Stanford Dragon (871K tris): median 15.4ms / ~65 FPS.
+- Massive City (1M tris): median 30.6ms / ~33 FPS at full-detail threshold (LOD hierarchy for this scene is threshold-degenerate; see docs/IMPLEMENTATION_STATUS.md).
 
-Interactive mode: `--interactive` for continuous present loop, WASD + mouse look + Q/E vertical, FPS in window title.
+Interactive mode: `--interactive` for continuous present loop, WASD + mouse look + Q/E vertical, FPS in window title. `--error-threshold` tunes LOD selection per scene (default 0.001).
 
 See [`docs/IMPLEMENTATION_STATUS.md`](./docs/IMPLEMENTATION_STATUS.md) for the full pipeline state, known issues, and per-pass timings.
 
 ## Not Yet Implemented
 
-- Per-cluster backface culling on LOD clusters (currently base-only).
-- Real demand-streaming scheduler (CPU prototype exists; pages start all-resident by default).
-- Production async disk I/O for page loading (validation path exists).
+- Real demand-streaming scheduler in full (CPU prototype + validated async I/O path exist; pages start all-resident by default).
+- Production async disk I/O replacing the startup buffer (validation path exists via `--demand-streaming`).
 - Benchmark automation vs stock Godot.
 - Texture / UV support (all shading currently procedural).
 - Broader glTF import coverage.

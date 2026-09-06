@@ -1,6 +1,6 @@
 # Implementation Status
 
-Last updated: 2026-04-16
+Last updated: 2026-09-05
 
 ## Phase 1: Offline Builder (Complete)
 
@@ -36,6 +36,8 @@ GPU timestamp profiler emits `MERIDIAN_GPU: cull=.. sel=.. occ=.. shadow=.. main
 - `vkCmdDrawIndirectCount` reads draw list directly from the same buffers for both shadow and main passes (with fallback to `vkCmdDrawIndirect` if the extension is unavailable)
 - Shadow map rendered to depth texture, sampled in main fragment shader via `sampler2DShadow`
 - Visibility buffer: two-word RG32_UINT encoding matching visibility_format.h spec (instance, kind, index, local_triangle)
+- Normal-cone backface culling on both base and LOD clusters (schema v3 stores LOD cones; dragon steady-state draws 8366 -> 6467)
+- `meridian_vk_bootstrap --error-threshold` CLI override; `meridian_trace` reports LOD group error distribution
 - Occlusion refinement output available but readback deferred until indirect draws eliminate frame latency
 
 ### Interactive Mode
@@ -48,25 +50,25 @@ GPU timestamp profiler emits `MERIDIAN_GPU: cull=.. sel=.. occ=.. shadow=.. main
 
 - **No texture support**: all shading is procedural (per-cluster color hash + hemisphere ambient). No UV interpolation or texture sampling.
 - **Meshlet boundary seams (residual)**: smooth normals are now angle-weighted and position-welded in the builder (`compute_smooth_normals`), which matches normal values across index-split duplicates at the same position. Any remaining boundary seams come from LOD-level T-junctions at cluster borders of different detail, which are mitigated but not fully eliminated by seam-locked vertex simplification.
+- **City LOD hierarchy is degenerate (clusterlod output)**: `massive_city` LOD group errors are min ~0.036 / median ~0.1 with root-level groups at FLT_MAX, and there is a selection cliff between threshold ~5 (31K base clusters, ~39 groups activate) and ~20 (collapses to 1 group / 2 clusters). Between those bounds there is no useful middle representation, so the renderer default (0.001) keeps the city at full detail (correct but ~31K draws). Fixing this requires builder-side changes (coarser district partitioning or simplification caps), not traversal changes. `meridian_trace` now prints the error distribution, and `meridian_vk_bootstrap` accepts `--error-threshold` to tune per scene.
 - **Page residency initialized as all-resident by default**; pass `--demand-streaming` to run the StreamingScheduler + async-disk-load path. Under that flag pages start unloaded (seed pages autodetected via a coarse `simulate_traversal`), the scheduler throttles loads to `streaming_max_loads_per_frame` per frame, and a page's `loading -> resident` transition now waits on a real `pread()` from a worker thread (`AsyncReader`) against a serialized temp `.vgeo` written at startup. A latency-window simulation remains as the fallback path when the temp-file write or reader open fails. The GPU payload buffer is still populated in full at startup -- async reads currently validate the I/O path rather than replace the live buffer; the next step to remove startup memory cost is mmap-backed payload streaming plus per-page sub-buffer uploads.
-- **~~City has sparse node-LOD links~~ (fixed)**: previously `massive_city.vgeo` reported 6230 LOD groups but only 8 node-LOD links (vs Stanford Dragon's 2509 groups -> 946 links). Now: dragon 2509 groups -> 2509 links (100%), city 6230 groups -> 6230 links (100%). Fix (builder_cluster.cpp `build_node_lod_links` + builder_traversal.cpp + gpu_abi.h): each LOD group now stores its base cluster coverage as a multi-run table (`LodGroupBaseRun` list indexed by `LodGroupRecord::{first_base_run_index, base_run_count}`). Builder attaches a group to the deepest hierarchy node whose cluster span contains all of the group's runs. Traversal threads a per-cluster coverage bitmap through the recursive descent: when an LOD group is selected at a node, its base runs mark covered clusters; descendants skip fully-covered subtrees and base emits skip covered clusters. No child-alignment constraint on the attachment -- subsets and cross-child-boundary groups both work. Schema version bumped to 2.
-- **CPU cluster selection divergence on sparse-LOD-link scenes (stale; refer to LOD link fix above)**: on `massive_city` the CPU `simulate_traversal` returns 0 LOD clusters + 31394 base clusters while the pre-hoist GPU `compute_select.comp` produced 15106 draws on the same data. CPU path is semantically identical to GPU shader (LOD-group-first, then base emit if leaf/acceptable error, else descend). Diagnostic pass showed 99.997% of city's base clusters have `normal_cone.w = 1.0` (meshoptimizer-marked degenerate), so backface culling is a no-op regardless of path. After the LOD-link fix city has a dense LOD hierarchy (6230 links), but the default `debug_error_threshold=0.001` is still far below city's smallest group error (~0.036), so CPU selects 0 LOD at that threshold. At looser thresholds CPU traversal now picks LOD groups correctly. GPU shader `cluster_select.comp` is still retained-but-not-dispatched and has not been rewritten against the multi-run coverage model.
+- **GPU cluster_select.comp is retained but not dispatched**: CPU `simulate_traversal` produces the draw list each frame; the serial DFS compute shader predates the multi-run coverage model and is kept as reference only. Rebuilding it (BFS-per-level or workgroup-DFS) is worth doing only if profiling shows CPU selection as a bottleneck for some scene class.
 
 ### What's Validated
 
-- CPU and GPU selection match exactly on scenes with well-connected LOD hierarchies (Dragon: both emit 8628 after normal-cone backface cull). Diverge on sparse-LOD scenes (see Known Issues).
-- Visibility buffer readback confirms `visibility_selection_subset=true` on most benchmark scenes
-- Tested assets: 5 synthetic benchmarks, pirate.glb (5K tris), Stanford Dragon (871K tris), generated city (1M tris)
-- Platform: macOS Apple M4, MoltenVK, Vulkan 1.2
+- CPU and GPU selection match exactly on scenes with well-connected LOD hierarchies (pre-cone-culling Dragon: both emit 8628 after normal-cone backface cull; with LOD-cluster cones the CPU draw list drops to 6467).
+- Visibility buffer readback confirms `visibility_selection_subset=true` on all benchmark scenes (re-validated 2026-09-05 on the pinned meshoptimizer build)
+- Tested assets: 5 synthetic benchmarks, pirate.glb (5K tris), fuzz.glb, Stanford Dragon (871K tris), generated city (1M tris)
+- Platform: macOS Apple M4, MoltenVK, Vulkan 1.2; meshoptimizer vendored at c645e49 via `tools/vendor_thirdparty.sh`
 
-### Performance (Apple M4, MoltenVK, 1280x720)
+### Performance (Apple M4, MoltenVK, 1280x720, meshoptimizer pinned at c645e49)
 
-Stanford Dragon (871K tris): median 19.2ms / 52 FPS with 3-cascade CSM + per-cascade culling + 8-tap Poisson PCF (improved from 24.0ms after LOD attachment coverage fix)
-Massive City (1M tris): median 65.5ms / 15.3 FPS with 3-cascade CSM + per-cascade culling + 8-tap Poisson PCF (small improvement from 66.7ms; threshold too tight to activate the now-dense LOD hierarchy, see Known Issues)
+Stanford Dragon (871K tris): median 15.4ms / ~65 FPS, steady-state draw count 6467 after LOD-cluster normal-cone culling (8366 with base-only culling; 8628 on the pre-2026-09 meshoptimizer build).
+Massive City (1M tris): median 30.6ms / ~33 FPS at the default full-detail threshold (was 65.5ms / 15.3 FPS in April; the improvement comes from the repinned meshoptimizer and LOD-cluster cone culling; the city LOD hierarchy remains threshold-degenerate, see Known Issues).
 
 Per-cascade culling closed ~8ms of the CSM regression on Dragon (32 -> 24ms) and ~6ms on City (73 -> 67ms) by filtering the CPU draw list against each cascade's orthographic frustum before submitting, so most clusters land in only one or two cascades instead of all three.
 
-Per-pass GPU (Dragon, steady state): cull 0.1ms, sel 0.0ms (CPU), occ 0.05ms, shadow 3-4ms, main 3-4ms, hzb 0.1-0.2ms.
+Per-pass GPU (Dragon, steady state): cull 0.1ms, sel 0.0ms (CPU), occ 0.05ms, shadow 3-5ms, main 2-4ms, hzb 0.1-0.2ms.
 
 Per-frame CPU (emitted every 60 frames as `MERIDIAN_CPU: ...`, measured post-CSM + per-cascade culling):
 - Application-side work (traverse, residency, build, upload, cmdrec) is under 1ms on both scenes (dragon ~0.35ms, city ~1.0ms).
@@ -75,12 +77,12 @@ Per-frame CPU (emitted every 60 frames as `MERIDIAN_CPU: ...`, measured post-CSM
 
 ## Not Yet Implemented
 
-- Per-cluster backface culling with normal cones on LOD clusters (currently base only; many LOD clusters have cones but shader `emit_lod` skips the test)
-- Real streaming scheduler (CPU prototype exists but pages start all-resident)
-- Async disk I/O for page loading
+- Real streaming scheduler (CPU prototype exists but pages start all-resident; mmap-based payload streaming is the next step)
+- Async disk I/O replacing the live startup buffer (validation path exists via `--demand-streaming`)
 - Benchmark automation vs stock Godot
 - Texture/UV support
 - Broader glTF import coverage
 - Compressed geometry payloads
 - Deeper Godot runtime integration
 - Parallel GPU traversal (BFS-per-level or workgroup-DFS) to replace the retained-but-not-dispatched serial compute_select.comp
+- City-class scene LOD: coarser district partitioning or simplification caps so generated cities get a usable mid-error representation

@@ -21,7 +21,7 @@ It is intentionally implementation-agnostic and should be refined before binary 
 Required fields:
 
 - magic
-- schema version
+- schema version (current: 3 -- v2 added multi-run LOD-group base coverage, v3 added LOD-cluster normal cones)
 - builder version
 - source asset identifier
 - source asset hash
@@ -148,6 +148,7 @@ Required fields per LOD cluster:
 - geometry payload size
 - page index
 - bounds
+- normal cone axis xyz + cutoff (schema v3; cutoff >= 1.0 means no usable cone, do not cull)
 - local error
 - material section index
 - flags
