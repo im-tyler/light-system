@@ -1,6 +1,6 @@
 # Implementation Status
 
-Last updated: 2026-09-07
+Last updated: 2026-09-08
 
 ## Phase 1: Offline Builder (Complete)
 
@@ -80,13 +80,14 @@ Per-frame CPU (emitted every 60 frames as `MERIDIAN_CPU: ...`, measured post-CSM
 
 ## Not Yet Implemented
 
-- Skip the startup temp `.vgeo` write for persisted assets (mmap them directly)
+- (done 2026-09-08) persisted `.vgeo` inputs mmap directly (header-validated); startup temp write only for non-.vgeo inputs. Also fixed silent streamed-payload corruption (payload offsets omitted the base-run table — 229KB shift on dragon; streamed vs resident is now bit-identical on terrace) and added MADV_DONTNEED on eviction.
 - Per-material textures, real image decode, compression, mipmaps (v1 = one embedded checker), OBJ `vt` import
+- Godot gap after 2026-09-08 perf work: dragon 9.2ms (clears 60fps, faster than Godot's capped reading); city 20.4ms vs 4.12ms unthrottled (~4.9x, GPU-bound: shadow caster LOD, ~8.4ms submits, 3.3ms CPU DFS) — root cause of the old 2x submit overhead was MoltenVK's drawIndirectCount stub (fallback drew capacity counts)
 - Broader glTF import coverage
-- **Normal-cone cull sign bug (pre-existing, found during texture work)**: CPU draw builder + cluster_select.comp cull without meshopt's radius-compensation term; tight front-facing cones get culled (uv_seam_plane renders nothing; masked on closed meshes). Fix needs the radius term + LOD-cluster radius data — schema-level.
-- `--screenshot` triggers a validation error (non-acquired swapchain image) — any scene.
+- **Normal-cone cull FIXED 2026-09-08 (schema v5)**: culls per meshopt's canonical test (dot >= cutoff*len + radius) with bounding-sphere center+radius threaded through cluster records, CPU selection, and compute shaders. The old test was inverted — it culled front-facing tight cones and kept back-facing ones; the documented past 'culling gains' were the wrong half. uv_seam now renders (0 -> 69K visible px); dragon 4101->4002 draws, city 20.9->19.3ms; subset property holds on all scenes.
+- (fixed 2026-09-08) screenshot acquire path validated clean.
 - Godot comparison harness exists (benchmarks/godot/); results honestly unfavorable — stock Forward+ is faster today (benchmarks/godot/RESULTS.md).
-- ontos_view (2026-09-07): plays back ontos v2 gravity streams — instanced billboard bodies colored by region/level, region grid, playback controls, `--frames` headless smoke; no depth/MSAA, no trails, stream RAM-resident.
+- ontos_view (2026-09-08): plays back ontos v2 gravity streams including spec-19 collapse (tag 8, level 2) — billboard bodies colored by region/level, region grid, playback controls, `--frames` headless smoke; depth attachment, MSAA, double-buffered instances, mmap'd stream parsing. Spec coverage matches the golden set. No trails.
 - Compressed geometry payloads
 - Deeper Godot runtime integration
 - Parallel GPU traversal (BFS-per-level or workgroup-DFS) to replace the retained-but-not-dispatched serial compute_select.comp
