@@ -1,6 +1,6 @@
 # Implementation Status
 
-Last updated: 2026-09-06
+Last updated: 2026-09-07
 
 ## Phase 1: Offline Builder (Complete)
 
@@ -51,7 +51,7 @@ GPU timestamp profiler emits `MERIDIAN_GPU: cull=.. sel=.. occ=.. shadow=.. main
 
 ### Known Issues
 
-- **No texture support**: all shading is procedural (per-cluster color hash + hemisphere ambient). No UV interpolation or texture sampling.
+- **Texture/UV support landed 2026-09-07** (schema v4): per-vertex UVs through base + LOD clusters (attribute-aware simplification), deterministic embedded checker texture, opt-in via manifest `emit_texture = true`; old v3 files still load; texel sampling verified via screenshot pixel counts; dragon unregressed. Remaining: per-material textures, image decode, mipmaps, OBJ `vt` import.
 - **Meshlet boundary seams (residual)**: smooth normals are now angle-weighted and position-welded in the builder (`compute_smooth_normals`), which matches normal values across index-split duplicates at the same position. Any remaining boundary seams come from LOD-level T-junctions at cluster borders of different detail, which are mitigated but not fully eliminated by seam-locked vertex simplification.
 - **City LOD hierarchy fixed (2026-09-06)**: the degeneracy was attachment collapse, not the error ladder. `partition_cluster_ids` fed raw vertex indices to `meshopt_partitionClusters` while the clusterlod DAG partitions position-remapped indices, so on index-split geometry (thousands of disconnected boxes) the two partitioners disagreed on adjacency; combined with a flat one-cut hierarchy (no intermediate levels), all LOD-group attachments piled onto ~43 near-root nodes and selection collapsed to a cliff. Fix (builder-side): partitions now use position-remapped indices, and `build_temp_hierarchy` grows district targets (`max(partition_size, count/8)`) so the tree gains fanout-8 intermediate levels. City trace now has a smooth ladder (t=0.05: 1894 groups / 14K+15K clusters -> t=8: 60+57; no cliff). Interleaved A/B on the renderer: city at t=1.0 runs 90.6ms / 21223 draws vs 143.5ms / 31394 at full detail (-37% frame time); dragon improves too (5532 vs 8543 draws at default threshold, no regression; `visibility_selection_subset=true` holds). Remaining (lower severity): the clusterlod DAG still smears provenance (~1.9x overlap at depth 1), so ~5K base clusters stay uncovered at mid thresholds and draw counts are slightly non-monotonic around t=4; depth-0 groups are no-op replacements.
 - **Page residency / payload streaming (2026-09-06: mmap path landed)**: default stays all-resident; `--demand-streaming` now mmaps the serialized `.vgeo` (madvise WILLNEED readahead), worker completions carry page bytes, payload buffers are allocated empty at full size (uncommitted on unified memory) and populated per-page via direct sub-range `vkMapMemory` memcpys (staging + `vkCmdCopyBuffer` fallback for discrete DEVICE_LOCAL). Seed pages upload synchronously before frame 0; CPU-side payload copies are freed after seeding (the mmap is the byte source). Verified: dragon streams 1447 pages/30.4MB with parity + visibility-subset holding; `--budget 96` pins residency through evict/reload cycles; city at threshold 0.05 streams 59MB of 155MB, 103.8ms vs 114.2ms on the pread+staging path; temp-file/mmap failure falls back to full upload + latency sim; default path unregressed. Remaining: mmap persisted `.vgeo` directly (skip the startup temp write); MADV_DONTNEED after eviction.
@@ -81,9 +81,12 @@ Per-frame CPU (emitted every 60 frames as `MERIDIAN_CPU: ...`, measured post-CSM
 ## Not Yet Implemented
 
 - Skip the startup temp `.vgeo` write for persisted assets (mmap them directly)
-- Benchmark automation vs stock Godot
-- Texture/UV support
+- Per-material textures, real image decode, compression, mipmaps (v1 = one embedded checker), OBJ `vt` import
 - Broader glTF import coverage
+- **Normal-cone cull sign bug (pre-existing, found during texture work)**: CPU draw builder + cluster_select.comp cull without meshopt's radius-compensation term; tight front-facing cones get culled (uv_seam_plane renders nothing; masked on closed meshes). Fix needs the radius term + LOD-cluster radius data — schema-level.
+- `--screenshot` triggers a validation error (non-acquired swapchain image) — any scene.
+- Godot comparison harness exists (benchmarks/godot/); results honestly unfavorable — stock Forward+ is faster today (benchmarks/godot/RESULTS.md).
+- ontos_view (2026-09-07): plays back ontos v2 gravity streams — instanced billboard bodies colored by region/level, region grid, playback controls, `--frames` headless smoke; no depth/MSAA, no trails, stream RAM-resident.
 - Compressed geometry payloads
 - Deeper Godot runtime integration
 - Parallel GPU traversal (BFS-per-level or workgroup-DFS) to replace the retained-but-not-dispatched serial compute_select.comp
