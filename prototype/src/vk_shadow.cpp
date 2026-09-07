@@ -24,12 +24,12 @@ namespace meridian {
 VkResult create_shadow_context(VkPhysicalDevice physical_device, VkDevice device,
                                const UploadedSceneBuffers& scene_buffers,
                                const UploadedBuffer& frame_ubo,
-                               uint32_t max_draws_per_cascade,
+                               uint32_t max_draws,
                                const VGeoResource& resource,
                                uint32_t shadow_resolution,
                                ShadowContext& context) {
     context.resolution = shadow_resolution;
-    context.max_draws_per_cascade = max_draws_per_cascade;
+    context.max_draws = max_draws;
 
     // 2D array depth image, one layer per cascade.
     VkFormat depth_format = find_depth_format(physical_device);
@@ -71,21 +71,6 @@ VkResult create_shadow_context(VkPhysicalDevice physical_device, VkDevice device
         view_info.subresourceRange.levelCount = 1;
         view_info.subresourceRange.layerCount = kShadowCascadeCount;
         result = vkCreateImageView(device, &view_info, nullptr, &context.depth_array_view);
-        if (result != VK_SUCCESS) return result;
-    }
-
-    // Per-layer 2D views for framebuffer attachments (render pass writes one layer).
-    for (uint32_t i = 0; i < kShadowCascadeCount; ++i) {
-        VkImageViewCreateInfo view_info{};
-        view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        view_info.image = context.depth_image;
-        view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        view_info.format = depth_format;
-        view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-        view_info.subresourceRange.levelCount = 1;
-        view_info.subresourceRange.baseArrayLayer = i;
-        view_info.subresourceRange.layerCount = 1;
-        result = vkCreateImageView(device, &view_info, nullptr, &context.cascade_views[i]);
         if (result != VK_SUCCESS) return result;
     }
 
@@ -133,17 +118,19 @@ VkResult create_shadow_context(VkPhysicalDevice physical_device, VkDevice device
     result = vkCreateRenderPass(device, &rp_info, nullptr, &context.render_pass);
     if (result != VK_SUCCESS) return result;
 
-    // One framebuffer per cascade, bound to that cascade's layer view.
-    for (uint32_t i = 0; i < kShadowCascadeCount; ++i) {
+    // One layered framebuffer spanning all cascade layers of the shared 2D
+    // array depth image; the merged draw list renders all cascades in a
+    // single indirect draw with per-instance gl_Layer selection.
+    {
         VkFramebufferCreateInfo fb_info{};
         fb_info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
         fb_info.renderPass = context.render_pass;
         fb_info.attachmentCount = 1;
-        fb_info.pAttachments = &context.cascade_views[i];
+        fb_info.pAttachments = &context.depth_array_view;
         fb_info.width = shadow_resolution;
         fb_info.height = shadow_resolution;
-        fb_info.layers = 1;
-        result = vkCreateFramebuffer(device, &fb_info, nullptr, &context.framebuffers[i]);
+        fb_info.layers = kShadowCascadeCount;
+        result = vkCreateFramebuffer(device, &fb_info, nullptr, &context.framebuffer);
         if (result != VK_SUCCESS) return result;
     }
 
@@ -179,19 +166,12 @@ VkResult create_shadow_context(VkPhysicalDevice physical_device, VkDevice device
     result = vkCreateDescriptorSetLayout(device, &ds_layout_info, nullptr, &context.descriptor_set_layout);
     if (result != VK_SUCCESS) { vkDestroyShaderModule(device, vert_mod, nullptr); return result; }
 
-    // Push constant range: the shadow vertex shader reads the cascade index
-    // to pick which light_vp to transform through.
-    VkPushConstantRange push_range{};
-    push_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-    push_range.offset = 0;
-    push_range.size = sizeof(uint32_t);
-
+    // No push constants: the cascade is selected per instance in the vertex
+    // shader from the draw entry's overlap mask.
     VkPipelineLayoutCreateInfo pl_info{};
     pl_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     pl_info.setLayoutCount = 1;
     pl_info.pSetLayouts = &context.descriptor_set_layout;
-    pl_info.pushConstantRangeCount = 1;
-    pl_info.pPushConstantRanges = &push_range;
     result = vkCreatePipelineLayout(device, &pl_info, nullptr, &context.pipeline_layout);
     if (result != VK_SUCCESS) { vkDestroyShaderModule(device, vert_mod, nullptr); return result; }
 
@@ -263,67 +243,63 @@ VkResult create_shadow_context(VkPhysicalDevice physical_device, VkDevice device
     vkDestroyShaderModule(device, vert_mod, nullptr);
     if (result != VK_SUCCESS) return result;
 
-    // Per-cascade draw list + draw count buffers. The CPU fills these each
-    // frame with the subset of the main draw list that falls inside each
-    // cascade's orthographic frustum. Sizing each buffer to the full cluster
-    // count is cheap (32 B / draw) and means the worst-case fallback where
-    // every cluster lands in every cascade still fits.
-    const VkDeviceSize per_cascade_list_bytes =
+    // Merged multi-cascade draw list + count buffers. The CPU fills these
+    // each frame with one entry per selected caster cluster; the entry's
+    // instance count is the size of its cascade overlap mask. Sizing the
+    // buffer to the full cluster count is cheap (32 B / draw) and covers the
+    // worst case where every cluster overlaps every cascade.
+    const VkDeviceSize draw_list_bytes =
         std::max<VkDeviceSize>(
-            static_cast<VkDeviceSize>(max_draws_per_cascade) * sizeof(GpuDrawEntry),
+            static_cast<VkDeviceSize>(max_draws) * sizeof(GpuDrawEntry),
             sizeof(GpuDrawEntry));
-    for (uint32_t c = 0; c < kShadowCascadeCount; ++c) {
-        result = create_uploaded_buffer(
-            physical_device, device, nullptr, per_cascade_list_bytes,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
-            context.cascade_draw_lists[c]);
-        if (result != VK_SUCCESS) return result;
+    result = create_uploaded_buffer(
+        physical_device, device, nullptr, draw_list_bytes,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+        context.draw_list);
+    if (result != VK_SUCCESS) return result;
 
-        const uint32_t zero = 0;
-        result = create_uploaded_buffer(
-            physical_device, device, &zero, sizeof(uint32_t),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
-            context.cascade_draw_counts[c]);
-        if (result != VK_SUCCESS) return result;
-    }
+    const uint32_t zero = 0;
+    result = create_uploaded_buffer(
+        physical_device, device, &zero, sizeof(uint32_t),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+        context.draw_count);
+    if (result != VK_SUCCESS) return result;
 
-    // Descriptor pool sized for 3 sets, each holding 3 storage buffers (two
-    // payload SSBOs + one per-cascade draw-list SSBO) + 1 uniform (frame UBO).
+    // Descriptor pool sized for one set: three storage buffers (two payload
+    // SSBOs + the merged draw-list SSBO) + 1 uniform (frame UBO).
     VkDescriptorPoolSize shadow_pool_sizes[2] = {};
     shadow_pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    shadow_pool_sizes[0].descriptorCount = 3 * kShadowCascadeCount;
+    shadow_pool_sizes[0].descriptorCount = 3;
     shadow_pool_sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    shadow_pool_sizes[1].descriptorCount = kShadowCascadeCount;
+    shadow_pool_sizes[1].descriptorCount = 1;
     VkDescriptorPoolCreateInfo pool_info{};
     pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pool_info.maxSets = kShadowCascadeCount;
+    pool_info.maxSets = 1;
     pool_info.poolSizeCount = 2;
     pool_info.pPoolSizes = shadow_pool_sizes;
     result = vkCreateDescriptorPool(device, &pool_info, nullptr, &context.descriptor_pool);
     if (result != VK_SUCCESS) return result;
 
-    VkDescriptorSetLayout layouts[kShadowCascadeCount] = {};
-    for (uint32_t c = 0; c < kShadowCascadeCount; ++c) layouts[c] = context.descriptor_set_layout;
+    VkDescriptorSetLayout layouts[1] = {context.descriptor_set_layout};
     VkDescriptorSetAllocateInfo ds_alloc{};
     ds_alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     ds_alloc.descriptorPool = context.descriptor_pool;
-    ds_alloc.descriptorSetCount = kShadowCascadeCount;
+    ds_alloc.descriptorSetCount = 1;
     ds_alloc.pSetLayouts = layouts;
-    result = vkAllocateDescriptorSets(device, &ds_alloc, context.cascade_descriptor_sets);
+    result = vkAllocateDescriptorSets(device, &ds_alloc, &context.descriptor_set);
     if (result != VK_SUCCESS) return result;
 
-    // Write bindings for each cascade set. Bindings 0-2 are shared (payloads,
-    // frame UBO); binding 3 is the cascade-specific draw list.
-    for (uint32_t c = 0; c < kShadowCascadeCount; ++c) {
+    // Write set bindings: payloads + frame UBO + merged draw list.
+    {
         VkDescriptorBufferInfo buf_infos[4] = {};
         VkWriteDescriptorSet ds_writes[4] = {};
         uint32_t wc = 0;
         if (scene_buffers.base_payload.buffer != VK_NULL_HANDLE) {
             buf_infos[wc] = {scene_buffers.base_payload.buffer, 0, scene_buffers.base_payload.size};
             ds_writes[wc].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            ds_writes[wc].dstSet = context.cascade_descriptor_sets[c];
+            ds_writes[wc].dstSet = context.descriptor_set;
             ds_writes[wc].dstBinding = 0;
             ds_writes[wc].descriptorCount = 1;
             ds_writes[wc].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -333,7 +309,7 @@ VkResult create_shadow_context(VkPhysicalDevice physical_device, VkDevice device
         if (scene_buffers.lod_payload.buffer != VK_NULL_HANDLE) {
             buf_infos[wc] = {scene_buffers.lod_payload.buffer, 0, scene_buffers.lod_payload.size};
             ds_writes[wc].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            ds_writes[wc].dstSet = context.cascade_descriptor_sets[c];
+            ds_writes[wc].dstSet = context.descriptor_set;
             ds_writes[wc].dstBinding = 1;
             ds_writes[wc].descriptorCount = 1;
             ds_writes[wc].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -342,16 +318,15 @@ VkResult create_shadow_context(VkPhysicalDevice physical_device, VkDevice device
         }
         buf_infos[wc] = {frame_ubo.buffer, 0, sizeof(FrameUBO)};
         ds_writes[wc].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        ds_writes[wc].dstSet = context.cascade_descriptor_sets[c];
+        ds_writes[wc].dstSet = context.descriptor_set;
         ds_writes[wc].dstBinding = 2;
         ds_writes[wc].descriptorCount = 1;
         ds_writes[wc].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         ds_writes[wc].pBufferInfo = &buf_infos[wc];
         wc++;
-        buf_infos[wc] = {context.cascade_draw_lists[c].buffer, 0,
-                         context.cascade_draw_lists[c].size};
+        buf_infos[wc] = {context.draw_list.buffer, 0, context.draw_list.size};
         ds_writes[wc].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        ds_writes[wc].dstSet = context.cascade_descriptor_sets[c];
+        ds_writes[wc].dstSet = context.descriptor_set;
         ds_writes[wc].dstBinding = 3;
         ds_writes[wc].descriptorCount = 1;
         ds_writes[wc].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;

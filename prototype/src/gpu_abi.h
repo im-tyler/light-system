@@ -164,4 +164,15 @@ struct GpuDrawEntry {
 };
 static_assert(sizeof(GpuDrawEntry) == 32);
 
+// geometry_kind bit layout: bit 0 = domain (0 base, 1 LOD), bit 16 = has_uv,
+// bits 17..19 = shadow cascade overlap mask (shadow-pass draws only; the
+// main pass and occlusion shaders ignore these bits).
+constexpr uint32_t kGeometryKindCascadeMaskShift = 17;
+constexpr uint32_t kGeometryKindCascadeMask = 0x7u << kGeometryKindCascadeMaskShift;
+
+// Shadow-pass draws render one instance per overlapping cascade; instance
+// slots are strided by this so the vertex shader can recover the draw entry
+// index from gl_InstanceIndex (must stay a power of two).
+constexpr uint32_t kShadowInstanceStride = 4;
+
 }  // namespace meridian

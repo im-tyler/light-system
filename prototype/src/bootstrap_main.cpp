@@ -11,8 +11,9 @@ namespace {
 void print_usage() {
     std::cerr << "Usage: meridian_vk_bootstrap --manifest <path> [--interactive] [--screenshot <path>] [--budget <pages>] [--demand-streaming] [--error-threshold <value>] [--validate]\n"
                  "  --screenshot writes a raw PPM image (extension forced to .ppm)\n"
-                 "  --error-threshold sets the LOD selection threshold (default 0.001; scene-appropriate\n"
-                 "  values vary, e.g. the generated city needs ~0.05+ for its LOD groups to activate)\n";
+                 "  --error-threshold sets the LOD selection threshold (default: auto =\n"
+                 "  max(0.001, 8.9x the scene's median LOD-group geometric error), so\n"
+                 "  scene-scale ladders activate instead of selecting full detail)\n";
 }
 
 }  // namespace
@@ -21,7 +22,7 @@ int main(int argc, char** argv) {
     std::filesystem::path manifest_path;
     std::string screenshot_path;
     uint32_t resident_budget = 0xffffffffu;
-    float error_threshold = 0.001f;
+    float error_threshold = -1.0f;  // negative = auto (scene-scaled)
     bool validate = false;
     bool interactive = false;
     bool demand_streaming = false;

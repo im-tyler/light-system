@@ -1,4 +1,7 @@
 #version 450
+// Enables writing gl_Layer from the vertex stage (SPIR-V capability
+// ShaderViewportIndexLayerEXT); required by the merged layered shadow pass.
+#extension GL_ARB_shader_viewport_layer_array : require
 
 layout(set = 0, binding = 2) uniform FrameData {
     mat4 view_projection;
@@ -22,19 +25,36 @@ struct DrawEntry {
 };
 layout(set = 0, binding = 3) readonly buffer DrawList { DrawEntry draws[]; };
 
-layout(push_constant) uniform ShadowPush {
-    uint cascade_index;
-} push;
-
+// Merged multi-cascade draw list: one draw per caster cluster, one instance
+// per overlapping cascade. draw_first_instance = entry_index * 4 (see
+// kShadowInstanceStride), so the entry index is gl_InstanceIndex >> 2 and the
+// instance's slot within the draw is gl_InstanceIndex & 3. The cascade
+// overlap mask rides in geometry_kind bits 17..19; instance slot i renders
+// into the i-th set bit of that mask.
 uint read_u32(uint byte_offset, uint geometry_kind) {
     uint w = byte_offset >> 2u;
     return geometry_kind == 0u ? base_data[w] : lod_data[w];
 }
 
 void main() {
-    DrawEntry entry = draws[gl_InstanceIndex];
+    DrawEntry entry = draws[gl_InstanceIndex >> 2u];
     uint domain = entry.geometry_kind & 0xffffu;
     bool has_uv = (entry.geometry_kind & 0x10000u) != 0u;
+    uint cascade_mask = (entry.geometry_kind >> 17u) & 7u;
+
+    uint cascade = 0u;
+    {
+        uint slot = gl_InstanceIndex & 3u;
+        for (uint b = 0u; b < 3u; ++b) {
+            if ((cascade_mask & (1u << b)) == 0u) continue;
+            if (slot == 0u) {
+                cascade = b;
+                break;
+            }
+            slot -= 1u;
+        }
+    }
+
     uint pos_base = entry.payload_offset + 8u;
     uint idx_base = pos_base + entry.local_vertex_count * (has_uv ? 32u : 24u);
     uint local_idx = read_u32(idx_base + gl_VertexIndex * 4u, domain);
@@ -42,5 +62,6 @@ void main() {
     vec3 pos = vec3(uintBitsToFloat(read_u32(addr, domain)),
                     uintBitsToFloat(read_u32(addr+4u, domain)),
                     uintBitsToFloat(read_u32(addr+8u, domain)));
-    gl_Position = frame.light_vp[push.cascade_index] * vec4(pos, 1.0);
+    gl_Position = frame.light_vp[cascade] * vec4(pos, 1.0);
+    gl_Layer = int(cascade);
 }

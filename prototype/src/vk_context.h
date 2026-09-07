@@ -193,21 +193,24 @@ struct ShadowContext {
     VkImage depth_image = VK_NULL_HANDLE;
     VkDeviceMemory depth_memory = VK_NULL_HANDLE;
     VkImageView depth_array_view = VK_NULL_HANDLE;
-    VkImageView cascade_views[kShadowCascadeCount] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
-    VkFramebuffer framebuffers[kShadowCascadeCount] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
+    // One layered framebuffer spanning all cascade layers; the merged draw
+    // list renders every cascade in a single indirect draw via per-instance
+    // gl_Layer selection.
+    VkFramebuffer framebuffer = VK_NULL_HANDLE;
     VkSampler sampler = VK_NULL_HANDLE;
     VkRenderPass render_pass = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
     VkDescriptorSetLayout descriptor_set_layout = VK_NULL_HANDLE;
-    // Per-cascade descriptor sets + draw buffers. Each cascade samples the
-    // same payload + frame UBO but pulls its draw list from its own buffer,
-    // which the CPU fills with clusters that pass that cascade's frustum test.
-    VkDescriptorSet cascade_descriptor_sets[kShadowCascadeCount] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
-    UploadedBuffer cascade_draw_lists[kShadowCascadeCount];
-    UploadedBuffer cascade_draw_counts[kShadowCascadeCount];
-    uint32_t max_draws_per_cascade = 0;
+    // Merged multi-cascade draw list. Each entry carries the cluster's
+    // cascade overlap mask in geometry_kind and draws one instance per
+    // overlapping cascade; the vertex shader picks the light_vp and output
+    // layer per instance.
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    UploadedBuffer draw_list;
+    UploadedBuffer draw_count;
+    uint32_t max_draws = 0;
     uint32_t resolution = 0;
     CascadeLightSetup cascades{};
     float scene_radius = 1.0f;
@@ -254,7 +257,7 @@ VkResult create_occlusion_refine_context(VkPhysicalDevice physical_device, VkDev
 VkResult create_shadow_context(VkPhysicalDevice physical_device, VkDevice device,
                                const UploadedSceneBuffers& scene_buffers,
                                const UploadedBuffer& frame_ubo,
-                               uint32_t max_draws_per_cascade,
+                               uint32_t max_draws,
                                const VGeoResource& resource,
                                uint32_t shadow_resolution,
                                ShadowContext& context);

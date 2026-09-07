@@ -51,9 +51,11 @@ renderer_manifest() {
 }
 
 renderer_extra_args() {
+    # The renderer's default LOD threshold is scene-scaled (auto) since
+    # 2026-09-07; no per-scene override is needed. Set an explicit
+    # --error-threshold here to pin a specific detail level instead.
     case "$1" in
-        massive_city) echo "--error-threshold 0.05" ;;
-        *) echo "" ;;
+        *) echo ""
     esac
 }
 

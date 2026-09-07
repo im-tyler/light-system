@@ -650,19 +650,14 @@ void destroy_occlusion_refine_context(VkDevice device, OcclusionRefineContext& c
 
 
 void destroy_shadow_context(VkDevice device, ShadowContext& context) {
-    for (VkFramebuffer& fb : context.framebuffers) {
-        if (fb != VK_NULL_HANDLE) vkDestroyFramebuffer(device, fb, nullptr);
-    }
+    if (context.framebuffer != VK_NULL_HANDLE) vkDestroyFramebuffer(device, context.framebuffer, nullptr);
     if (context.render_pass != VK_NULL_HANDLE) vkDestroyRenderPass(device, context.render_pass, nullptr);
-    for (VkImageView& v : context.cascade_views) {
-        if (v != VK_NULL_HANDLE) vkDestroyImageView(device, v, nullptr);
-    }
     if (context.depth_array_view != VK_NULL_HANDLE) vkDestroyImageView(device, context.depth_array_view, nullptr);
     if (context.sampler != VK_NULL_HANDLE) vkDestroySampler(device, context.sampler, nullptr);
     if (context.depth_image != VK_NULL_HANDLE) vkDestroyImage(device, context.depth_image, nullptr);
     if (context.depth_memory != VK_NULL_HANDLE) vkFreeMemory(device, context.depth_memory, nullptr);
-    for (UploadedBuffer& b : context.cascade_draw_lists) destroy_uploaded_buffer(device, b);
-    for (UploadedBuffer& b : context.cascade_draw_counts) destroy_uploaded_buffer(device, b);
+    destroy_uploaded_buffer(device, context.draw_list);
+    destroy_uploaded_buffer(device, context.draw_count);
     if (context.descriptor_pool != VK_NULL_HANDLE) vkDestroyDescriptorPool(device, context.descriptor_pool, nullptr);
     if (context.descriptor_set_layout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(device, context.descriptor_set_layout, nullptr);
     if (context.pipeline != VK_NULL_HANDLE) vkDestroyPipeline(device, context.pipeline, nullptr);
@@ -1203,6 +1198,12 @@ DeviceSelection select_device(VkInstance instance, VkSurfaceKHR surface, VkBoots
         if (!supports_extension(extensions, VK_KHR_SWAPCHAIN_EXTENSION_NAME)) {
             continue;
         }
+        // The merged multi-cascade shadow pass selects the output layer per
+        // instance from the vertex shader; that needs viewport/layer writes
+        // from the vertex stage.
+        if (!supports_extension(extensions, "VK_EXT_shader_viewport_index_layer")) {
+            continue;
+        }
         if (!has_swapchain_support(physical_device, surface)) {
             continue;
         }
@@ -1460,21 +1461,23 @@ void destroy_frame_context(VkDevice device, FrameContext& frame) {
 namespace {  // reopen anonymous namespace
 
 VkResult record_debug_command_buffer(FrameContext& frame, const DebugRenderContext& debug_render,
-                                     const ComputeCullContext& compute_cull,
-                                     const ComputeSelectionContext& compute_selection,
-                                     const HzbContext& hzb,
-                                     const OcclusionRefineContext& occlusion_refine,
-                                     const ShadowContext& shadow,
-                                     const SwapchainContext& swapchain,
-                                     const CameraFrameData& camera_frame,
-                                     const FrustumPlanes& frustum,
-                                     float error_threshold,
-                                     const TraversalSelection& selection,
-                                     const UploadableScene& scene,
-                                     uint32_t frame_index,
-                                     uint32_t image_index,
-                                     bool has_draw_indirect_count,
-                                     const GpuProfiler& profiler) {
+                                      const ComputeCullContext& compute_cull,
+                                      const ComputeSelectionContext& compute_selection,
+                                      const HzbContext& hzb,
+                                      const OcclusionRefineContext& occlusion_refine,
+                                      const ShadowContext& shadow,
+                                      const SwapchainContext& swapchain,
+                                      const CameraFrameData& camera_frame,
+                                      const FrustumPlanes& frustum,
+                                      float error_threshold,
+                                      const TraversalSelection& selection,
+                                      const UploadableScene& scene,
+                                      uint32_t frame_index,
+                                      uint32_t image_index,
+                                      bool has_draw_indirect_count,
+                                      uint32_t shadow_draw_count,
+                                      uint32_t main_draw_count,
+                                      const GpuProfiler& profiler) {
     VkCommandBufferBeginInfo begin_info{};
     begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     VkResult result = vkBeginCommandBuffer(frame.command_buffer, &begin_info);
@@ -1606,52 +1609,53 @@ VkResult record_debug_command_buffer(FrameContext& frame, const DebugRenderConte
                             profiler.query_pool, 6); // shadow start
     }
 
-    // Shadow pass: render scene from light perspective, once per cascade.
-    // Each cascade has its own draw list (CPU-filled against that cascade's
-    // orthographic frustum) and its own framebuffer/layer into the shared
-    // 2D array depth image, so a cluster only gets submitted to the cascades
-    // whose volume it actually overlaps.
-    if (shadow.pipeline != VK_NULL_HANDLE) {
-        for (uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade) {
-            if (shadow.cascade_descriptor_sets[cascade] == VK_NULL_HANDLE) continue;
+    // Shadow pass: one layered render pass over all cascades. The merged
+    // draw list carries one draw per caster cluster, instanced once per
+    // overlapping cascade (per-cascade frustum filtering happens on the CPU
+    // when the mask is built); the vertex shader picks light_vp and the
+    // output layer per instance.
+    if (shadow.pipeline != VK_NULL_HANDLE && shadow.descriptor_set != VK_NULL_HANDLE) {
+        VkClearValue shadow_clear{};
+        shadow_clear.depthStencil.depth = 1.0f;
 
-            VkClearValue shadow_clear{};
-            shadow_clear.depthStencil.depth = 1.0f;
+        VkRenderPassBeginInfo shadow_rp_info{};
+        shadow_rp_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        shadow_rp_info.renderPass = shadow.render_pass;
+        shadow_rp_info.framebuffer = shadow.framebuffer;
+        shadow_rp_info.renderArea.extent = {shadow.resolution, shadow.resolution};
+        shadow_rp_info.clearValueCount = 1;
+        shadow_rp_info.pClearValues = &shadow_clear;
 
-            VkRenderPassBeginInfo shadow_rp_info{};
-            shadow_rp_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-            shadow_rp_info.renderPass = shadow.render_pass;
-            shadow_rp_info.framebuffer = shadow.framebuffers[cascade];
-            shadow_rp_info.renderArea.extent = {shadow.resolution, shadow.resolution};
-            shadow_rp_info.clearValueCount = 1;
-            shadow_rp_info.pClearValues = &shadow_clear;
+        vkCmdBeginRenderPass(frame.command_buffer, &shadow_rp_info, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBindPipeline(frame.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, shadow.pipeline);
+        vkCmdBindDescriptorSets(frame.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                shadow.pipeline_layout, 0, 1, &shadow.descriptor_set, 0, nullptr);
 
-            vkCmdBeginRenderPass(frame.command_buffer, &shadow_rp_info, VK_SUBPASS_CONTENTS_INLINE);
-            vkCmdBindPipeline(frame.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, shadow.pipeline);
-            vkCmdBindDescriptorSets(frame.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                    shadow.pipeline_layout, 0, 1,
-                                    &shadow.cascade_descriptor_sets[cascade], 0, nullptr);
-            vkCmdPushConstants(frame.command_buffer, shadow.pipeline_layout,
-                               VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(uint32_t), &cascade);
-
-            const UploadedBuffer& dl = shadow.cascade_draw_lists[cascade];
-            const UploadedBuffer& dc = shadow.cascade_draw_counts[cascade];
-            if (dl.buffer != VK_NULL_HANDLE && dc.buffer != VK_NULL_HANDLE) {
-                if (has_draw_indirect_count) {
-                    vkCmdDrawIndirectCount(frame.command_buffer,
-                                           dl.buffer, 0,
-                                           dc.buffer, 0,
-                                           shadow.max_draws_per_cascade,
-                                           sizeof(GpuDrawEntry));
-                } else {
-                    vkCmdDrawIndirect(frame.command_buffer,
-                                      dl.buffer, 0,
-                                      shadow.max_draws_per_cascade,
-                                      sizeof(GpuDrawEntry));
-                }
+        const UploadedBuffer& dl = shadow.draw_list;
+        const UploadedBuffer& dc = shadow.draw_count;
+        if (dl.buffer != VK_NULL_HANDLE && dc.buffer != VK_NULL_HANDLE) {
+            // Draw count: on implementations without draw_indirect_count the
+            // count parameter must come from the CPU (the GPU-side count
+            // buffer cannot feed vkCmdDrawIndirect), so pass this frame's
+            // exact list length instead of the buffer capacity -- MoltenVK
+            // encodes one Metal draw per count entry and the capacity-sized
+            // count dominated vkQueueSubmit.
+            const uint32_t shadow_count =
+                std::min(shadow_draw_count, shadow.max_draws);
+            if (has_draw_indirect_count) {
+                vkCmdDrawIndirectCount(frame.command_buffer,
+                                       dl.buffer, 0,
+                                       dc.buffer, 0,
+                                       shadow_count,
+                                       sizeof(GpuDrawEntry));
+            } else {
+                vkCmdDrawIndirect(frame.command_buffer,
+                                  dl.buffer, 0,
+                                  shadow_count,
+                                  sizeof(GpuDrawEntry));
             }
-            vkCmdEndRenderPass(frame.command_buffer);
         }
+        vkCmdEndRenderPass(frame.command_buffer);
     }
 
     if (profiler.query_pool != VK_NULL_HANDLE) {
@@ -1693,28 +1697,37 @@ VkResult record_debug_command_buffer(FrameContext& frame, const DebugRenderConte
                                 0, nullptr);
         if (compute_selection.draw_list.buffer != VK_NULL_HANDLE &&
             compute_selection.draw_count.buffer != VK_NULL_HANDLE) {
-            const bool use_occlusion_output = frame_index > 0 &&
-                occlusion_refine.output_draws.buffer != VK_NULL_HANDLE &&
-                occlusion_refine.output_count.buffer != VK_NULL_HANDLE;
-            VkBuffer draw_buffer = use_occlusion_output
-                ? occlusion_refine.output_draws.buffer
-                : compute_selection.draw_list.buffer;
-            VkBuffer count_buffer = use_occlusion_output
-                ? occlusion_refine.output_count.buffer
-                : compute_selection.draw_count.buffer;
-            uint32_t max_draws = use_occlusion_output
-                ? occlusion_refine.max_draws
-                : compute_selection.max_draws;
             if (has_draw_indirect_count) {
+                // With GPU-side draw counts the occlusion-refined list can be
+                // consumed directly; vkCmdDrawIndirectCount reads the survivor
+                // count from the buffer the compute pass wrote.
+                const bool use_occlusion_output = frame_index > 0 &&
+                    occlusion_refine.output_draws.buffer != VK_NULL_HANDLE &&
+                    occlusion_refine.output_count.buffer != VK_NULL_HANDLE;
+                VkBuffer draw_buffer = use_occlusion_output
+                    ? occlusion_refine.output_draws.buffer
+                    : compute_selection.draw_list.buffer;
+                VkBuffer count_buffer = use_occlusion_output
+                    ? occlusion_refine.output_count.buffer
+                    : compute_selection.draw_count.buffer;
+                uint32_t max_draws = use_occlusion_output
+                    ? occlusion_refine.max_draws
+                    : compute_selection.max_draws;
                 vkCmdDrawIndirectCount(frame.command_buffer,
                                        draw_buffer, 0,
                                        count_buffer, 0,
                                        max_draws,
                                        sizeof(GpuDrawEntry));
             } else {
+                // No draw_indirect_count: draw the CPU-built list with this
+                // frame's exact count. The occlusion output cannot be used
+                // here (its count is GPU-written and its tail holds stale
+                // entries), and a capacity-sized count would encode one Metal
+                // draw per cluster slot, dominating vkQueueSubmit on MoltenVK.
+                const uint32_t count = std::min(main_draw_count, compute_selection.max_draws);
                 vkCmdDrawIndirect(frame.command_buffer,
-                                  draw_buffer, 0,
-                                  max_draws,
+                                  compute_selection.draw_list.buffer, 0,
+                                  count,
                                   sizeof(GpuDrawEntry));
             }
         }
@@ -2069,6 +2082,7 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
 
         std::vector<const char*> device_extensions;
         device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+        device_extensions.push_back("VK_EXT_shader_viewport_index_layer");
         if (selection.enable_portability_subset) {
             device_extensions.push_back("VK_KHR_portability_subset");
         }
@@ -2353,9 +2367,9 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
         // vkCmdDrawIndirect fallback (no draw_indirect_count extension) never
         // replays stale draws with instanceCount=1 after the visible set shrinks.
         std::vector<GpuDrawEntry> draw_upload_scratch;
-        std::vector<GpuDrawEntry> cascade_upload_scratch[kShadowCascadeCount];
+        std::vector<GpuDrawEntry> shadow_upload_scratch;
         uint32_t draw_list_high_water = 0;
-        uint32_t cascade_high_water[kShadowCascadeCount] = {};
+        uint32_t shadow_list_high_water = 0;
         double fps_timer = last_frame_time;
         std::vector<double> frame_times_ms;
 
@@ -2371,8 +2385,36 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
         }
 
         const std::vector<uint8_t> initial_resident_pages = build_resident_page_mask(residency_model);
+        // Resolve the LOD selection threshold. A negative config value means
+        // auto: a fixed multiple of the scene's median LOD-group geometric
+        // error, floored at the historical 0.001 default. The multiple is
+        // calibrated so scenes whose LOD ladder sits near the old default
+        // (e.g. the dragon scan) resolve to the floor unchanged, while
+        // large, coarsely-grained scenes activate their mid-LODs instead of
+        // selecting every cluster at full detail.
+        const float error_threshold = [&]() {
+            if (config.debug_error_threshold >= 0.0f) return config.debug_error_threshold;
+            constexpr float kAutoThresholdFloor = 0.001f;
+            constexpr float kAutoThresholdMedianMultiple = 8.9f;
+            std::vector<float> group_errors;
+            group_errors.reserve(resource.lod_groups.size());
+            for (const LodGroupRecord& group : resource.lod_groups) {
+                group_errors.push_back(group.geometric_error);
+            }
+            if (group_errors.empty()) return kAutoThresholdFloor;
+            std::sort(group_errors.begin(), group_errors.end());
+            const float median_error = group_errors[group_errors.size() / 2];
+            if (!std::isfinite(median_error)) return kAutoThresholdFloor;
+            const float threshold =
+                std::max(kAutoThresholdFloor, kAutoThresholdMedianMultiple * median_error);
+            std::fprintf(stderr,
+                         "MERIDIAN_LOD: auto error threshold %.4f (median group error %.6f over "
+                         "%zu groups)\n",
+                         threshold, median_error, group_errors.size());
+            return threshold;
+        }();
         const TraversalSelection initial_selection =
-            simulate_traversal(resource, config.debug_error_threshold, initial_resident_pages);
+            simulate_traversal(resource, error_threshold, initial_resident_pages);
         report.runtime_missing_page_count =
             static_cast<uint32_t>(initial_selection.missing_page_indices.size());
         report.runtime_prefetch_page_count =
@@ -2698,7 +2740,7 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             auto t_traverse_start = clock_t::now();
             const std::vector<uint8_t> resident_pages = build_resident_page_mask(residency_model);
             const TraversalSelection selection_for_frame =
-                simulate_traversal(resource, config.debug_error_threshold, resident_pages);
+                simulate_traversal(resource, error_threshold, resident_pages);
             auto t_traverse_end = clock_t::now();
             static double acc_traverse_ms = 0.0;
             static double acc_build_ms = 0.0;
@@ -2838,8 +2880,10 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             acc_fence_ms +=
                 std::chrono::duration<double, std::milli>(t_fence_end - t_fence_start).count();
             if (report.presented_frame_count > 0) {
-                analyze_visibility_readback(device, swapchain, debug_render, last_submitted_selection,
-                                           report);
+                // The full visibility analysis runs once after the present
+                // loop; repeating it per frame cost several ms of CPU
+                // (921K-pixel scan + set inserts) without feeding anything
+                // frame-local.
                 // Read back GPU draw count for debug stats (draws are consumed on GPU via indirect)
                 const UploadedBuffer& readback_count_buf = compute_selection.draw_count;
                 if (readback_count_buf.buffer != VK_NULL_HANDLE) {
@@ -2991,26 +3035,35 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                 }
                 return false;
             };
+            uint32_t cpu_draw_count = 0;
+            uint32_t shadow_draw_count = 0;
             {
                 auto t_build_start = clock_t::now();
                 std::vector<GpuDrawEntry> cpu_draws;
-                std::vector<GpuDrawEntry> cascade_draws[kShadowCascadeCount];
+                std::vector<GpuDrawEntry> shadow_draws;
                 cpu_draws.reserve(selection_for_frame.selected_cluster_indices.size() +
                                   selection_for_frame.selected_lod_cluster_indices.size());
-                for (auto& v : cascade_draws) v.reserve(cpu_draws.capacity() / 2);
+                shadow_draws.reserve(cpu_draws.capacity());
                 const Vec3f cam = camera_frame.camera_position;
-                auto push_to_cascades = [&](const GpuDrawEntry& entry,
-                                             const float bmin[4], const float bmax[4]) {
+                // Compute the cluster's cascade overlap mask and append a
+                // merged shadow entry when at least one cascade sees it. The
+                // entry draws one instance per overlapping cascade; instance
+                // slots are strided by kShadowInstanceStride so shadow.vert
+                // can recover the entry index from gl_InstanceIndex.
+                auto push_to_shadow_list = [&](GpuDrawEntry& entry,
+                                               const float bmin[4], const float bmax[4]) {
+                    uint32_t mask = 0;
                     for (uint32_t c = 0; c < kShadowCascadeCount; ++c) {
                         if (aabb_outside_planes(cascade_frusta[c], bmin, bmax)) continue;
-                        GpuDrawEntry copy = entry;
-                        // draw_first_instance is used as gl_InstanceIndex by
-                        // the shadow.vert vertex pulling path; keep it in
-                        // sync with the cascade-local slot so indexing stays
-                        // contiguous within each cascade buffer.
-                        copy.draw_first_instance = static_cast<uint32_t>(cascade_draws[c].size());
-                        cascade_draws[c].push_back(copy);
+                        mask |= 1u << c;
                     }
+                    if (mask == 0) return;
+                    entry.geometry_kind |= mask << kGeometryKindCascadeMaskShift;
+                    entry.draw_instance_count =
+                        (mask & 1u) + ((mask >> 1) & 1u) + ((mask >> 2) & 1u);
+                    entry.draw_first_instance =
+                        static_cast<uint32_t>(shadow_draws.size()) * kShadowInstanceStride;
+                    shadow_draws.push_back(entry);
                 };
                 for (const uint32_t ci : selection_for_frame.selected_cluster_indices) {
                     const GpuClusterRecord& c = report.uploadable_scene.clusters[ci];
@@ -3027,7 +3080,7 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                         0u | ((c.flags & kClusterFlagHasUv) != 0 ? kGeometryKindHasUv : 0u);
                     cascade_entry.payload_offset = c.payload_offset;
                     cascade_entry.local_vertex_count = c.local_vertex_count;
-                    push_to_cascades(cascade_entry, c.bounds_min.data(), c.bounds_max.data());
+                    push_to_shadow_list(cascade_entry, c.bounds_min.data(), c.bounds_max.data());
 
                     // Main-pass entry has camera-frustum + normal-cone culls.
                     if (aabb_outside_frustum(c.bounds_min.data(), c.bounds_max.data())) continue;
@@ -3053,6 +3106,8 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                         if (d < -cone_cutoff) continue;
                     }
                     GpuDrawEntry e = cascade_entry;
+                    e.geometry_kind = 0u |
+                        ((c.flags & kClusterFlagHasUv) != 0 ? kGeometryKindHasUv : 0u);
                     e.draw_first_instance = static_cast<uint32_t>(cpu_draws.size());
                     cpu_draws.push_back(e);
                 }
@@ -3067,7 +3122,7 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                         1u | ((c.flags & kClusterFlagHasUv) != 0 ? kGeometryKindHasUv : 0u);
                     cascade_entry.payload_offset = c.payload_offset;
                     cascade_entry.local_vertex_count = c.local_vertex_count;
-                    push_to_cascades(cascade_entry, c.bounds_min.data(), c.bounds_max.data());
+                    push_to_shadow_list(cascade_entry, c.bounds_min.data(), c.bounds_max.data());
 
                     if (aabb_outside_frustum(c.bounds_min.data(), c.bounds_max.data())) continue;
                     // Normal-cone backface cull, same test as the base-cluster path.
@@ -3090,10 +3145,13 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                         if (d < -cone_cutoff) continue;
                     }
                     GpuDrawEntry e = cascade_entry;
+                    e.geometry_kind = 1u |
+                        ((c.flags & kClusterFlagHasUv) != 0 ? kGeometryKindHasUv : 0u);
                     e.draw_first_instance = static_cast<uint32_t>(cpu_draws.size());
                     cpu_draws.push_back(e);
                 }
-                const uint32_t cpu_draw_count = static_cast<uint32_t>(cpu_draws.size());
+                cpu_draw_count = static_cast<uint32_t>(cpu_draws.size());
+                shadow_draw_count = static_cast<uint32_t>(shadow_draws.size());
                 auto t_build_end = clock_t::now();
                 acc_build_ms +=
                     std::chrono::duration<double, std::milli>(t_build_end - t_build_start).count();
@@ -3109,27 +3167,23 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                                                sizeof(GpuDrawEntry),
                                            compute_selection.draw_list);
                 }
-                // Upload each cascade's draw list + count into its own
-                // HOST_COHERENT buffer; the shadow pass reads them per pass.
-                for (uint32_t c = 0; c < kShadowCascadeCount; ++c) {
-                    const uint32_t ccount = static_cast<uint32_t>(cascade_draws[c].size());
-                    if (shadow.cascade_draw_lists[c].buffer != VK_NULL_HANDLE) {
-                        if (ccount > cascade_high_water[c]) {
-                            cascade_high_water[c] = ccount;
-                        }
-                        cascade_upload_scratch[c].assign(cascade_high_water[c], GpuDrawEntry{});
-                        std::copy(cascade_draws[c].begin(), cascade_draws[c].end(),
-                                  cascade_upload_scratch[c].begin());
-                        update_uploaded_buffer(device, cascade_upload_scratch[c].data(),
-                                               static_cast<VkDeviceSize>(
-                                                   cascade_upload_scratch[c].size()) *
-                                                   sizeof(GpuDrawEntry),
-                                               shadow.cascade_draw_lists[c]);
+                // Upload the merged shadow draw list + count into their
+                // HOST_COHERENT buffers; the layered shadow pass reads them.
+                if (shadow.draw_list.buffer != VK_NULL_HANDLE) {
+                    if (shadow_draw_count > shadow_list_high_water) {
+                        shadow_list_high_water = shadow_draw_count;
                     }
-                    if (shadow.cascade_draw_counts[c].buffer != VK_NULL_HANDLE) {
-                        update_uploaded_buffer(device, &ccount, sizeof(uint32_t),
-                                               shadow.cascade_draw_counts[c]);
-                    }
+                    shadow_upload_scratch.assign(shadow_list_high_water, GpuDrawEntry{});
+                    std::copy(shadow_draws.begin(), shadow_draws.end(),
+                              shadow_upload_scratch.begin());
+                    update_uploaded_buffer(device, shadow_upload_scratch.data(),
+                                           static_cast<VkDeviceSize>(shadow_upload_scratch.size()) *
+                                               sizeof(GpuDrawEntry),
+                                           shadow.draw_list);
+                }
+                if (shadow.draw_count.buffer != VK_NULL_HANDLE) {
+                    update_uploaded_buffer(device, &shadow_draw_count, sizeof(uint32_t),
+                                           shadow.draw_count);
                 }
                 if (compute_selection.draw_count.buffer != VK_NULL_HANDLE) {
                     update_uploaded_buffer(device, &cpu_draw_count, sizeof(uint32_t),
@@ -3144,10 +3198,11 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             auto t_cmdrec_start = clock_t::now();
             result = record_debug_command_buffer(frame, debug_render, compute_cull, compute_selection,
                                                  hzb, occlusion_refine, shadow, swapchain,
-                                                 camera_frame, frustum, config.debug_error_threshold,
+                                                 camera_frame, frustum, error_threshold,
                                                  selection_for_frame, report.uploadable_scene,
                                                  frame_index, image_index,
-                                                 has_draw_indirect_count, gpu_profiler);
+                                                 has_draw_indirect_count, shadow_draw_count,
+                                                 cpu_draw_count, gpu_profiler);
             auto t_cmdrec_end = clock_t::now();
             acc_cmdrec_ms +=
                 std::chrono::duration<double, std::milli>(t_cmdrec_end - t_cmdrec_start).count();
@@ -3182,7 +3237,7 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             cpu_prof_samples++;
             if (cpu_prof_samples % 60 == 0) {
                 std::fprintf(stderr,
-                    "MERIDIAN_CPU: traverse=%.2f residency=%.2f build=%.2f upload=%.2f cmdrec=%.2f submit=%.2f fence=%.2f present=%.2f (ms/frame, n=%u)\n",
+                    "MERIDIAN_CPU: traverse=%.2f residency=%.2f build=%.2f upload=%.2f cmdrec=%.2f submit=%.2f fence=%.2f present=%.2f draws=main:%u shadow:%u (ms/frame, n=%u)\n",
                     acc_traverse_ms / cpu_prof_samples,
                     acc_residency_ms / cpu_prof_samples,
                     acc_build_ms / cpu_prof_samples,
@@ -3191,6 +3246,8 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                     acc_submit_ms / cpu_prof_samples,
                     acc_fence_ms / cpu_prof_samples,
                     acc_present_ms / cpu_prof_samples,
+                    cpu_draw_count,
+                    shadow_draw_count,
                     cpu_prof_samples);
             }
             if (result != VK_SUCCESS) {
