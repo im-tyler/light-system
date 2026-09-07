@@ -59,7 +59,7 @@ Last updated: 2026-09-05
 - [x] profile the ~9ms CPU-side overhead still remaining after the sel hoist (attributed to vkQueueSubmit MoltenVK translation: Dragon 7.8ms, City 21.8ms submit; application work <1ms on both)
 - [x] repin vendored meshoptimizer (c645e49) with tools/vendor_thirdparty.sh; builder provenance fixed against the upstream optimize_clusters_level change (2026-09-05)
 - [ ] rebuild cluster_select.comp against the multi-run coverage model (or drop it) -- only worth doing if profiling shows CPU selection as a bottleneck
-- [ ] city-class LOD usefulness: clusterlod output for the generated city is threshold-degenerate (see IMPLEMENTATION_STATUS Known Issues); needs builder-side partitioning/simplification work
+- [x] city-class LOD usefulness: fixed 2026-09-06 — position-remapped partitioning + district hierarchy levels (see IMPLEMENTATION_STATUS); smooth threshold ladder, city t=1.0 at 90.6ms/21K draws vs 143.5ms/31K full detail
 
 ## Rendering Quality
 
