@@ -145,8 +145,10 @@ int main(int argc, char** argv) {
         std::cout << "gpu_pages=" << report.uploadable_scene.pages.size() << '\n';
         std::cout << "gpu_page_dependencies=" << report.uploadable_scene.page_dependencies.size()
                   << '\n';
-        std::cout << "base_payload_bytes=" << report.uploadable_scene.base_payload.size() << '\n';
-        std::cout << "lod_payload_bytes=" << report.uploadable_scene.lod_payload.size() << '\n';
+        std::cout << "base_payload_bytes=" << report.uploadable_scene.header.base_payload_bytes
+                  << '\n';
+        std::cout << "lod_payload_bytes=" << report.uploadable_scene.header.lod_payload_bytes
+                  << '\n';
 
         const meridian::VisibilityPixel example =
             meridian::encode_visibility(0, meridian::GeometryKind::base_cluster, 1, 2);

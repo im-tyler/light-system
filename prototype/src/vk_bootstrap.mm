@@ -416,6 +416,133 @@ void destroy_uploaded_scene_buffers(VkDevice device, UploadedSceneBuffers& buffe
 
 namespace {  // reopen anonymous namespace
 
+// Streaming counterpart of create_uploaded_buffer: allocates the payload
+// buffer at full size but never touches the bytes, so on unified-memory
+// platforms the pages stay uncommitted until per-page uploads land. The
+// memory type is HOST_VISIBLE|HOST_COHERENT (same search as
+// create_uploaded_buffer) so upload_page_bytes can map sub-ranges.
+VkResult create_empty_uploaded_buffer(VkPhysicalDevice physical_device, VkDevice device,
+                                      VkDeviceSize size, VkBufferUsageFlags usage,
+                                      UploadedBuffer& uploaded_buffer) {
+    if (size == 0) {
+        return VK_SUCCESS;
+    }
+
+    VkBufferCreateInfo buffer_info{};
+    buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    buffer_info.size = size;
+    buffer_info.usage = usage;
+    buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VkResult result = vkCreateBuffer(device, &buffer_info, nullptr, &uploaded_buffer.buffer);
+    if (result != VK_SUCCESS) {
+        return result;
+    }
+
+    VkMemoryRequirements memory_requirements{};
+    vkGetBufferMemoryRequirements(device, uploaded_buffer.buffer, &memory_requirements);
+
+    VkMemoryAllocateInfo allocate_info{};
+    allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocate_info.allocationSize = memory_requirements.size;
+    allocate_info.memoryTypeIndex =
+        find_memory_type(physical_device, memory_requirements.memoryTypeBits,
+                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (allocate_info.memoryTypeIndex == kInvalidQueueFamily) {
+        vkDestroyBuffer(device, uploaded_buffer.buffer, nullptr);
+        uploaded_buffer.buffer = VK_NULL_HANDLE;
+        return VK_ERROR_MEMORY_MAP_FAILED;
+    }
+
+    result = vkAllocateMemory(device, &allocate_info, nullptr, &uploaded_buffer.memory);
+    if (result != VK_SUCCESS) {
+        vkDestroyBuffer(device, uploaded_buffer.buffer, nullptr);
+        uploaded_buffer.buffer = VK_NULL_HANDLE;
+        return result;
+    }
+
+    result = vkBindBufferMemory(device, uploaded_buffer.buffer, uploaded_buffer.memory, 0);
+    if (result != VK_SUCCESS) {
+        destroy_uploaded_buffer(device, uploaded_buffer);
+        return result;
+    }
+
+    uploaded_buffer.size = size;
+    return VK_SUCCESS;
+}
+
+// Per-page sub-buffer upload into a payload buffer. Fast path maps the
+// destination range directly (HOST_COHERENT unified memory); if the memory
+// is not host-mappable (discrete DEVICE_LOCAL), falls back to a one-shot
+// staging buffer + vkCmdCopyBuffer, mirroring
+// create_device_local_buffer_staged.
+VkResult upload_page_bytes(VkPhysicalDevice physical_device, VkDevice device, VkQueue queue,
+                           uint32_t queue_family, const void* data, VkDeviceSize size,
+                           VkDeviceSize dst_offset, UploadedBuffer& dst) {
+    if (size == 0 || dst.memory == VK_NULL_HANDLE) {
+        return VK_SUCCESS;
+    }
+    if (dst_offset + size > dst.size) {
+        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    }
+
+    void* mapped = nullptr;
+    if (vkMapMemory(device, dst.memory, dst_offset, size, 0, &mapped) == VK_SUCCESS) {
+        std::memcpy(mapped, data, static_cast<size_t>(size));
+        vkUnmapMemory(device, dst.memory);
+        return VK_SUCCESS;
+    }
+
+    UploadedBuffer staging{};
+    VkResult result = create_uploaded_buffer(physical_device, device, data, size,
+                                             VK_BUFFER_USAGE_TRANSFER_SRC_BIT, staging);
+    if (result != VK_SUCCESS) return result;
+
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandPoolCreateInfo pool_info{};
+    pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    pool_info.queueFamilyIndex = queue_family;
+    pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    result = vkCreateCommandPool(device, &pool_info, nullptr, &pool);
+    if (result != VK_SUCCESS) {
+        destroy_uploaded_buffer(device, staging);
+        return result;
+    }
+
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VkCommandBufferAllocateInfo cb_info{};
+    cb_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cb_info.commandPool = pool;
+    cb_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cb_info.commandBufferCount = 1;
+    vkAllocateCommandBuffers(device, &cb_info, &cmd);
+
+    VkCommandBufferBeginInfo begin{};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &begin);
+
+    VkBufferCopy copy{};
+    copy.srcOffset = 0;
+    copy.dstOffset = dst_offset;
+    copy.size = size;
+    vkCmdCopyBuffer(cmd, staging.buffer, dst.buffer, 1, &copy);
+
+    vkEndCommandBuffer(cmd);
+
+    VkSubmitInfo submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &cmd;
+    vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
+    vkQueueWaitIdle(queue);
+
+    vkDestroyCommandPool(device, pool, nullptr);
+    destroy_uploaded_buffer(device, staging);
+    return VK_SUCCESS;
+}
+
+
 CameraFrameData build_camera_frame_data(const VGeoResource& resource, const VkExtent2D& extent,
                                         float& camera_distance) {
     const Vec3f center = {
@@ -692,7 +819,7 @@ VkResult update_vector_buffer(VkDevice device, const std::vector<T>& values,
 VkResult upload_scene_buffers(VkPhysicalDevice physical_device, VkDevice device,
                               VkQueue upload_queue, uint32_t upload_queue_family,
                               const UploadableScene& scene, UploadedSceneBuffers& buffers,
-                              VkBootstrapReport& report) {
+                              VkBootstrapReport& report, bool stream_payloads) {
     const VkBufferUsageFlags metadata_usage =
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
@@ -726,24 +853,52 @@ VkResult upload_scene_buffers(VkPhysicalDevice physical_device, VkDevice device,
     result = upload_vector_buffer(physical_device, device, scene.page_residency, metadata_usage,
                                   buffers.page_residency);
     if (result != VK_SUCCESS) return result;
-    // Payload buffers are large and immutable. Push them to DEVICE_LOCAL via
-    // a staged copy when the platform has a dedicated device-only heap.
-    if (!scene.base_payload.empty()) {
-        result = create_device_local_buffer_staged(
-            physical_device, device, upload_queue, upload_queue_family,
-            scene.base_payload.data(),
-            static_cast<VkDeviceSize>(scene.base_payload.size()),
-            metadata_usage, buffers.base_payload);
+    if (stream_payloads) {
+        // Demand-streaming: allocate the payload buffers at full size but
+        // leave them unpopulated -- page bytes arrive via per-page uploads
+        // as the residency scheduler completes loads. Nothing is read from
+        // these ranges until the owning page is resident, so the
+        // untouched (uncommitted on unified memory) content is never
+        // observed.
+        if (!scene.base_payload.empty()) {
+            result = create_empty_uploaded_buffer(
+                physical_device, device,
+                static_cast<VkDeviceSize>(scene.base_payload.size()), metadata_usage,
+                buffers.base_payload);
+        }
+        if (result != VK_SUCCESS) return result;
+        if (!scene.lod_payload.empty()) {
+            result = create_empty_uploaded_buffer(
+                physical_device, device,
+                static_cast<VkDeviceSize>(scene.lod_payload.size()), metadata_usage,
+                buffers.lod_payload);
+        }
+        if (result != VK_SUCCESS) return result;
+        std::fprintf(stderr,
+                     "MERIDIAN_STREAM: payload buffers allocated empty (base=%llu lod=%llu "
+                     "bytes), pages upload on demand\n",
+                     static_cast<unsigned long long>(scene.base_payload.size()),
+                     static_cast<unsigned long long>(scene.lod_payload.size()));
+    } else {
+        // Payload buffers are large and immutable. Push them to DEVICE_LOCAL via
+        // a staged copy when the platform has a dedicated device-only heap.
+        if (!scene.base_payload.empty()) {
+            result = create_device_local_buffer_staged(
+                physical_device, device, upload_queue, upload_queue_family,
+                scene.base_payload.data(),
+                static_cast<VkDeviceSize>(scene.base_payload.size()),
+                metadata_usage, buffers.base_payload);
+        }
+        if (result != VK_SUCCESS) return result;
+        if (!scene.lod_payload.empty()) {
+            result = create_device_local_buffer_staged(
+                physical_device, device, upload_queue, upload_queue_family,
+                scene.lod_payload.data(),
+                static_cast<VkDeviceSize>(scene.lod_payload.size()),
+                metadata_usage, buffers.lod_payload);
+        }
+        if (result != VK_SUCCESS) return result;
     }
-    if (result != VK_SUCCESS) return result;
-    if (!scene.lod_payload.empty()) {
-        result = create_device_local_buffer_staged(
-            physical_device, device, upload_queue, upload_queue_family,
-            scene.lod_payload.data(),
-            static_cast<VkDeviceSize>(scene.lod_payload.size()),
-            metadata_usage, buffers.lod_payload);
-    }
-    if (result != VK_SUCCESS) return result;
 
     const UploadedBuffer* all_buffers[] = {
         &buffers.header,          &buffers.instances,     &buffers.hierarchy_nodes,
@@ -1961,16 +2116,163 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             }
         }
 
+        ResidencyModel residency_model = create_residency_model(resource);
+        // Demand-streaming: start pages unloaded so the scheduler drives the
+        // loads from frame 0. Default path leaves every page resident for the
+        // existing "all-in-memory" benchmark behavior.
+        std::vector<uint32_t> page_load_start_frame(residency_model.pages.size(), 0xffffffffu);
+        // Per-page absolute file offset + size, filled when async I/O is on.
+        struct PageFileRange { uint64_t offset = 0; uint32_t size = 0; };
+        std::vector<PageFileRange> page_file_ranges(residency_model.pages.size());
+        AsyncReader async_reader;
+        bool async_io_active = false;
+        StreamingScheduler streaming_scheduler;
+        uint32_t stream_pages_uploaded = 0;
+        uint64_t stream_bytes_uploaded = 0;
+        if (config.demand_streaming) {
+            for (PageResidencyEntry& entry : residency_model.pages) {
+                entry.state = PageResidencyState::unloaded;
+                entry.last_touched_frame = 0xffffffffu;
+            }
+            // Root-page autodetect: run a coarse traversal with all pages
+            // marked resident and a very large error threshold to discover
+            // which pages the hierarchy actually needs for its minimum-detail
+            // render. This is the correct seed set regardless of storage
+            // layout (previously we seeded the first N pages by index, which
+            // happened to work only because the DFS flatten pass tends to
+            // land low-detail clusters at the front of the linear layout).
+            const std::vector<uint8_t> all_resident_mask(residency_model.pages.size(), 1);
+            const TraversalSelection coarse =
+                simulate_traversal(resource, /*error_threshold=*/1e30f, all_resident_mask);
+            const uint32_t seed_cap = std::min<uint32_t>(
+                config.streaming_seed_pages,
+                static_cast<uint32_t>(residency_model.pages.size()));
+            uint32_t seeded = 0;
+            for (uint32_t p : coarse.selected_page_indices) {
+                if (p >= residency_model.pages.size()) continue;
+                if (residency_model.pages[p].state == PageResidencyState::resident) continue;
+                residency_model.pages[p].state = PageResidencyState::resident;
+                residency_model.pages[p].last_touched_frame = 0;
+                if (++seeded >= seed_cap) break;
+            }
+            // Fall back to linear seed only if the coarse traversal produced
+            // fewer pages than the seed cap (unlikely but defensive against
+            // scenes where the root has zero LOD links and an empty base
+            // span -- e.g. a completely uninitialised hierarchy).
+            for (uint32_t p = 0; seeded < seed_cap && p < residency_model.pages.size(); ++p) {
+                if (residency_model.pages[p].state == PageResidencyState::resident) continue;
+                residency_model.pages[p].state = PageResidencyState::resident;
+                residency_model.pages[p].last_touched_frame = 0;
+                ++seeded;
+            }
+            StreamingConfig sc;
+            sc.max_resident_pages = config.resident_budget == 0xffffffffu
+                                        ? static_cast<uint32_t>(residency_model.pages.size())
+                                        : config.resident_budget;
+            sc.max_loads_per_frame = config.streaming_max_loads_per_frame;
+            sc.eviction_grace_frames = config.eviction_grace_frames;
+            streaming_scheduler = create_streaming_scheduler(resource, sc);
+
+            // Real async disk I/O path: serialize the resource to a temp
+            // .vgeo, mmap it, and serve page loads from a worker thread
+            // that copies each page's byte range out of the mapping. If
+            // anything fails here we fall back to the latency-window
+            // simulation (async_io_active stays false) and keep the
+            // full startup payload upload.
+            try {
+                const std::string unique =
+                    std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+                temp_vgeo_path = std::filesystem::temp_directory_path() /
+                                 (std::string("meridian-stream-") + unique + ".vgeo");
+                write_resource(resource, temp_vgeo_path);
+                const VGeoPayloadOffsets payload_offsets = compute_payload_offsets(resource);
+                for (uint32_t p = 0; p < resource.pages.size(); ++p) {
+                    const PageRecord& page = resource.pages[p];
+                    const uint64_t base = (page.lod_cluster_count != 0)
+                                              ? payload_offsets.lod_geometry_payload_offset
+                                              : payload_offsets.cluster_geometry_payload_offset;
+                    page_file_ranges[p] = {base + page.byte_offset, page.uncompressed_byte_size};
+                }
+                async_io_active = async_reader.open(temp_vgeo_path);
+                if (!async_io_active) {
+                    std::fprintf(stderr,
+                                 "MERIDIAN_STREAM: async_reader.open failed, "
+                                 "falling back to latency simulation\n");
+                }
+            } catch (const std::exception& e) {
+                std::fprintf(stderr,
+                             "MERIDIAN_STREAM: temp .vgeo write failed (%s), "
+                             "falling back to latency simulation\n", e.what());
+                async_io_active = false;
+            }
+        }
+
+        // When the mmap reader is live the payload buffers start empty and
+        // stream per page; otherwise (default path, or reader-open failure)
+        // keep the full startup upload so the fallback renders correctly.
+        const bool stream_payloads = config.demand_streaming && async_io_active;
         result = upload_scene_buffers(selection.physical_device, device,
                                       graphics_queue, selection.queues.graphics_family,
                                       report.uploadable_scene,
-                                      scene_buffers, report);
+                                      scene_buffers, report, stream_payloads);
         if (result != VK_SUCCESS) {
             std::ostringstream message;
             message << "upload_scene_buffers failed with code " << result;
             report.status = message.str();
             cleanup();
             return report;
+        }
+
+        if (stream_payloads) {
+            // Seed pages were marked resident directly, so their bytes must
+            // land in the (otherwise empty) payload buffers before frame 0.
+            // Synchronous copies from the mapping -- the temp .vgeo was just
+            // written, so the pages are cache-hot.
+            std::vector<std::byte> seed_scratch;
+            uint32_t seeded_pages = 0;
+            for (uint32_t p = 0; p < residency_model.pages.size(); ++p) {
+                if (residency_model.pages[p].state != PageResidencyState::resident) continue;
+                const PageFileRange& range = page_file_ranges[p];
+                if (range.size == 0) continue;
+                seed_scratch.resize(range.size);
+                if (!async_reader.read_sync(range.offset, range.size, seed_scratch.data())) {
+                    continue;
+                }
+                const PageRecord& page = resource.pages[p];
+                UploadedBuffer& dst = (page.lod_cluster_count != 0)
+                                          ? scene_buffers.lod_payload
+                                          : scene_buffers.base_payload;
+                result = upload_page_bytes(selection.physical_device, device, graphics_queue,
+                                           selection.queues.graphics_family,
+                                           seed_scratch.data(), range.size,
+                                           static_cast<VkDeviceSize>(page.byte_offset), dst);
+                if (result != VK_SUCCESS) {
+                    std::ostringstream message;
+                    message << "seed page upload failed with code " << result;
+                    report.status = message.str();
+                    cleanup();
+                    return report;
+                }
+                seeded_pages += 1;
+                stream_pages_uploaded += 1;
+                stream_bytes_uploaded += range.size;
+            }
+            std::fprintf(stderr,
+                         "MERIDIAN_STREAM: seeded %u pages (%llu bytes) synchronously via %s\n",
+                         seeded_pages, static_cast<unsigned long long>(stream_bytes_uploaded),
+                         async_reader.mmap_active() ? "mmap" : "pread");
+            // The mmap'd .vgeo is now the source of truth for page bytes;
+            // drop the CPU-side payload copies (the resource is const in
+            // this scope but owned by a non-const caller object).
+            report.uploadable_scene.base_payload.clear();
+            report.uploadable_scene.base_payload.shrink_to_fit();
+            report.uploadable_scene.lod_payload.clear();
+            report.uploadable_scene.lod_payload.shrink_to_fit();
+            VGeoResource& mutable_resource = const_cast<VGeoResource&>(resource);
+            mutable_resource.cluster_geometry_payload.clear();
+            mutable_resource.cluster_geometry_payload.shrink_to_fit();
+            mutable_resource.lod_geometry_payload.clear();
+            mutable_resource.lod_geometry_payload.shrink_to_fit();
         }
 
         result = create_compute_cull_context(selection.physical_device, device, scene_buffers,
@@ -2052,93 +2354,6 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
         double fps_timer = last_frame_time;
         std::vector<double> frame_times_ms;
 
-        ResidencyModel residency_model = create_residency_model(resource);
-        // Demand-streaming: start pages unloaded so the scheduler drives the
-        // loads from frame 0. Default path leaves every page resident for the
-        // existing "all-in-memory" benchmark behavior.
-        std::vector<uint32_t> page_load_start_frame(residency_model.pages.size(), 0xffffffffu);
-        // Per-page absolute file offset + size, filled when async I/O is on.
-        struct PageFileRange { uint64_t offset = 0; uint32_t size = 0; };
-        std::vector<PageFileRange> page_file_ranges(residency_model.pages.size());
-        AsyncReader async_reader;
-        bool async_io_active = false;
-        StreamingScheduler streaming_scheduler;
-        if (config.demand_streaming) {
-            for (PageResidencyEntry& entry : residency_model.pages) {
-                entry.state = PageResidencyState::unloaded;
-                entry.last_touched_frame = 0xffffffffu;
-            }
-            // Root-page autodetect: run a coarse traversal with all pages
-            // marked resident and a very large error threshold to discover
-            // which pages the hierarchy actually needs for its minimum-detail
-            // render. This is the correct seed set regardless of storage
-            // layout (previously we seeded the first N pages by index, which
-            // happened to work only because the DFS flatten pass tends to
-            // land low-detail clusters at the front of the linear layout).
-            const std::vector<uint8_t> all_resident_mask(residency_model.pages.size(), 1);
-            const TraversalSelection coarse =
-                simulate_traversal(resource, /*error_threshold=*/1e30f, all_resident_mask);
-            const uint32_t seed_cap = std::min<uint32_t>(
-                config.streaming_seed_pages,
-                static_cast<uint32_t>(residency_model.pages.size()));
-            uint32_t seeded = 0;
-            for (uint32_t p : coarse.selected_page_indices) {
-                if (p >= residency_model.pages.size()) continue;
-                if (residency_model.pages[p].state == PageResidencyState::resident) continue;
-                residency_model.pages[p].state = PageResidencyState::resident;
-                residency_model.pages[p].last_touched_frame = 0;
-                if (++seeded >= seed_cap) break;
-            }
-            // Fall back to linear seed only if the coarse traversal produced
-            // fewer pages than the seed cap (unlikely but defensive against
-            // scenes where the root has zero LOD links and an empty base
-            // span -- e.g. a completely uninitialised hierarchy).
-            for (uint32_t p = 0; seeded < seed_cap && p < residency_model.pages.size(); ++p) {
-                if (residency_model.pages[p].state == PageResidencyState::resident) continue;
-                residency_model.pages[p].state = PageResidencyState::resident;
-                residency_model.pages[p].last_touched_frame = 0;
-                ++seeded;
-            }
-            StreamingConfig sc;
-            sc.max_resident_pages = config.resident_budget == 0xffffffffu
-                                        ? static_cast<uint32_t>(residency_model.pages.size())
-                                        : config.resident_budget;
-            sc.max_loads_per_frame = config.streaming_max_loads_per_frame;
-            sc.eviction_grace_frames = config.eviction_grace_frames;
-            streaming_scheduler = create_streaming_scheduler(resource, sc);
-
-            // Real async disk I/O path: serialize the resource to a temp
-            // .vgeo and open it for pread() on a worker thread. Each page
-            // load turns into an actual disk read. If anything fails here
-            // we fall back to the latency-window simulation (async_io_active
-            // stays false).
-            try {
-                const std::string unique =
-                    std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
-                temp_vgeo_path = std::filesystem::temp_directory_path() /
-                                 (std::string("meridian-stream-") + unique + ".vgeo");
-                write_resource(resource, temp_vgeo_path);
-                const VGeoPayloadOffsets payload_offsets = compute_payload_offsets(resource);
-                for (uint32_t p = 0; p < resource.pages.size(); ++p) {
-                    const PageRecord& page = resource.pages[p];
-                    const uint64_t base = (page.lod_cluster_count != 0)
-                                              ? payload_offsets.lod_geometry_payload_offset
-                                              : payload_offsets.cluster_geometry_payload_offset;
-                    page_file_ranges[p] = {base + page.byte_offset, page.uncompressed_byte_size};
-                }
-                async_io_active = async_reader.open(temp_vgeo_path);
-                if (!async_io_active) {
-                    std::fprintf(stderr,
-                                 "MERIDIAN_STREAM: async_reader.open failed, "
-                                 "falling back to latency simulation\n");
-                }
-            } catch (const std::exception& e) {
-                std::fprintf(stderr,
-                             "MERIDIAN_STREAM: temp .vgeo write failed (%s), "
-                             "falling back to latency simulation\n", e.what());
-                async_io_active = false;
-            }
-        }
         snapshot_page_residency(report.uploadable_scene, residency_model);
         result = update_vector_buffer(device, report.uploadable_scene.page_residency,
                                       scene_buffers.page_residency);
@@ -2369,23 +2584,27 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
 
             // Async-load completion. Two paths:
             //   * Real async I/O (async_io_active): drain completions from
-            //     the worker thread that just finished pread()ing the page's
-            //     byte range from the temp .vgeo. Completion time reflects
-            //     actual disk latency + worker scheduling.
+            //     the worker thread that just copied the page's byte range
+            //     out of the mmap'd .vgeo. Completion time reflects
+            //     actual disk latency + worker scheduling, and the
+            //     completion's bytes are uploaded into the GPU payload
+            //     buffer after this frame's residency step.
             //   * Simulated (fallback): a page that entered the loading state
             //     streaming_load_latency_frames ago now becomes resident.
             //   * Non-streaming default: complete_loading_pages transitions
             //     every loading page to resident instantly.
             std::vector<uint32_t> completed_this_frame;
+            std::vector<AsyncReadCompletion> completed_reads;
             if (config.demand_streaming) {
                 if (async_io_active) {
-                    const auto reads = async_reader.drain_completions();
-                    for (const auto& r : reads) {
+                    std::vector<AsyncReadCompletion> reads = async_reader.drain_completions();
+                    for (auto& r : reads) {
                         if (!r.success) continue;
                         if (r.page_index >= residency_model.pages.size()) continue;
                         if (residency_model.pages[r.page_index].state !=
                             PageResidencyState::loading) continue;
                         completed_this_frame.push_back(r.page_index);
+                        completed_reads.push_back(std::move(r));
                         page_load_start_frame[r.page_index] = 0xffffffffu;
                     }
                 } else {
@@ -2457,7 +2676,7 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             if (config.demand_streaming) {
                 // Any page that step_residency advanced to `loading` this
                 // frame needs its load-start timestamp recorded (for the
-                // simulation fallback) AND its real pread submitted to the
+                // simulation fallback) AND its real read submitted to the
                 // worker thread (for the async I/O path). The scheduler's
                 // throttle guarantees we won't spam the worker.
                 for (uint32_t p : residency_update.loading_pages) {
@@ -2472,6 +2691,43 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                         job.page_index = p;
                         async_reader.submit(job);
                     }
+                }
+                if (async_io_active && !completed_reads.empty()) {
+                    // step_residency has transitioned the completed pages to
+                    // resident; push their bytes into the payload buffers via
+                    // per-page sub-buffer uploads. Newly resident pages only
+                    // enter the draw list next frame, so the GPU consumes
+                    // the bytes after they land.
+                    for (const AsyncReadCompletion& r : completed_reads) {
+                        const PageRecord& page = resource.pages[r.page_index];
+                        UploadedBuffer& dst = (page.lod_cluster_count != 0)
+                                                  ? scene_buffers.lod_payload
+                                                  : scene_buffers.base_payload;
+                        result = upload_page_bytes(
+                            selection.physical_device, device, graphics_queue,
+                            selection.queues.graphics_family, r.data.data(),
+                            static_cast<VkDeviceSize>(r.data.size()),
+                            static_cast<VkDeviceSize>(page.byte_offset), dst);
+                        if (result != VK_SUCCESS) {
+                            std::ostringstream message;
+                            message << "streamed page upload failed with code " << result;
+                            report.status = message.str();
+                            cleanup();
+                            return report;
+                        }
+                        stream_pages_uploaded += 1;
+                        stream_bytes_uploaded += r.data.size();
+                    }
+                }
+                if (async_io_active && (frame_index % 60) == 0) {
+                    std::fprintf(stderr,
+                                 "MERIDIAN_STREAM: uploads=%u pages / %llu bytes, "
+                                 "resident=%u/%u, pending_reads=%zu\n",
+                                 stream_pages_uploaded,
+                                 static_cast<unsigned long long>(stream_bytes_uploaded),
+                                 count_resident_pages(residency_model),
+                                 static_cast<uint32_t>(residency_model.pages.size()),
+                                 async_reader.pending_count());
                 }
             }
 
@@ -2911,6 +3167,14 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
         // visibility readback / cleanup path runs. Closing here instead of
         // in `cleanup` keeps the reader local to the streaming block where
         // it lives.
+        if (config.demand_streaming && async_io_active) {
+            std::fprintf(stderr,
+                         "MERIDIAN_STREAM: total page uploads=%u (%llu bytes) over %u "
+                         "presented frames; payload buffers were allocated empty at startup\n",
+                         stream_pages_uploaded,
+                         static_cast<unsigned long long>(stream_bytes_uploaded),
+                         report.presented_frame_count);
+        }
         if (async_io_active) {
             async_reader.close();
             async_io_active = false;
