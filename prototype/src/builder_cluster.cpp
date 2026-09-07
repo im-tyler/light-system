@@ -87,9 +87,14 @@ Bounds3f merge_cluster_bounds(const std::vector<ClusterRecord>& clusters,
     return bounds;
 }
 
+// Partitions use position-remapped indices so cluster adjacency matches the
+// clusterlod DAG's view of the mesh (raw indices under-detect adjacency on
+// position-split geometry, e.g. per-face box vertices, which scatters LOD
+// group provenance and pushes group attachment toward the root).
 std::vector<std::vector<uint32_t>> partition_cluster_ids(
     const MeshData& mesh, const std::vector<std::vector<unsigned int>>& cluster_global_indices,
-    const std::vector<uint32_t>& cluster_ids, uint32_t target_partition_size) {
+    const std::vector<uint32_t>& cluster_ids, uint32_t target_partition_size,
+    const std::vector<unsigned int>& position_remap) {
     if (cluster_ids.size() <= target_partition_size) {
         return {cluster_ids};
     }
@@ -105,15 +110,16 @@ std::vector<std::vector<uint32_t>> partition_cluster_ids(
     for (size_t i = 0; i < cluster_ids.size(); ++i) {
         const uint32_t cluster_id = cluster_ids[i];
         cluster_counts[i] = static_cast<unsigned int>(cluster_global_indices[cluster_id].size());
-        flat_indices.insert(flat_indices.end(), cluster_global_indices[cluster_id].begin(),
-                            cluster_global_indices[cluster_id].end());
+        for (const unsigned int index : cluster_global_indices[cluster_id]) {
+            flat_indices.push_back(position_remap[index]);
+        }
     }
 
     std::vector<unsigned int> partition_ids(cluster_ids.size());
     const size_t partition_count = meshopt_partitionClusters(
         partition_ids.data(), flat_indices.data(), flat_indices.size(), cluster_counts.data(),
         cluster_counts.size(), reinterpret_cast<const float*>(mesh.positions.data()),
-        mesh.positions.size(), sizeof(Vec3f), target_partition_size);
+        position_remap.size(), sizeof(Vec3f), target_partition_size);
 
     if (partition_count <= 1) {
         std::vector<std::vector<uint32_t>> fallback;
@@ -144,7 +150,8 @@ uint32_t build_temp_hierarchy(std::vector<TempHierarchyNode>& nodes, const MeshD
                               const std::vector<std::vector<unsigned int>>& cluster_global_indices,
                               const std::vector<ClusterRecord>& clusters,
                               const std::vector<uint32_t>& cluster_ids, uint32_t parent_index,
-                              uint32_t partition_size) {
+                              uint32_t partition_size,
+                              const std::vector<unsigned int>& position_remap) {
     const uint32_t node_index = static_cast<uint32_t>(nodes.size());
     TempHierarchyNode node;
     node.parent_index = parent_index;
@@ -160,8 +167,17 @@ uint32_t build_temp_hierarchy(std::vector<TempHierarchyNode>& nodes, const MeshD
         return node_index;
     }
 
-    std::vector<std::vector<uint32_t>> partitions =
-        partition_cluster_ids(mesh, cluster_global_indices, cluster_ids, partition_size);
+    // District partitioning: grow the target with the cluster span so the
+    // tree gains intermediate district levels (fanout ~8 per level) instead
+    // of a single flat cut at partition_size. LOD groups cover progressively
+    // larger base-cluster spans per DAG depth and need same-scale nodes to
+    // attach to; without this, every depth>=1 group lands on the section
+    // root and threshold selection collapses to a cliff.
+    const uint32_t target_partition_size =
+        std::max(partition_size, static_cast<uint32_t>((cluster_ids.size() + 7) / 8));
+
+    std::vector<std::vector<uint32_t>> partitions = partition_cluster_ids(
+        mesh, cluster_global_indices, cluster_ids, target_partition_size, position_remap);
     if (partitions.size() == 1 && partitions[0].size() == cluster_ids.size()) {
         partitions.clear();
         partitions.reserve(cluster_ids.size());
@@ -173,7 +189,8 @@ uint32_t build_temp_hierarchy(std::vector<TempHierarchyNode>& nodes, const MeshD
     nodes[node_index].child_indices.reserve(partitions.size());
     for (const std::vector<uint32_t>& partition : partitions) {
         nodes[node_index].child_indices.push_back(build_temp_hierarchy(
-            nodes, mesh, cluster_global_indices, clusters, partition, node_index, partition_size));
+            nodes, mesh, cluster_global_indices, clusters, partition, node_index, partition_size,
+            position_remap));
     }
     return node_index;
 }

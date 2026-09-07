@@ -141,6 +141,11 @@ VGeoResource build_resource(const BuildManifest& manifest) {
     temp_hierarchy[0].bounds = detail::make_empty_bounds();
     temp_hierarchy[0].geometric_error = 0.0f;
 
+    std::vector<unsigned int> position_remap(mesh.positions.size());
+    meshopt_generatePositionRemap(position_remap.data(),
+                                  reinterpret_cast<const float*>(mesh.positions.data()),
+                                  mesh.positions.size(), sizeof(Vec3f));
+
     for (uint32_t material_section_index = 0; material_section_index < mesh.sections.size();
          ++material_section_index) {
         std::vector<uint32_t> material_cluster_ids;
@@ -155,7 +160,7 @@ VGeoResource build_resource(const BuildManifest& manifest) {
 
         const uint32_t section_root_temp_node_index = detail::build_temp_hierarchy(
             temp_hierarchy, mesh, cluster_global_indices, source_clusters, material_cluster_ids, 0,
-            manifest.hierarchy_partition_size);
+            manifest.hierarchy_partition_size, position_remap);
         temp_hierarchy[0].child_indices.push_back(section_root_temp_node_index);
         temp_hierarchy[0].geometric_error =
             std::max(temp_hierarchy[0].geometric_error,

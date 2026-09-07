@@ -318,7 +318,8 @@ uint32_t build_temp_hierarchy(std::vector<TempHierarchyNode>& nodes, const MeshD
                               const std::vector<std::vector<unsigned int>>& cluster_global_indices,
                               const std::vector<ClusterRecord>& clusters,
                               const std::vector<uint32_t>& cluster_ids, uint32_t parent_index,
-                              uint32_t partition_size);
+                              uint32_t partition_size,
+                              const std::vector<unsigned int>& position_remap);
 void flatten_temp_hierarchy(const std::vector<TempHierarchyNode>& temp_nodes,
                             const std::vector<ClusterRecord>& source_clusters,
                             const std::vector<std::byte>& source_payload, VGeoResource& resource,
