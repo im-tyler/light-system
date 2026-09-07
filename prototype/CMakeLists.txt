@@ -150,3 +150,35 @@ add_executable(meridian_replay
 )
 
 target_link_libraries(meridian_replay PRIVATE vgeo_builder)
+
+# ontos Phase 3 viewer bridge: standalone stream consumer, deliberately NOT
+# linked against vgeo_builder (JoltViewer pattern: thin, zero core coupling).
+add_executable(ontos_view
+    src/ontos_view.mm
+)
+
+target_compile_options(ontos_view PRIVATE
+    $<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:
+        -Wall -Wextra -Wpedantic -Wno-unused-parameter
+        -Wno-missing-field-initializers
+    >
+)
+
+if(TARGET PkgConfig::VULKAN)
+    target_link_libraries(ontos_view PRIVATE PkgConfig::VULKAN)
+endif()
+
+if(TARGET PkgConfig::GLFW)
+    target_link_libraries(ontos_view PRIVATE PkgConfig::GLFW)
+endif()
+
+if(TARGET PkgConfig::SHADERC)
+    target_link_libraries(ontos_view PRIVATE PkgConfig::SHADERC)
+endif()
+
+if(APPLE)
+    find_library(OBJC_LIBRARY objc REQUIRED)
+    find_library(COCOA_FRAMEWORK Cocoa REQUIRED)
+    find_library(QUARTZCORE_FRAMEWORK QuartzCore REQUIRED)
+    target_link_libraries(ontos_view PRIVATE ${OBJC_LIBRARY} ${COCOA_FRAMEWORK} ${QUARTZCORE_FRAMEWORK})
+endif()

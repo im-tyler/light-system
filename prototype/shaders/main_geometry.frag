@@ -12,11 +12,15 @@ layout(set = 0, binding = 2) uniform FrameData {
 // MoltenVK on Apple GPUs (produces zero-cost no-op samples in practice).
 layout(set = 0, binding = 3) uniform sampler2DArray shadow_map;
 
+layout(set = 0, binding = 5) uniform sampler2D base_texture;
+
 layout(location = 0) in vec3 frag_normal;
 layout(location = 1) flat in uint frag_geometry_index;
 layout(location = 2) flat in uint frag_geometry_kind;
 layout(location = 3) in vec3 frag_world_pos;
 layout(location = 4) flat in uint frag_local_triangle;
+layout(location = 5) in vec2 frag_uv;
+layout(location = 6) flat in uint frag_has_uv;
 
 layout(location = 0) out vec4 out_color;
 layout(location = 1) out uvec2 out_visibility;
@@ -25,7 +29,8 @@ void main() {
     // Per-cluster color variation using geometry index as seed.
     uint hash = frag_geometry_index * 2654435761u;
     float hue = float(hash & 0xFFu) / 255.0;
-    vec3 base_color = vec3(0.62 + hue * 0.12, 0.64 + hue * 0.08, 0.68 - hue * 0.06);
+    vec3 hash_color = vec3(0.62 + hue * 0.12, 0.64 + hue * 0.08, 0.68 - hue * 0.06);
+    vec3 base_color = frag_has_uv == 1u ? texture(base_texture, frag_uv).rgb : hash_color;
 
     vec3 N = gl_FrontFacing ? frag_normal : -frag_normal;
     vec3 L = normalize(frame.light_dir.xyz);
@@ -105,3 +110,4 @@ void main() {
                  (frag_local_triangle & 0xffu);
     out_visibility = uvec2(word0, word1);
 }
+

@@ -27,37 +27,51 @@ layout(location = 1) flat out uint frag_geometry_index;
 layout(location = 2) flat out uint frag_geometry_kind;
 layout(location = 3) out vec3 frag_world_pos;
 layout(location = 4) flat out uint frag_local_triangle;
+layout(location = 5) out vec2 frag_uv;
+layout(location = 6) flat out uint frag_has_uv;
 
-uint read_u32(uint byte_offset, uint geometry_kind) {
+uint read_u32(uint byte_offset, uint domain) {
     uint word_index = byte_offset >> 2u;
-    if (geometry_kind == 0u) {
+    if (domain == 0u) {
         return base_data[word_index];
     } else {
         return lod_data[word_index];
     }
 }
 
-vec3 read_vec3(uint base, uint index, uint gk) {
+vec3 read_vec3(uint base, uint index, uint domain) {
     uint addr = base + index * 12u;
-    return vec3(uintBitsToFloat(read_u32(addr, gk)),
-                uintBitsToFloat(read_u32(addr + 4u, gk)),
-                uintBitsToFloat(read_u32(addr + 8u, gk)));
+    return vec3(uintBitsToFloat(read_u32(addr, domain)),
+                uintBitsToFloat(read_u32(addr + 4u, domain)),
+                uintBitsToFloat(read_u32(addr + 8u, domain)));
+}
+
+vec2 read_vec2(uint base, uint index, uint domain) {
+    uint addr = base + index * 8u;
+    return vec2(uintBitsToFloat(read_u32(addr, domain)),
+                uintBitsToFloat(read_u32(addr + 4u, domain)));
 }
 
 void main() {
     DrawEntry entry = draws[gl_InstanceIndex];
+    uint domain = entry.geometry_kind & 0xffffu;
+    bool has_uv = (entry.geometry_kind & 0x10000u) != 0u;
     uint pos_base = entry.payload_offset + 8u;
     uint normal_base = pos_base + entry.local_vertex_count * 12u;
-    uint idx_base = pos_base + entry.local_vertex_count * 24u;
+    uint uv_base = normal_base + entry.local_vertex_count * 12u;
+    uint idx_base = uv_base + (has_uv ? entry.local_vertex_count * 8u : 0u);
 
-    uint local_index = read_u32(idx_base + gl_VertexIndex * 4u, entry.geometry_kind);
-    vec3 position = read_vec3(pos_base, local_index, entry.geometry_kind);
-    vec3 smooth_normal = read_vec3(normal_base, local_index, entry.geometry_kind);
+    uint local_index = read_u32(idx_base + gl_VertexIndex * 4u, domain);
+    vec3 position = read_vec3(pos_base, local_index, domain);
+    vec3 smooth_normal = read_vec3(normal_base, local_index, domain);
+    vec2 uv = has_uv ? read_vec2(uv_base, local_index, domain) : vec2(0.0);
 
     gl_Position = frame.view_projection * vec4(position, 1.0);
     frag_normal = normalize(smooth_normal);
     frag_world_pos = position;
     frag_geometry_index = entry.cluster_index;
-    frag_geometry_kind = entry.geometry_kind;
+    frag_geometry_kind = domain;
     frag_local_triangle = gl_VertexIndex / 3u;
+    frag_uv = uv;
+    frag_has_uv = has_uv ? 1u : 0u;
 }

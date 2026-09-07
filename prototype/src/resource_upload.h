@@ -21,6 +21,10 @@ struct UploadableScene {
     std::vector<GpuPageResidencyEntry> page_residency;
     std::vector<std::byte> base_payload;
     std::vector<std::byte> lod_payload;
+    // Embedded RGBA8 base-color texture; empty when untextured.
+    std::vector<std::byte> texture_payload;
+    uint32_t texture_width = 0;
+    uint32_t texture_height = 0;
 };
 
 UploadableScene build_uploadable_scene(const VGeoResource& resource);

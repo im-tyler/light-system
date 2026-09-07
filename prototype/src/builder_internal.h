@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vgeo_builder.h"
+#include "runtime_contract.h"
 
 #include "../thirdparty/meshoptimizer/src/meshoptimizer.h"
 #include "../thirdparty/meshoptimizer/demo/clusterlod.h"
@@ -27,9 +28,13 @@
 namespace meridian::detail {
 
 constexpr std::array<char, 4> kMagic = {'V', 'G', 'E', 'O'};
-constexpr uint32_t kSchemaVersion = 3;
+// v4: optional per-vertex UVs in cluster payloads (kClusterFlagHasUv) and an
+// embedded RGBA8 texture payload domain (header flag kFileFlagTextured).
+constexpr uint32_t kSchemaVersion = 4;
 constexpr uint32_t kBuilderVersion = 2;
 constexpr uint32_t kPageFlagLodPayload = 1u << 0;
+constexpr uint32_t kFileFlagHasFallback = 1u << 0;
+constexpr uint32_t kFileFlagTextured = 1u << 1;
 
 struct FileHeader {
     char magic[4];
@@ -47,7 +52,7 @@ struct FileHeader {
     uint32_t total_cluster_geometry_bytes;
     uint32_t total_lod_geometry_bytes;
     uint32_t total_lod_group_base_runs;
-    uint32_t reserved0;
+    uint32_t total_texture_bytes;
     Bounds3f bounds;
     uint64_t metadata_offset;
     uint64_t material_table_offset;
@@ -164,6 +169,12 @@ struct MeshSection {
 struct MeshData {
     std::vector<Vec3f> positions;
     std::vector<Vec3f> normals;
+    // 2 floats per vertex; empty when the source asset has no texcoords.
+    std::vector<float> texcoords;
+    // Gate for UV payload emission and attribute-aware simplification
+    // (manifest emit_texture). Texcoords are always parsed for seam locking;
+    // payloads only carry them when explicitly requested.
+    bool emit_uv_payloads = false;
     std::vector<MeshSection> sections;
     std::vector<unsigned char> vertex_locks;
     struct VertexSeamAttributes {
@@ -311,6 +322,7 @@ inline Bounds3f resolve_resource_bounds(const BuildManifest& manifest, const Bou
 void validate_manifest(const BuildManifest& manifest);
 MeshData load_mesh(const BuildManifest& manifest);
 void compute_smooth_normals(MeshData& mesh);
+std::vector<std::byte> generate_checker_texture(uint32_t width, uint32_t height);
 
 clodConfig make_clod_config(const BuildManifest& manifest);
 void build_section_base_clusters(const MeshData& mesh, const MeshSection& section,

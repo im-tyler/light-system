@@ -41,7 +41,7 @@ void main() {
 
     // Read AABB from cluster or lod_cluster record
     vec3 bmin, bmax;
-    if (entry.geometry_kind == 0u) {
+    if ((entry.geometry_kind & 0xffffu) == 0u) {
         uint b = entry.cluster_index * CLUSTER_W;
         bmin = vec3(uintBitsToFloat(cluster_data[b+12u]), uintBitsToFloat(cluster_data[b+13u]),
                     uintBitsToFloat(cluster_data[b+14u]));

@@ -265,6 +265,15 @@ void append_gltf_primitive(MeshData& mesh, const cgltf_primitive& primitive, con
 
     mesh.positions.reserve(mesh.positions.size() + positions->count);
     mesh.seam_attributes.reserve(mesh.seam_attributes.size() + positions->count);
+    // The texcoord stream is mesh-wide: once any primitive has contributed
+    // UVs the array stays sized to the vertex count so later primitives
+    // without texcoords get zeros instead of dropping the stream.
+    if (texcoords != nullptr || !mesh.texcoords.empty()) {
+        mesh.texcoords.resize((mesh.positions.size() + positions->count) * 2, 0.0f);
+    }
+    const size_t texcoord_write_base = mesh.texcoords.empty()
+                                           ? std::numeric_limits<size_t>::max()
+                                           : (mesh.texcoords.size() / 2 - positions->count);
     for (cgltf_size vertex_index = 0; vertex_index < positions->count; ++vertex_index) {
         const Vec3f transformed = transform_point(
             world_matrix,
@@ -272,6 +281,13 @@ void append_gltf_primitive(MeshData& mesh, const cgltf_primitive& primitive, con
                   unpacked_positions[vertex_index * 3 + 2]});
         mesh.positions.push_back(transformed);
         update_bounds(mesh.bounds, transformed);
+
+        if (texcoords != nullptr) {
+            mesh.texcoords[(texcoord_write_base + vertex_index) * 2 + 0] =
+                unpacked_texcoords[vertex_index * 2 + 0];
+            mesh.texcoords[(texcoord_write_base + vertex_index) * 2 + 1] =
+                unpacked_texcoords[vertex_index * 2 + 1];
+        }
 
         MeshData::VertexSeamAttributes attributes;
         if (!unpacked_normals.empty()) {
@@ -540,6 +556,22 @@ MeshData load_mesh(const BuildManifest& manifest) {
 
     throw BuilderError("unsupported source asset format: " + extension +
                        " (first-pass builder supports .obj, .gltf, and .glb)");
+}
+
+std::vector<std::byte> generate_checker_texture(uint32_t width, uint32_t height) {
+    std::vector<std::byte> pixels(static_cast<size_t>(width) * height * 4);
+    const uint32_t cell = 32;
+    for (uint32_t y = 0; y < height; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+            const size_t offset = (static_cast<size_t>(y) * width + x) * 4;
+            const uint32_t checker = ((x / cell) ^ (y / cell)) & 1u;
+            pixels[offset + 0] = static_cast<std::byte>(checker ? 232 : 36);
+            pixels[offset + 1] = static_cast<std::byte>(checker ? 180 : 96);
+            pixels[offset + 2] = static_cast<std::byte>(checker ? 64 : 176);
+            pixels[offset + 3] = std::byte{0xff};
+        }
+    }
+    return pixels;
 }
 
 void compute_smooth_normals(MeshData& mesh) {

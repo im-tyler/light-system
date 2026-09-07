@@ -75,7 +75,7 @@ void emit_base(uint ci) {
     draws[slot].draw_first_vertex = 0u;
     draws[slot].draw_first_instance = slot;
     draws[slot].cluster_index = ci;
-    draws[slot].geometry_kind = 0u;
+    draws[slot].geometry_kind = ((cluster_data[b + 7u] & 1u) != 0u) ? 0x10000u : 0u;
     draws[slot].payload_offset = cluster_data[b + 4u];
     draws[slot].local_vertex_count = cluster_data[b + 1u];
 }
@@ -89,7 +89,7 @@ void emit_lod(uint ci) {
     draws[slot].draw_first_vertex = 0u;
     draws[slot].draw_first_instance = slot;
     draws[slot].cluster_index = ci;
-    draws[slot].geometry_kind = 1u;
+    draws[slot].geometry_kind = 1u | (((lod_cluster_data[b + 9u] & 1u) != 0u) ? 0x10000u : 0u);
     draws[slot].payload_offset = lod_cluster_data[b + 5u];
     draws[slot].local_vertex_count = lod_cluster_data[b + 2u];
 }

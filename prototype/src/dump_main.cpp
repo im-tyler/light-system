@@ -42,6 +42,9 @@ int main(int argc, char** argv) {
         std::cout << "page_dependencies=" << summary.page_dependency_count << '\n';
         std::cout << "cluster_geometry_bytes=" << summary.cluster_geometry_bytes << '\n';
         std::cout << "lod_geometry_bytes=" << summary.lod_geometry_bytes << '\n';
+        std::cout << "texture_width=" << summary.texture_width << '\n';
+        std::cout << "texture_height=" << summary.texture_height << '\n';
+        std::cout << "texture_bytes=" << summary.texture_bytes << '\n';
         return 0;
     } catch (const meridian::BuilderError& error) {
         std::cerr << "Dump error: " << error.what() << '\n';

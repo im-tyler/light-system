@@ -12,6 +12,8 @@ std::array<float, 4> to_float4(const Vec3f& value) {
     return {value.x, value.y, value.z, 0.0f};
 }
 
+constexpr uint32_t kSceneFlagTextured = 1u << 1;
+
 }  // namespace
 
 UploadableScene build_uploadable_scene(const VGeoResource& resource) {
@@ -27,7 +29,11 @@ UploadableScene build_uploadable_scene(const VGeoResource& resource) {
     scene.header.base_payload_bytes = static_cast<uint32_t>(resource.cluster_geometry_payload.size());
     scene.header.lod_payload_bytes = static_cast<uint32_t>(resource.lod_geometry_payload.size());
     scene.header.visibility_format_word_count = 2;
-    scene.header.flags = resource.has_fallback ? 1u : 0u;
+    scene.header.flags = (resource.has_fallback ? 1u : 0u) |
+                         (resource.texture_payload.empty() ? 0u : kSceneFlagTextured);
+    scene.texture_payload = resource.texture_payload;
+    scene.texture_width = resource.texture_width;
+    scene.texture_height = resource.texture_height;
 
     GpuInstanceRecord instance;
     instance.bounds_min = to_float4(resource.bounds.min);

@@ -102,6 +102,15 @@ struct DebugRenderContext {
     VkDeviceMemory placeholder_depth_memory = VK_NULL_HANDLE;
     VkImageView placeholder_depth_view = VK_NULL_HANDLE;
     VkSampler placeholder_sampler = VK_NULL_HANDLE;
+    // Base-color texture (binding 5): the scene's embedded RGBA8 texture,
+    // or a 1x1 white placeholder when the scene is untextured.
+    VkImage base_texture_image = VK_NULL_HANDLE;
+    VkDeviceMemory base_texture_memory = VK_NULL_HANDLE;
+    VkImageView base_texture_view = VK_NULL_HANDLE;
+    VkSampler base_texture_sampler = VK_NULL_HANDLE;
+    uint32_t base_texture_width = 0;
+    uint32_t base_texture_height = 0;
+    bool base_texture_is_placeholder = false;
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
     VkDescriptorSetLayout descriptor_set_layout = VK_NULL_HANDLE;
     VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
@@ -217,11 +226,12 @@ void destroy_shadow_context(VkDevice device, ShadowContext& context);
 
 // Create functions (implementations in per-subsystem .cpp files)
 struct VGeoResource;
+struct UploadableScene;
 
 VkResult create_compute_cull_context(VkPhysicalDevice physical_device, VkDevice device,
-                                     const UploadedSceneBuffers& scene_buffers,
-                                     uint32_t instance_count,
-                                     ComputeCullContext& context);
+                                      const UploadedSceneBuffers& scene_buffers,
+                                      uint32_t instance_count,
+                                      ComputeCullContext& context);
 
 VkResult create_compute_selection_context(VkPhysicalDevice physical_device, VkDevice device,
                                           const UploadedSceneBuffers& scene_buffers,
@@ -256,10 +266,12 @@ VkResult create_visibility_resources(VkPhysicalDevice physical_device, VkDevice 
                                      const VkExtent2D& extent, DebugRenderContext& context);
 
 VkResult create_debug_render_context(VkPhysicalDevice physical_device, VkDevice device,
-                                     const SwapchainContext& swapchain,
-                                     const UploadedSceneBuffers& scene_buffers,
-                                     const UploadedBuffer& draw_list,
-                                     DebugRenderContext& context);
+                                      VkQueue upload_queue, uint32_t upload_queue_family,
+                                      const SwapchainContext& swapchain,
+                                      const UploadedSceneBuffers& scene_buffers,
+                                      const struct UploadableScene& scene,
+                                      const UploadedBuffer& draw_list,
+                                      DebugRenderContext& context);
 
 #endif  // MERIDIAN_VK_CONTEXT_HAS_VULKAN && MERIDIAN_VK_CONTEXT_HAS_GLFW
 

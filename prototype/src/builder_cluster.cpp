@@ -52,6 +52,14 @@ ClusterRecord append_meshlet_payload(const MeshData& mesh, const meshopt_Meshlet
     for (const Vec3f& normal : local_normals) {
         append_bytes(payload, normal);
     }
+    const bool has_uvs = mesh.emit_uv_payloads && !mesh.texcoords.empty();
+    if (has_uvs) {
+        for (size_t i = 0; i < meshlet.vertex_count; ++i) {
+            const uint32_t vertex_index = meshlet_vertices[meshlet.vertex_offset + i];
+            append_bytes(payload, mesh.texcoords[vertex_index * 2 + 0]);
+            append_bytes(payload, mesh.texcoords[vertex_index * 2 + 1]);
+        }
+    }
     for (const uint32_t index : local_indices) {
         append_bytes(payload, index);
     }
@@ -74,6 +82,9 @@ ClusterRecord append_meshlet_payload(const MeshData& mesh, const meshopt_Meshlet
     cluster.normal_cone_axis[3] = meshlet_bounds.cone_cutoff;
     cluster.local_error = meshlet_bounds.radius;
     cluster.material_section_index = material_section_index;
+    if (has_uvs) {
+        cluster.flags |= kClusterFlagHasUv;
+    }
     return cluster;
 }
 
@@ -612,6 +623,13 @@ LodClusterRecord append_lod_cluster_payload(const MeshData& mesh, const unsigned
     for (const uint32_t vertex_index : local_vertices) {
         append_bytes(payload, mesh.normals[vertex_index]);
     }
+    const bool has_uvs = mesh.emit_uv_payloads && !mesh.texcoords.empty();
+    if (has_uvs) {
+        for (const uint32_t vertex_index : local_vertices) {
+            append_bytes(payload, mesh.texcoords[vertex_index * 2 + 0]);
+            append_bytes(payload, mesh.texcoords[vertex_index * 2 + 1]);
+        }
+    }
     for (const unsigned char index : local_triangles) {
         const uint32_t widened = index;
         append_bytes(payload, widened);
@@ -635,6 +653,9 @@ LodClusterRecord append_lod_cluster_payload(const MeshData& mesh, const unsigned
     cluster.normal_cone_axis[3] = cone_bounds.cone_cutoff;
     cluster.local_error = cluster_bounds.error;
     cluster.material_section_index = material_section_index;
+    if (has_uvs) {
+        cluster.flags |= kClusterFlagHasUv;
+    }
     return cluster;
 }
 
@@ -668,11 +689,24 @@ void build_lod_metadata(VGeoResource& resource, const MeshData& mesh, const Buil
         clod_mesh.vertex_count = mesh.positions.size();
         clod_mesh.vertex_positions = reinterpret_cast<const float*>(mesh.positions.data());
         clod_mesh.vertex_positions_stride = sizeof(Vec3f);
-        clod_mesh.vertex_attributes = nullptr;
-        clod_mesh.vertex_attributes_stride = 0;
         clod_mesh.vertex_lock = mesh.vertex_locks.data();
-        clod_mesh.attribute_weights = nullptr;
-        clod_mesh.attribute_count = 0;
+        if (mesh.emit_uv_payloads && !mesh.texcoords.empty()) {
+            // Attribute-aware simplification: track UVs alongside positions so
+            // LOD clusters keep UVs consistent with their geometry (seam
+            // vertices are additionally locked by build_vertex_locks). Only
+            // affects simplification decisions; level-0 clustering is
+            // attribute-blind so provenance signatures still match.
+            clod_mesh.vertex_attributes = mesh.texcoords.data();
+            clod_mesh.vertex_attributes_stride = 2 * sizeof(float);
+            const float uv_weights[2] = {1.0f, 1.0f};
+            clod_mesh.attribute_weights = uv_weights;
+            clod_mesh.attribute_count = 2;
+        } else {
+            clod_mesh.vertex_attributes = nullptr;
+            clod_mesh.vertex_attributes_stride = 0;
+            clod_mesh.attribute_weights = nullptr;
+            clod_mesh.attribute_count = 0;
+        }
         clod_mesh.attribute_protect_mask = 0;
 
         clodBuild(config, clod_mesh,

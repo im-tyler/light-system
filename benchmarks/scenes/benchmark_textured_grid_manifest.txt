@@ -1,0 +1,11 @@
+asset_id = benchmark_textured_grid
+source_asset = generated/textured_grid.gltf
+output_path = ../../build/benchmark_textured_grid.vgeo
+emit_fallback = true
+emit_texture = true
+material_slots = textured_grid
+cluster_vertex_limit = 64
+cluster_triangle_limit = 124
+page_cluster_limit = 8
+hierarchy_partition_size = 8
+bounds_padding = 0.1

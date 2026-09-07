@@ -126,6 +126,9 @@ struct ResourceMetadata {
     uint64_t lod_geometry_payload_offset = 0;
     uint64_t material_mapping_offset = 0;
     uint64_t debug_info_offset = 0;
+    uint64_t texture_payload_offset = 0;
+    uint32_t texture_width = 0;
+    uint32_t texture_height = 0;
 };
 
 struct BuildManifest {
@@ -136,6 +139,10 @@ struct BuildManifest {
     bool has_explicit_bounds = false;
     float bounds_padding = 0.0f;
     bool emit_fallback = true;
+    // Emit per-vertex UVs into cluster payloads and embed a generated
+    // RGBA8 checker texture as a third payload domain. Requires the source
+    // asset to provide texcoords (glTF TEXCOORD_0).
+    bool emit_texture = false;
     uint32_t cluster_vertex_limit = 64;
     uint32_t cluster_triangle_limit = 124;
     uint32_t page_cluster_limit = 8;
@@ -163,6 +170,11 @@ struct VGeoResource {
     std::vector<LodGroupBaseRun> lod_group_base_runs;
     std::vector<std::byte> cluster_geometry_payload;
     std::vector<std::byte> lod_geometry_payload;
+    // Embedded RGBA8 base-color texture (schema v4, third payload domain).
+    // Empty when the resource was built without emit_texture.
+    std::vector<std::byte> texture_payload;
+    uint32_t texture_width = 0;
+    uint32_t texture_height = 0;
 };
 
 struct ResourceSummary {
@@ -182,6 +194,9 @@ struct ResourceSummary {
     uint32_t page_dependency_count = 0;
     uint32_t cluster_geometry_bytes = 0;
     uint32_t lod_geometry_bytes = 0;
+    uint32_t texture_width = 0;
+    uint32_t texture_height = 0;
+    uint32_t texture_bytes = 0;
 };
 
 struct TraversalSelection {

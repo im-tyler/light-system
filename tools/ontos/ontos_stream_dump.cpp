@@ -484,7 +484,7 @@ struct GravityWorld {
     GBody b = bodies[i];
     if (is_coarse(i)) {
       const GFit &fit = coarse[i];
-      const f64 s = -1.0 + static_cast<f64>(t - fit.t0) / 32.0;
+      const f64 s = -1.0 + static_cast<f64>(t - fit.t0) / 16.0;
       b.x = g_clenshaw(fit.c[0], s);
       b.y = g_clenshaw(fit.c[1], s);
       b.vx = g_clenshaw(fit.c[2], s);

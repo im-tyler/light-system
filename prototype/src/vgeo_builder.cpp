@@ -45,6 +45,8 @@ BuildManifest load_manifest(const std::filesystem::path& manifest_path) {
             saw_bounds_max = true;
         } else if (key == "emit_fallback") {
             manifest.emit_fallback = detail::parse_bool(value);
+        } else if (key == "emit_texture") {
+            manifest.emit_texture = detail::parse_bool(value);
         } else if (key == "material_slots") {
             manifest.material_slots = detail::parse_list(value);
         } else if (key == "cluster_vertex_limit") {
@@ -108,6 +110,16 @@ VGeoResource build_resource(const BuildManifest& manifest) {
     VGeoResource resource = create_stub_resource(manifest);
     detail::MeshData mesh = detail::load_mesh(manifest);
     detail::compute_smooth_normals(mesh);
+    mesh.emit_uv_payloads = manifest.emit_texture;
+    if (manifest.emit_texture) {
+        if (mesh.texcoords.empty()) {
+            throw BuilderError("emit_texture requires source texcoords (glTF TEXCOORD_0)");
+        }
+        constexpr uint32_t kTextureSize = 256;
+        resource.texture_width = kTextureSize;
+        resource.texture_height = kTextureSize;
+        resource.texture_payload = detail::generate_checker_texture(kTextureSize, kTextureSize);
+    }
     resource.bounds = detail::resolve_resource_bounds(manifest, mesh.bounds);
     resource.source_vertex_count = static_cast<uint32_t>(mesh.positions.size());
     resource.seam_locked_vertex_count =

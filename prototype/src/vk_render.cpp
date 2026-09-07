@@ -3,6 +3,7 @@
 #include "shader_loader.h"
 #include "math_utils.h"
 #include "gpu_abi.h"
+#include "resource_upload.h"
 
 #include <algorithm>
 #include <cstring>
@@ -148,21 +149,210 @@ VkResult create_visibility_resources(VkPhysicalDevice physical_device, VkDevice 
                                   VK_BUFFER_USAGE_TRANSFER_DST_BIT, context.visibility_readback_buffer);
 }
 
+// Creates the base-color texture (binding 5) from the scene's embedded
+// RGBA8 payload, or a 1x1 white placeholder when the scene is untextured.
+// Upload path mirrors create_device_local_buffer_staged: HOST_VISIBLE
+// staging buffer + one-shot vkCmdCopyBufferToImage with queue idle wait.
+VkResult create_base_texture_resources(VkPhysicalDevice physical_device, VkDevice device,
+                                        VkQueue upload_queue, uint32_t upload_queue_family,
+                                        const UploadableScene& scene, DebugRenderContext& context) {
+    const bool has_scene_texture =
+        !scene.texture_payload.empty() && scene.texture_width > 0 && scene.texture_height > 0;
+    context.base_texture_is_placeholder = !has_scene_texture;
+    context.base_texture_width = has_scene_texture ? scene.texture_width : 1;
+    context.base_texture_height = has_scene_texture ? scene.texture_height : 1;
+
+    const uint8_t white_pixel[4] = {0xff, 0xff, 0xff, 0xff};
+    const void* pixels = nullptr;
+    VkDeviceSize pixel_bytes = 0;
+    if (has_scene_texture) {
+        pixels = scene.texture_payload.data();
+        pixel_bytes = static_cast<VkDeviceSize>(scene.texture_payload.size());
+    } else {
+        pixels = white_pixel;
+        pixel_bytes = sizeof(white_pixel);
+    }
+
+    UploadedBuffer staging{};
+    VkResult result = create_uploaded_buffer(physical_device, device, pixels, pixel_bytes,
+                                              VK_BUFFER_USAGE_TRANSFER_SRC_BIT, staging);
+    if (result != VK_SUCCESS) {
+        return result;
+    }
+    const auto destroy_staging = [&]() { destroy_uploaded_buffer(device, staging); };
+
+    VkImageCreateInfo image_info{};
+    image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    image_info.imageType = VK_IMAGE_TYPE_2D;
+    image_info.extent = {context.base_texture_width, context.base_texture_height, 1};
+    image_info.mipLevels = 1;
+    image_info.arrayLayers = 1;
+    image_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+    image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    image_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    result = vkCreateImage(device, &image_info, nullptr, &context.base_texture_image);
+    if (result != VK_SUCCESS) {
+        destroy_staging();
+        return result;
+    }
+
+    VkMemoryRequirements memory_requirements{};
+    vkGetImageMemoryRequirements(device, context.base_texture_image, &memory_requirements);
+    const uint32_t memory_type = find_memory_type(physical_device, memory_requirements.memoryTypeBits,
+                                                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (memory_type == kInvalidQueueFamily) {
+        vkDestroyImage(device, context.base_texture_image, nullptr);
+        context.base_texture_image = VK_NULL_HANDLE;
+        destroy_staging();
+        return VK_ERROR_MEMORY_MAP_FAILED;
+    }
+    VkMemoryAllocateInfo allocate_info{};
+    allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocate_info.allocationSize = memory_requirements.size;
+    allocate_info.memoryTypeIndex = memory_type;
+    result = vkAllocateMemory(device, &allocate_info, nullptr, &context.base_texture_memory);
+    if (result != VK_SUCCESS) {
+        vkDestroyImage(device, context.base_texture_image, nullptr);
+        context.base_texture_image = VK_NULL_HANDLE;
+        destroy_staging();
+        return result;
+    }
+    result = vkBindImageMemory(device, context.base_texture_image, context.base_texture_memory, 0);
+    if (result != VK_SUCCESS) {
+        vkFreeMemory(device, context.base_texture_memory, nullptr);
+        context.base_texture_memory = VK_NULL_HANDLE;
+        vkDestroyImage(device, context.base_texture_image, nullptr);
+        context.base_texture_image = VK_NULL_HANDLE;
+        destroy_staging();
+        return result;
+    }
+
+    VkCommandPool command_pool = VK_NULL_HANDLE;
+    VkCommandPoolCreateInfo pool_info{};
+    pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    pool_info.queueFamilyIndex = upload_queue_family;
+    pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    result = vkCreateCommandPool(device, &pool_info, nullptr, &command_pool);
+    if (result != VK_SUCCESS) {
+        destroy_staging();
+        return result;
+    }
+    VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+    VkCommandBufferAllocateInfo command_info{};
+    command_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    command_info.commandPool = command_pool;
+    command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    command_info.commandBufferCount = 1;
+    vkAllocateCommandBuffers(device, &command_info, &command_buffer);
+
+    VkCommandBufferBeginInfo begin{};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(command_buffer, &begin);
+
+    VkImageMemoryBarrier to_transfer_dst{};
+    to_transfer_dst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    to_transfer_dst.srcAccessMask = 0;
+    to_transfer_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    to_transfer_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    to_transfer_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    to_transfer_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_transfer_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_transfer_dst.image = context.base_texture_image;
+    to_transfer_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                          &to_transfer_dst);
+
+    VkBufferImageCopy copy_region{};
+    copy_region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy_region.imageExtent = {context.base_texture_width, context.base_texture_height, 1};
+    vkCmdCopyBufferToImage(command_buffer, staging.buffer, context.base_texture_image,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy_region);
+
+    VkImageMemoryBarrier to_shader_read{};
+    to_shader_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    to_shader_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    to_shader_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    to_shader_read.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    to_shader_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    to_shader_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_shader_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_shader_read.image = context.base_texture_image;
+    to_shader_read.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                          &to_shader_read);
+
+    vkEndCommandBuffer(command_buffer);
+    VkSubmitInfo submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &command_buffer;
+    result = vkQueueSubmit(upload_queue, 1, &submit, VK_NULL_HANDLE);
+    if (result == VK_SUCCESS) {
+        result = vkQueueWaitIdle(upload_queue);
+    }
+    vkDestroyCommandPool(device, command_pool, nullptr);
+    destroy_staging();
+    if (result != VK_SUCCESS) {
+        return result;
+    }
+
+    VkImageViewCreateInfo view_info{};
+    view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view_info.image = context.base_texture_image;
+    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+    view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    result = vkCreateImageView(device, &view_info, nullptr, &context.base_texture_view);
+    if (result != VK_SUCCESS) {
+        return result;
+    }
+
+    VkSamplerCreateInfo sampler_info{};
+    sampler_info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    sampler_info.magFilter = VK_FILTER_LINEAR;
+    sampler_info.minFilter = VK_FILTER_LINEAR;
+    sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sampler_info.anisotropyEnable = VK_FALSE;
+    sampler_info.maxAnisotropy = 1.0f;
+    sampler_info.compareEnable = VK_FALSE;
+    sampler_info.minLod = 0.0f;
+    sampler_info.maxLod = 0.0f;
+    return vkCreateSampler(device, &sampler_info, nullptr, &context.base_texture_sampler);
+}
+
 VkResult create_debug_render_context(VkPhysicalDevice physical_device, VkDevice device,
-                                     const SwapchainContext& swapchain,
-                                     const UploadedSceneBuffers& scene_buffers,
-                                     const UploadedBuffer& draw_list,
-                                     DebugRenderContext& context) {
+                                      VkQueue upload_queue, uint32_t upload_queue_family,
+                                      const SwapchainContext& swapchain,
+                                      const UploadedSceneBuffers& scene_buffers,
+                                      const UploadableScene& scene,
+                                      const UploadedBuffer& draw_list,
+                                      DebugRenderContext& context) {
 #if !MERIDIAN_HAS_SHADERC
     (void)physical_device;
     (void)device;
+    (void)upload_queue;
+    (void)upload_queue_family;
     (void)swapchain;
     (void)scene_buffers;
+    (void)scene;
     (void)draw_list;
     (void)context;
     return VK_ERROR_FEATURE_NOT_PRESENT;
 #else
-    VkResult result = create_depth_resources(physical_device, device, swapchain.extent, context);
+    VkResult result = create_base_texture_resources(physical_device, device, upload_queue,
+                                                     upload_queue_family, scene, context);
+    if (result != VK_SUCCESS) {
+        return result;
+    }
+    result = create_depth_resources(physical_device, device, swapchain.extent, context);
     if (result != VK_SUCCESS) {
         return result;
     }
@@ -321,8 +511,8 @@ VkResult create_debug_render_context(VkPhysicalDevice physical_device, VkDevice 
     color_blending.attachmentCount = 2;
     color_blending.pAttachments = color_blend_attachments;
 
-    // Descriptor set layout: 0=base SSBO, 1=lod SSBO, 2=frame UBO, 3=shadow sampler, 4=draw list SSBO
-    VkDescriptorSetLayoutBinding ds_bindings[5] = {};
+    // Descriptor set layout: 0=base SSBO, 1=lod SSBO, 2=frame UBO, 3=shadow sampler, 4=draw list SSBO, 5=base-color sampler
+    VkDescriptorSetLayoutBinding ds_bindings[6] = {};
     ds_bindings[0].binding = 0;
     ds_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     ds_bindings[0].descriptorCount = 1;
@@ -343,10 +533,14 @@ VkResult create_debug_render_context(VkPhysicalDevice physical_device, VkDevice 
     ds_bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     ds_bindings[4].descriptorCount = 1;
     ds_bindings[4].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    ds_bindings[5].binding = 5;
+    ds_bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    ds_bindings[5].descriptorCount = 1;
+    ds_bindings[5].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
     VkDescriptorSetLayoutCreateInfo set_layout_info{};
     set_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    set_layout_info.bindingCount = 5;
+    set_layout_info.bindingCount = 6;
     set_layout_info.pBindings = ds_bindings;
     result = vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr,
                                          &context.descriptor_set_layout);
@@ -417,7 +611,7 @@ VkResult create_debug_render_context(VkPhysicalDevice physical_device, VkDevice 
     pool_sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     pool_sizes[1].descriptorCount = 1;
     pool_sizes[2].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    pool_sizes[2].descriptorCount = 1;
+    pool_sizes[2].descriptorCount = 2;
 
     VkDescriptorPoolCreateInfo pool_info{};
     pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -453,7 +647,8 @@ VkResult create_debug_render_context(VkPhysicalDevice physical_device, VkDevice 
     buffer_infos[3].buffer = draw_list.buffer;
     buffer_infos[3].range = draw_list.size > 0 ? draw_list.size : VK_WHOLE_SIZE;
 
-    VkWriteDescriptorSet writes[4] = {};
+    VkDescriptorImageInfo image_info{};
+    VkWriteDescriptorSet writes[5] = {};
     uint32_t write_count = 0;
     if (scene_buffers.base_payload.buffer != VK_NULL_HANDLE) {
         writes[write_count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -487,6 +682,18 @@ VkResult create_debug_render_context(VkPhysicalDevice physical_device, VkDevice 
         writes[write_count].descriptorCount = 1;
         writes[write_count].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[write_count].pBufferInfo = &buffer_infos[3];
+        write_count++;
+    }
+    if (context.base_texture_view != VK_NULL_HANDLE && context.base_texture_sampler != VK_NULL_HANDLE) {
+        image_info.sampler = context.base_texture_sampler;
+        image_info.imageView = context.base_texture_view;
+        image_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        writes[write_count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[write_count].dstSet = context.descriptor_set;
+        writes[write_count].dstBinding = 5;
+        writes[write_count].descriptorCount = 1;
+        writes[write_count].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[write_count].pImageInfo = &image_info;
         write_count++;
     }
     vkUpdateDescriptorSets(device, write_count, writes, 0, nullptr);

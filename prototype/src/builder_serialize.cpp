@@ -122,6 +122,12 @@ ResourceSummary read_resource_summary(const std::filesystem::path& input_path) {
     if (!std::equal(std::begin(header.magic), std::end(header.magic), kMagic.begin())) {
         throw BuilderError("input file does not have a valid VGEO header: " + input_path.string());
     }
+    if (header.schema_version == 0 || header.schema_version > kSchemaVersion) {
+        throw BuilderError("unsupported VGEO schema version " + std::to_string(header.schema_version) +
+                           " (supported: 1.." + std::to_string(kSchemaVersion) + "): " +
+                           input_path.string());
+    }
+    const bool file_is_textured = (header.flags & kFileFlagTextured) != 0;
 
     ResourceSummary summary;
     summary.asset_id = std::string(summary_disk.asset_id);
@@ -140,6 +146,16 @@ ResourceSummary read_resource_summary(const std::filesystem::path& input_path) {
     summary.page_dependency_count = header.total_page_dependencies;
     summary.cluster_geometry_bytes = header.total_cluster_geometry_bytes;
     summary.lod_geometry_bytes = header.total_lod_geometry_bytes;
+    if (file_is_textured && header.schema_version >= 4) {
+        summary.texture_bytes = header.total_texture_bytes;
+        ResourceMetadata metadata{};
+        input.seekg(static_cast<std::streamoff>(header.metadata_offset), std::ios::beg);
+        input.read(reinterpret_cast<char*>(&metadata), sizeof(metadata));
+        if (input) {
+            summary.texture_width = metadata.texture_width;
+            summary.texture_height = metadata.texture_height;
+        }
+    }
     return summary;
 }
 
@@ -176,12 +192,15 @@ void write_resource(const VGeoResource& resource, const std::filesystem::path& o
         (resource.lod_group_base_runs.size() * sizeof(LodGroupBaseRunDisk));
     const uint64_t lod_geometry_payload_offset =
         cluster_geometry_payload_offset + resource.cluster_geometry_payload.size();
+    const uint64_t texture_payload_offset =
+        lod_geometry_payload_offset + resource.lod_geometry_payload.size();
 
     FileHeader header{};
     std::copy(kMagic.begin(), kMagic.end(), std::begin(header.magic));
     header.schema_version = kSchemaVersion;
     header.builder_version = kBuilderVersion;
-    header.flags = resource.has_fallback ? 0x1u : 0x0u;
+    header.flags = (resource.has_fallback ? kFileFlagHasFallback : 0x0u) |
+                   (!resource.texture_payload.empty() ? kFileFlagTextured : 0x0u);
     header.total_material_sections = static_cast<uint32_t>(resource.material_sections.size());
     header.total_hierarchy_nodes = static_cast<uint32_t>(resource.hierarchy_nodes.size());
     header.total_clusters = static_cast<uint32_t>(resource.clusters.size());
@@ -193,7 +212,7 @@ void write_resource(const VGeoResource& resource, const std::filesystem::path& o
     header.total_cluster_geometry_bytes = static_cast<uint32_t>(resource.cluster_geometry_payload.size());
     header.total_lod_geometry_bytes = static_cast<uint32_t>(resource.lod_geometry_payload.size());
     header.total_lod_group_base_runs = static_cast<uint32_t>(resource.lod_group_base_runs.size());
-    header.reserved0 = 0;
+    header.total_texture_bytes = static_cast<uint32_t>(resource.texture_payload.size());
     header.bounds = resource.bounds;
     header.metadata_offset = metadata_offset;
     header.material_table_offset = material_table_offset;
@@ -219,6 +238,9 @@ void write_resource(const VGeoResource& resource, const std::filesystem::path& o
     metadata.lod_group_base_run_table_offset = lod_group_base_run_table_offset;
     metadata.cluster_geometry_payload_offset = cluster_geometry_payload_offset;
     metadata.lod_geometry_payload_offset = lod_geometry_payload_offset;
+    metadata.texture_payload_offset = texture_payload_offset;
+    metadata.texture_width = resource.texture_width;
+    metadata.texture_height = resource.texture_height;
 
     SummaryBlockDisk summary_disk{};
     const auto asset_id_size = std::min(resource.asset_id.size(), sizeof(summary_disk.asset_id) - 1);
@@ -265,6 +287,10 @@ void write_resource(const VGeoResource& resource, const std::filesystem::path& o
         output.write(reinterpret_cast<const char*>(resource.lod_geometry_payload.data()),
                      static_cast<std::streamsize>(resource.lod_geometry_payload.size()));
     }
+    if (!resource.texture_payload.empty()) {
+        output.write(reinterpret_cast<const char*>(resource.texture_payload.data()),
+                     static_cast<std::streamsize>(resource.texture_payload.size()));
+    }
 }
 
 void write_summary(const VGeoResource& resource, const std::filesystem::path& output_path) {
@@ -293,6 +319,24 @@ void write_summary(const VGeoResource& resource, const std::filesystem::path& ou
     output << "page_dependencies=" << resource.page_dependencies.size() << '\n';
     output << "cluster_geometry_bytes=" << resource.cluster_geometry_payload.size() << '\n';
     output << "lod_geometry_bytes=" << resource.lod_geometry_payload.size() << '\n';
+    output << "texture=" << (resource.texture_payload.empty() ? "none" : "checker") << '\n';
+    output << "texture_width=" << resource.texture_width << '\n';
+    output << "texture_height=" << resource.texture_height << '\n';
+    output << "texture_bytes=" << resource.texture_payload.size() << '\n';
+    uint32_t uv_cluster_count = 0;
+    for (const ClusterRecord& cluster : resource.clusters) {
+        if ((cluster.flags & kClusterFlagHasUv) != 0) {
+            uv_cluster_count += 1;
+        }
+    }
+    uint32_t uv_lod_cluster_count = 0;
+    for (const LodClusterRecord& cluster : resource.lod_clusters) {
+        if ((cluster.flags & kClusterFlagHasUv) != 0) {
+            uv_lod_cluster_count += 1;
+        }
+    }
+    output << "uv_clusters=" << uv_cluster_count << '\n';
+    output << "uv_lod_clusters=" << uv_lod_cluster_count << '\n';
 
     for (size_t index = 0; index < resource.material_sections.size(); ++index) {
         output << "material[" << index << "]=" << resource.material_sections[index].name << '\n';

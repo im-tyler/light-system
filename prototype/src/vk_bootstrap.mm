@@ -742,6 +742,10 @@ void destroy_debug_render_context(VkDevice device, DebugRenderContext& context) 
     if (context.placeholder_depth_image != VK_NULL_HANDLE) vkDestroyImage(device, context.placeholder_depth_image, nullptr);
     if (context.placeholder_depth_memory != VK_NULL_HANDLE) vkFreeMemory(device, context.placeholder_depth_memory, nullptr);
     if (context.placeholder_sampler != VK_NULL_HANDLE) vkDestroySampler(device, context.placeholder_sampler, nullptr);
+    if (context.base_texture_sampler != VK_NULL_HANDLE) vkDestroySampler(device, context.base_texture_sampler, nullptr);
+    if (context.base_texture_view != VK_NULL_HANDLE) vkDestroyImageView(device, context.base_texture_view, nullptr);
+    if (context.base_texture_image != VK_NULL_HANDLE) vkDestroyImage(device, context.base_texture_image, nullptr);
+    if (context.base_texture_memory != VK_NULL_HANDLE) vkFreeMemory(device, context.base_texture_memory, nullptr);
     if (context.descriptor_pool != VK_NULL_HANDLE) {
         vkDestroyDescriptorPool(device, context.descriptor_pool, nullptr);
     }
@@ -1918,6 +1922,7 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
     TraversalSelection last_submitted_selection;
     std::filesystem::path temp_vgeo_path;
     bool framebuffer_resized = false;
+    bool texture_stats_reported = false;
     uint32_t gpu_draw_count = 0;
     bool has_draw_indirect_count = false;
     GpuProfiler gpu_profiler;
@@ -2381,11 +2386,75 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
         // Extent-dependent GPU resources: destroyed and recreated together on
         // swapchain out-of-date / window resize.
         const auto create_surface_resources = [&]() -> VkResult {
-            VkResult r = create_debug_render_context(selection.physical_device, device, swapchain,
-                                                     scene_buffers, compute_selection.draw_list,
+            VkResult r = create_debug_render_context(selection.physical_device, device,
+                                                     graphics_queue, selection.queues.graphics_family,
+                                                     swapchain, scene_buffers,
+                                                     report.uploadable_scene,
+                                                     compute_selection.draw_list,
                                                      debug_render);
             if (r != VK_SUCCESS) {
                 return r;
+            }
+            if (!texture_stats_reported) {
+                texture_stats_reported = true;
+                uint32_t uv_base_clusters = 0;
+                for (const GpuClusterRecord& cluster : report.uploadable_scene.clusters) {
+                    if ((cluster.flags & kClusterFlagHasUv) != 0) {
+                        uv_base_clusters += 1;
+                    }
+                }
+                uint32_t uv_lod_clusters = 0;
+                for (const GpuLodClusterRecord& cluster : report.uploadable_scene.lod_clusters) {
+                    if ((cluster.flags & kClusterFlagHasUv) != 0) {
+                        uv_lod_clusters += 1;
+                    }
+                }
+                float uv_min[2] = {0.0f, 0.0f};
+                float uv_max[2] = {0.0f, 0.0f};
+                bool has_uv_range = false;
+                const auto accumulate_uv_range =
+                    [&](const std::vector<std::byte>& payload, uint32_t offset, uint32_t vertex_count) {
+                        if (payload.empty()) {
+                            return;
+                        }
+                        const uint32_t uv_base = offset + 8u + vertex_count * 24u;
+                        if (uv_base + vertex_count * 8u > payload.size()) {
+                            return;
+                        }
+                        for (uint32_t v = 0; v < vertex_count; ++v) {
+                            float uv[2];
+                            std::memcpy(uv, payload.data() + uv_base + v * 8u, sizeof(uv));
+                            if (!has_uv_range) {
+                                uv_min[0] = uv_max[0] = uv[0];
+                                uv_min[1] = uv_max[1] = uv[1];
+                                has_uv_range = true;
+                            } else {
+                                uv_min[0] = std::min(uv_min[0], uv[0]);
+                                uv_max[0] = std::max(uv_max[0], uv[0]);
+                                uv_min[1] = std::min(uv_min[1], uv[1]);
+                                uv_max[1] = std::max(uv_max[1], uv[1]);
+                            }
+                        }
+                    };
+                for (const GpuClusterRecord& cluster : report.uploadable_scene.clusters) {
+                    if ((cluster.flags & kClusterFlagHasUv) != 0) {
+                        accumulate_uv_range(report.uploadable_scene.base_payload,
+                                            cluster.payload_offset, cluster.local_vertex_count);
+                    }
+                }
+                for (const GpuLodClusterRecord& cluster : report.uploadable_scene.lod_clusters) {
+                    if ((cluster.flags & kClusterFlagHasUv) != 0) {
+                        accumulate_uv_range(report.uploadable_scene.lod_payload,
+                                            cluster.payload_offset, cluster.local_vertex_count);
+                    }
+                }
+                std::fprintf(stderr,
+                             "MERIDIAN_TEXTURE: %ux%u RGBA8 (%s), uv_clusters=%u+%u, "
+                             "payload_uv_range=[%.3f,%.3f]..[%.3f,%.3f]%s\n",
+                             debug_render.base_texture_width, debug_render.base_texture_height,
+                             debug_render.base_texture_is_placeholder ? "placeholder" : "embedded",
+                             uv_base_clusters, uv_lod_clusters, uv_min[0], uv_min[1], uv_max[0],
+                             uv_max[1], has_uv_range ? "" : " (none)");
             }
             r = create_hzb_context(selection.physical_device, device,
                                    swapchain.extent.width, swapchain.extent.height,
@@ -2954,7 +3023,8 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                     cascade_entry.draw_instance_count = 1u;
                     cascade_entry.draw_first_vertex = 0u;
                     cascade_entry.cluster_index = ci;
-                    cascade_entry.geometry_kind = 0u;
+                    cascade_entry.geometry_kind =
+                        0u | ((c.flags & kClusterFlagHasUv) != 0 ? kGeometryKindHasUv : 0u);
                     cascade_entry.payload_offset = c.payload_offset;
                     cascade_entry.local_vertex_count = c.local_vertex_count;
                     push_to_cascades(cascade_entry, c.bounds_min.data(), c.bounds_max.data());
@@ -2993,7 +3063,8 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                     cascade_entry.draw_instance_count = 1u;
                     cascade_entry.draw_first_vertex = 0u;
                     cascade_entry.cluster_index = ci;
-                    cascade_entry.geometry_kind = 1u;
+                    cascade_entry.geometry_kind =
+                        1u | ((c.flags & kClusterFlagHasUv) != 0 ? kGeometryKindHasUv : 0u);
                     cascade_entry.payload_offset = c.payload_offset;
                     cascade_entry.local_vertex_count = c.local_vertex_count;
                     push_to_cascades(cascade_entry, c.bounds_min.data(), c.bounds_max.data());

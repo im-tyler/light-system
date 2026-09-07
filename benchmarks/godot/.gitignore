@@ -1,0 +1,6 @@
+# harness runtime artifacts
+results/
+# godot editor cache
+project/.godot/
+# staged copies of benchmark assets already tracked elsewhere in the repo
+project/assets/

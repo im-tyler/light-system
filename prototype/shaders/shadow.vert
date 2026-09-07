@@ -33,12 +33,14 @@ uint read_u32(uint byte_offset, uint geometry_kind) {
 
 void main() {
     DrawEntry entry = draws[gl_InstanceIndex];
+    uint domain = entry.geometry_kind & 0xffffu;
+    bool has_uv = (entry.geometry_kind & 0x10000u) != 0u;
     uint pos_base = entry.payload_offset + 8u;
-    uint idx_base = pos_base + entry.local_vertex_count * 24u;
-    uint local_idx = read_u32(idx_base + gl_VertexIndex * 4u, entry.geometry_kind);
+    uint idx_base = pos_base + entry.local_vertex_count * (has_uv ? 32u : 24u);
+    uint local_idx = read_u32(idx_base + gl_VertexIndex * 4u, domain);
     uint addr = pos_base + local_idx * 12u;
-    vec3 pos = vec3(uintBitsToFloat(read_u32(addr, entry.geometry_kind)),
-                    uintBitsToFloat(read_u32(addr+4u, entry.geometry_kind)),
-                    uintBitsToFloat(read_u32(addr+8u, entry.geometry_kind)));
+    vec3 pos = vec3(uintBitsToFloat(read_u32(addr, domain)),
+                    uintBitsToFloat(read_u32(addr+4u, domain)),
+                    uintBitsToFloat(read_u32(addr+8u, domain)));
     gl_Position = frame.light_vp[push.cascade_index] * vec4(pos, 1.0);
 }
