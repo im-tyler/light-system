@@ -34,9 +34,9 @@ layout(set = 0, binding = 10) buffer DrawCount { uint draw_count; };
 
 // Word strides per struct (sizeof / 4)
 const uint NODE_W = 19;
-const uint CLUSTER_W = 24;
+const uint CLUSTER_W = 28;
 const uint LOD_GROUP_W = 16;
-const uint LOD_CLUSTER_W = 24;
+const uint LOD_CLUSTER_W = 28;
 const uint PAGE_W = 4;
 const uint INSTANCE_W = 28;
 
@@ -56,14 +56,37 @@ bool is_base_cluster_backfacing(uint ci) {
     // Degenerate cone (meshoptimizer uses cutoff >= 1.0): never cull
     if (cone_cutoff >= 1.0)
         return false;
-    // Compute cluster center from bounds
-    vec3 cluster_center = vec3(
-        (uintBitsToFloat(cluster_data[b + 12u]) + uintBitsToFloat(cluster_data[b + 16u])) * 0.5,
-        (uintBitsToFloat(cluster_data[b + 13u]) + uintBitsToFloat(cluster_data[b + 17u])) * 0.5,
-        (uintBitsToFloat(cluster_data[b + 14u]) + uintBitsToFloat(cluster_data[b + 18u])) * 0.5
+    // Radius-compensated cone test (meshopt canonical, sphere formulation):
+    // cull when dot(center - cam, axis) >= cutoff * length + radius. The
+    // bounding sphere lives right after the cone in the record.
+    vec3 sphere_center = vec3(
+        uintBitsToFloat(cluster_data[b + 24u]),
+        uintBitsToFloat(cluster_data[b + 25u]),
+        uintBitsToFloat(cluster_data[b + 26u])
     );
-    vec3 view_dir = normalize(cluster_center - vec3(params.camera_pos_x, params.camera_pos_y, params.camera_pos_z));
-    return dot(view_dir, cone_axis) < -cone_cutoff;
+    float sphere_radius = uintBitsToFloat(cluster_data[b + 27u]);
+    vec3 view = sphere_center - vec3(params.camera_pos_x, params.camera_pos_y, params.camera_pos_z);
+    return dot(view, cone_axis) >= cone_cutoff * length(view) + sphere_radius;
+}
+
+bool is_lod_cluster_backfacing(uint ci) {
+    uint b = ci * LOD_CLUSTER_W;
+    vec3 cone_axis = vec3(
+        uintBitsToFloat(lod_cluster_data[b + 20u]),
+        uintBitsToFloat(lod_cluster_data[b + 21u]),
+        uintBitsToFloat(lod_cluster_data[b + 22u])
+    );
+    float cone_cutoff = uintBitsToFloat(lod_cluster_data[b + 23u]);
+    if (cone_cutoff >= 1.0)
+        return false;
+    vec3 sphere_center = vec3(
+        uintBitsToFloat(lod_cluster_data[b + 24u]),
+        uintBitsToFloat(lod_cluster_data[b + 25u]),
+        uintBitsToFloat(lod_cluster_data[b + 26u])
+    );
+    float sphere_radius = uintBitsToFloat(lod_cluster_data[b + 27u]);
+    vec3 view = sphere_center - vec3(params.camera_pos_x, params.camera_pos_y, params.camera_pos_z);
+    return dot(view, cone_axis) >= cone_cutoff * length(view) + sphere_radius;
 }
 
 void emit_base(uint ci) {
@@ -103,6 +126,7 @@ bool try_lod_group(uint gi) {
         if (!is_page_resident(page)) return false;
     }
     for (uint i = 0u; i < count; i++) {
+        if (is_lod_cluster_backfacing(first + i)) continue;
         emit_lod(first + i);
     }
     return true;

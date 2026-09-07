@@ -80,6 +80,10 @@ ClusterRecord append_meshlet_payload(const MeshData& mesh, const meshopt_Meshlet
     cluster.normal_cone_axis[1] = meshlet_bounds.cone_axis[1];
     cluster.normal_cone_axis[2] = meshlet_bounds.cone_axis[2];
     cluster.normal_cone_axis[3] = meshlet_bounds.cone_cutoff;
+    cluster.cull_sphere[0] = meshlet_bounds.center[0];
+    cluster.cull_sphere[1] = meshlet_bounds.center[1];
+    cluster.cull_sphere[2] = meshlet_bounds.center[2];
+    cluster.cull_sphere[3] = meshlet_bounds.radius;
     cluster.local_error = meshlet_bounds.radius;
     cluster.material_section_index = material_section_index;
     if (has_uvs) {
@@ -651,6 +655,10 @@ LodClusterRecord append_lod_cluster_payload(const MeshData& mesh, const unsigned
     cluster.normal_cone_axis[1] = cone_bounds.cone_axis[1];
     cluster.normal_cone_axis[2] = cone_bounds.cone_axis[2];
     cluster.normal_cone_axis[3] = cone_bounds.cone_cutoff;
+    cluster.cull_sphere[0] = cone_bounds.center[0];
+    cluster.cull_sphere[1] = cone_bounds.center[1];
+    cluster.cull_sphere[2] = cone_bounds.center[2];
+    cluster.cull_sphere[3] = cone_bounds.radius;
     cluster.local_error = cluster_bounds.error;
     cluster.material_section_index = material_section_index;
     if (has_uvs) {

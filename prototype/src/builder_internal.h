@@ -30,7 +30,10 @@ namespace meridian::detail {
 constexpr std::array<char, 4> kMagic = {'V', 'G', 'E', 'O'};
 // v4: optional per-vertex UVs in cluster payloads (kClusterFlagHasUv) and an
 // embedded RGBA8 texture payload domain (header flag kFileFlagTextured).
-constexpr uint32_t kSchemaVersion = 4;
+// v5: cull_sphere[4] appended to cluster + LOD-cluster records (bounding
+// sphere for the radius-compensated normal-cone cull). Readers loading v3/v4
+// files synthesize the sphere from the cluster AABB.
+constexpr uint32_t kSchemaVersion = 5;
 constexpr uint32_t kBuilderVersion = 2;
 constexpr uint32_t kPageFlagLodPayload = 1u << 0;
 constexpr uint32_t kFileFlagHasFallback = 1u << 0;
@@ -106,6 +109,7 @@ struct ClusterRecordDisk {
     uint32_t page_index;
     Bounds3f bounds;
     float normal_cone_axis[4];
+    float cull_sphere[4];
     float local_error;
     uint32_t material_section_index;
     uint32_t flags;
@@ -135,6 +139,7 @@ struct LodClusterRecordDisk {
     uint32_t page_index;
     Bounds3f bounds;
     float normal_cone_axis[4];
+    float cull_sphere[4];
     float local_error;
     uint32_t material_section_index;
     uint32_t flags;

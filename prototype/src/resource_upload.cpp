@@ -77,6 +77,8 @@ UploadableScene build_uploadable_scene(const VGeoResource& resource) {
         record.bounds_max = to_float4(cluster.bounds.max);
         record.normal_cone = {cluster.normal_cone_axis[0], cluster.normal_cone_axis[1],
                               cluster.normal_cone_axis[2], cluster.normal_cone_axis[3]};
+        record.cull_sphere = {cluster.cull_sphere[0], cluster.cull_sphere[1],
+                              cluster.cull_sphere[2], cluster.cull_sphere[3]};
         scene.clusters.push_back(record);
     }
 
@@ -113,6 +115,8 @@ UploadableScene build_uploadable_scene(const VGeoResource& resource) {
         record.bounds_max = to_float4(cluster.bounds.max);
         record.normal_cone = {cluster.normal_cone_axis[0], cluster.normal_cone_axis[1],
                               cluster.normal_cone_axis[2], cluster.normal_cone_axis[3]};
+        record.cull_sphere = {cluster.cull_sphere[0], cluster.cull_sphere[1],
+                              cluster.cull_sphere[2], cluster.cull_sphere[3]};
         scene.lod_clusters.push_back(record);
     }
 

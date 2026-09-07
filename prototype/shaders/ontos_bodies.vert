@@ -2,6 +2,7 @@
 
 layout(push_constant) uniform ViewParams {
     vec4 view;  // xy = world->NDC scale, zw = NDC translate
+    float z;    // NDC depth for this pipeline (grid under bodies)
 } params;
 
 layout(location = 0) in vec2 in_corner;
@@ -18,5 +19,5 @@ void main() {
     frag_corner = in_corner;
     frag_color = in_color;
     frag_shape = in_shape.y;
-    gl_Position = vec4(world * params.view.xy + params.view.zw, 0.0, 1.0);
+    gl_Position = vec4(world * params.view.xy + params.view.zw, params.z, 1.0);
 }

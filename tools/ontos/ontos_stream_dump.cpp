@@ -344,6 +344,18 @@ struct GFit {
   u64 t0 = 0;
 };
 
+// Section 19 collapsed-region state: totals frozen at collapse, membership,
+// and the splitmix64 state left after the jitter draws (the expansion spread
+// continues drawing from it). Jitter offsets live on the world (indexed by
+// body id).
+struct GCollapsed {
+  bool active = false;
+  u64 n = 0;
+  f64 mass = 0, com_x = 0, com_y = 0, pxt = 0, pyt = 0, vcx = 0, vcy = 0, energy = 0;
+  u64 jitter_state = 0;
+  std::vector<std::size_t> members;
+};
+
 static int g_region_at(f64 x, f64 y) {
   if (x < 0.0 || x >= 128.0 || y < 0.0 || y >= 128.0) {
     return G_UNMANAGED;
@@ -445,13 +457,22 @@ struct GravityWorld {
   std::vector<GBody> bodies;
   std::vector<GFit> coarse;
   std::vector<u8> body_region;
-  bool region_coarse[4] = {false, false, false, false};
+  // Per-body level byte: 0 ephemeris-coarse, 1 fine, 2 collapsed.
+  std::vector<u8> blevel;
+  // Per-region level byte: 0 coarse (ephemeris), 1 fine, 2 collapsed.
+  u8 rstate[4] = {1, 1, 1, 1};
+  GCollapsed collapsed[4];
+  // Frozen section 19 jitter offsets per body (valid while blevel == 2).
+  std::vector<f64> body_jx, body_jy;
 
   explicit GravityWorld(u64 s, u32 count) : seed(s) {
     SplitMix64 rng(s);
     bodies.resize(count);
     coarse.resize(count);
     body_region.assign(count, G_UNMANAGED);
+    blevel.assign(count, 1);
+    body_jx.assign(count, 0.0);
+    body_jy.assign(count, 0.0);
     for (u32 i = 0; i < count; ++i) {
       const u64 u0 = rng.draw();
       const u64 u1 = rng.draw();
@@ -478,10 +499,18 @@ struct GravityWorld {
     }
   }
 
-  bool is_coarse(std::size_t i) const { return body_region[i] != G_UNMANAGED; }
+  bool is_coarse(std::size_t i) const { return blevel[i] == 0; }
 
   GBody state_at(std::size_t i, u64 t) const {
     GBody b = bodies[i];
+    if (blevel[i] == 2) {
+      const GCollapsed &c = collapsed[body_region[i]];
+      b.x = c.com_x + body_jx[i];
+      b.y = c.com_y + body_jy[i];
+      b.vx = c.vcx;
+      b.vy = c.vcy;
+      return b;
+    }
     if (is_coarse(i)) {
       const GFit &fit = coarse[i];
       const f64 s = -1.0 + static_cast<f64>(t - fit.t0) / 16.0;
@@ -573,24 +602,141 @@ struct GravityWorld {
         members.push_back(i);
       }
     }
-    region_coarse[region] = true;
+    rstate[region] = 0;
     if (members.empty()) {
       return;
     }
     fit_members(members, t0);
     for (std::size_t i : members) {
       body_region[i] = static_cast<u8>(region);
+      blevel[i] = 0;
     }
   }
 
-  void promote(int region, u64 t) {
+  // Section 19 collapse: materialize ephemeris evaluations at the boundary
+  // tick, select in-box bodies, freeze the totals (fixed id-order sums), and
+  // draw the frozen jitter from a re-seeded generator. Returns the computed
+  // totals for record validation.
+  GCollapsed collapse(int region, u64 t) {
+    const f64 x0 = static_cast<f64>(region % 2) * 64.0;
+    const f64 y0 = static_cast<f64>(region / 2) * 64.0;
+    if (rstate[region] != 1) {
+      // Materialize any tracked state (ephemeris polynomial evaluations or
+      // synthesized collapsed states) at the boundary tick first.
+      for (std::size_t i = 0; i < bodies.size(); ++i) {
+        if (body_region[i] == region && blevel[i] != 1) {
+          bodies[i] = state_at(i, t);
+          body_region[i] = G_UNMANAGED;
+          blevel[i] = 1;
+        }
+      }
+      collapsed[region] = GCollapsed{};
+    }
+    GCollapsed c;
     for (std::size_t i = 0; i < bodies.size(); ++i) {
-      if (is_coarse(i) && body_region[i] == region) {
-        bodies[i] = state_at(i, t);
-        body_region[i] = G_UNMANAGED;
+      if (bodies[i].x >= x0 && bodies[i].x < x0 + 64.0 && bodies[i].y >= y0 &&
+          bodies[i].y < y0 + 64.0) {
+        c.members.push_back(i);
       }
     }
-    region_coarse[region] = false;
+    c.n = c.members.size();
+    f64 sum_mx = 0.0;
+    f64 sum_my = 0.0;
+    f64 ke = 0.0;
+    for (std::size_t i : c.members) {
+      const GBody &b = bodies[i];
+      c.mass += b.mass;
+      sum_mx += b.mass * b.x;
+      sum_my += b.mass * b.y;
+      c.pxt += b.mass * b.vx;
+      c.pyt += b.mass * b.vy;
+      ke += 0.5 * b.mass * (b.vx * b.vx + b.vy * b.vy);
+    }
+    f64 pe = 0.0;
+    for (std::size_t a = 0; a < c.members.size(); ++a) {
+      for (std::size_t b = a + 1; b < c.members.size(); ++b) {
+        const GBody &ba = bodies[c.members[a]];
+        const GBody &bb = bodies[c.members[b]];
+        const f64 dx = bb.x - ba.x;
+        const f64 dy = bb.y - ba.y;
+        const f64 s2 = dx * dx + dy * dy + G_EPS2;
+        pe -= ba.mass * bb.mass / std::sqrt(s2);
+      }
+    }
+    c.energy = ke + pe;
+    if (c.n > 0) {
+      c.com_x = sum_mx / c.mass;
+      c.com_y = sum_my / c.mass;
+      c.vcx = c.pxt / c.mass;
+      c.vcy = c.pyt / c.mass;
+    }
+    SplitMix64 jitter(seed ^ (static_cast<u64>(region) * 0x9E3779B97F4A7C15ULL));
+    for (std::size_t i : c.members) {
+      const u64 ux = jitter.draw();
+      const u64 uy = jitter.draw();
+      body_jx[i] = (static_cast<f64>(ux) * G_TWO_POW_NEG64 - 0.5) * 8.0;
+      body_jy[i] = (static_cast<f64>(uy) * G_TWO_POW_NEG64 - 0.5) * 8.0;
+    }
+    c.jitter_state = jitter.state;
+    for (std::size_t i : c.members) {
+      body_region[i] = static_cast<u8>(region);
+      blevel[i] = 2;
+    }
+    rstate[region] = 2;
+    c.active = true;
+    collapsed[region] = c;
+    return c;
+  }
+
+  // Section 19 expansion: positions from the frozen jitter, velocities
+  // v_com + spread with the last body absorbing the exact momentum
+  // residual (bit-identical per the spec).
+  void expand(int region) {
+    GCollapsed &c = collapsed[region];
+    SplitMix64 jitter(c.jitter_state);
+    f64 sum_mv_x = 0.0;
+    f64 sum_mv_y = 0.0;
+    f64 last_mass = 0.0;
+    for (std::size_t a = 0; a < c.members.size(); ++a) {
+      const std::size_t i = c.members[a];
+      GBody &b = bodies[i];
+      b.x = c.com_x + body_jx[i];
+      b.y = c.com_y + body_jy[i];
+      if (a + 1 < c.members.size()) {
+        const u64 ux = jitter.draw();
+        const u64 uy = jitter.draw();
+        b.vx = c.vcx + (static_cast<f64>(ux) * G_TWO_POW_NEG64 - 0.5) * 0.1;
+        b.vy = c.vcy + (static_cast<f64>(uy) * G_TWO_POW_NEG64 - 0.5) * 0.1;
+        sum_mv_x += b.mass * b.vx;
+        sum_mv_y += b.mass * b.vy;
+      } else {
+        last_mass = b.mass;
+      }
+      blevel[i] = 1;
+      body_region[i] = G_UNMANAGED;
+    }
+    if (!c.members.empty()) {
+      const std::size_t last = c.members.back();
+      bodies[last].vx = (c.pxt - sum_mv_x) / last_mass;
+      bodies[last].vy = (c.pyt - sum_mv_y) / last_mass;
+    }
+    c = GCollapsed{};
+    rstate[region] = 1;
+  }
+
+  void promote(int region, u64 t) {
+    if (rstate[region] == 2) {
+      expand(region);
+      return;
+    }
+    for (std::size_t i = 0; i < bodies.size(); ++i) {
+      if (blevel[i] == 0 && body_region[i] == region) {
+        bodies[i] = state_at(i, t);
+        body_region[i] = G_UNMANAGED;
+        blevel[i] = 1;
+      }
+    }
+    rstate[region] = 1;
   }
 
   void refit(int region, u64 t) {
@@ -598,7 +744,7 @@ struct GravityWorld {
     const f64 y0 = static_cast<f64>(region / 2) * 64.0;
     std::vector<std::size_t> members;
     for (std::size_t i = 0; i < bodies.size(); ++i) {
-      if (is_coarse(i) && body_region[i] == region) {
+      if (blevel[i] == 0 && body_region[i] == region) {
         members.push_back(i);
       }
     }
@@ -612,19 +758,28 @@ struct GravityWorld {
         keep.push_back(i);
       } else {
         body_region[i] = G_UNMANAGED;
+        blevel[i] = 1;
       }
     }
     if (keep.empty()) {
-      region_coarse[region] = false;
+      rstate[region] = 1;
       return;
     }
     fit_members(keep, t);
     for (std::size_t i : keep) {
       body_region[i] = static_cast<u8>(region);
+      blevel[i] = 0;
     }
   }
 
-  void accel_split(const std::vector<GBody> &view, const std::vector<char> &coarse_flag,
+  // view holds each body's state at the tick being entered; flags carry the
+  // per-body level byte (0 ephemeris-coarse, 1 fine, 2 collapsed). Pair
+  // rules: fine-fine -> symmetric ff; fine x ephemeris -> one-sided fc;
+  // anything touching a collapsed body -> skipped (the region acts as a
+  // monopole instead). After all pairs, fine bodies accumulate the
+  // collapsed-region monopoles in region index order (section 19), into the
+  // fc arrays (one-sided, ledger-tracked like ephemeris pairs).
+  void accel_split(const std::vector<GBody> &view, const std::vector<u8> &flags,
                    std::vector<f64> &ax_ff, std::vector<f64> &ay_ff, std::vector<f64> &ax_fc,
                    std::vector<f64> &ay_fc) const {
     const std::size_t n = view.size();
@@ -640,18 +795,35 @@ struct GravityWorld {
         const f64 inv3 = 1.0 / (s2 * std::sqrt(s2));
         const f64 fx = G_CONST * inv3 * dx;
         const f64 fy = G_CONST * inv3 * dy;
-        if (!coarse_flag[i] && !coarse_flag[j]) {
+        if (flags[i] == 1 && flags[j] == 1) {
           ax_ff[i] += view[j].mass * fx;
           ay_ff[i] += view[j].mass * fy;
           ax_ff[j] -= view[i].mass * fx;
           ay_ff[j] -= view[i].mass * fy;
-        } else if (!coarse_flag[i] && coarse_flag[j]) {
+        } else if (flags[i] == 1 && flags[j] == 0) {
           ax_fc[i] += view[j].mass * fx;
           ay_fc[i] += view[j].mass * fy;
-        } else if (coarse_flag[i] && !coarse_flag[j]) {
+        } else if (flags[i] == 0 && flags[j] == 1) {
           ax_fc[j] -= view[i].mass * fx;
           ay_fc[j] -= view[i].mass * fy;
         }
+      }
+    }
+    for (int region = 0; region < 4; ++region) {
+      const GCollapsed &c = collapsed[region];
+      if (!c.active || c.n == 0) {
+        continue;
+      }
+      for (std::size_t i = 0; i < n; ++i) {
+        if (flags[i] != 1) {
+          continue;
+        }
+        const f64 dx = c.com_x - view[i].x;
+        const f64 dy = c.com_y - view[i].y;
+        const f64 s2 = dx * dx + dy * dy + G_EPS2;
+        const f64 inv3 = 1.0 / (s2 * std::sqrt(s2));
+        ax_fc[i] += c.mass * (G_CONST * inv3 * dx);
+        ay_fc[i] += c.mass * (G_CONST * inv3 * dy);
       }
     }
   }
@@ -659,12 +831,12 @@ struct GravityWorld {
   void step() {
     const u64 entering = tick + 1;
     for (int region = 0; region < 4; ++region) {
-      if (!region_coarse[region]) {
+      if (rstate[region] != 0) {
         continue;
       }
       bool ended = false;
       for (std::size_t i = 0; i < bodies.size(); ++i) {
-        if (body_region[i] == region && is_coarse(i) && entering == coarse[i].t0 + G_WINDOW) {
+        if (body_region[i] == region && blevel[i] == 0 && entering == coarse[i].t0 + G_WINDOW) {
           ended = true;
           break;
         }
@@ -674,9 +846,9 @@ struct GravityWorld {
       }
     }
     const std::size_t n = bodies.size();
-    std::vector<char> cflag(n);
+    std::vector<u8> cflag(n);
     for (std::size_t i = 0; i < n; ++i) {
-      cflag[i] = is_coarse(i) ? 1 : 0;
+      cflag[i] = blevel[i];
     }
     const f64 half = G_DT * 0.5;
     std::vector<GBody> view(n);
@@ -686,13 +858,13 @@ struct GravityWorld {
     std::vector<f64> ax_ff, ay_ff, ax_fc, ay_fc;
     accel_split(view, cflag, ax_ff, ay_ff, ax_fc, ay_fc);
     for (std::size_t i = 0; i < n; ++i) {
-      if (!cflag[i]) {
+      if (cflag[i] == 1) {
         bodies[i].vx += ax_ff[i] * half;
         bodies[i].vy += ay_ff[i] * half;
       }
     }
     for (std::size_t i = 0; i < n; ++i) {
-      if (!cflag[i]) {
+      if (cflag[i] == 1) {
         bodies[i].vx += ax_fc[i] * half;
         bodies[i].vy += ay_fc[i] * half;
         px += bodies[i].mass * (ax_fc[i] * half);
@@ -700,7 +872,7 @@ struct GravityWorld {
       }
     }
     for (std::size_t i = 0; i < n; ++i) {
-      if (!cflag[i]) {
+      if (cflag[i] == 1) {
         bodies[i].x += bodies[i].vx * G_DT;
         bodies[i].y += bodies[i].vy * G_DT;
       }
@@ -710,13 +882,13 @@ struct GravityWorld {
     }
     accel_split(view, cflag, ax_ff, ay_ff, ax_fc, ay_fc);
     for (std::size_t i = 0; i < n; ++i) {
-      if (!cflag[i]) {
+      if (cflag[i] == 1) {
         bodies[i].vx += ax_ff[i] * half;
         bodies[i].vy += ay_ff[i] * half;
       }
     }
     for (std::size_t i = 0; i < n; ++i) {
-      if (!cflag[i]) {
+      if (cflag[i] == 1) {
         bodies[i].vx += ax_fc[i] * half;
         bodies[i].vy += ay_fc[i] * half;
         px += bodies[i].mass * (ax_fc[i] * half);
@@ -737,10 +909,12 @@ struct GravityWorld {
     mass = 0.0;
     f64 ke = 0.0;
     for (const GBody &b : view) {
-      if (is_coarse(b.id)) {
-        ++coarse_n;
-      } else {
+      if (blevel[b.id] == 1) {
         ++fine;
+      } else {
+        // Ephemeris-coarse and collapsed both count as coarse
+        // (section 19 clarification: fine + coarse = N).
+        ++coarse_n;
       }
       mass += b.mass;
       ke += 0.5 * b.mass * (b.vx * b.vx + b.vy * b.vy);
@@ -773,19 +947,19 @@ struct GravityWorld {
     put_u64le(out + 28, bits);
     std::memcpy(&bits, &b.mass, 8);
     put_u64le(out + 36, bits);
-    out[44] = is_coarse(i) ? 0 : 1;
+    out[44] = blevel[i];
   }
 
   void emitted(std::size_t i, u8 &region, u8 &level, GBody &b) const {
     b = state_at(i, tick);
-    level = is_coarse(i) ? 0 : 1;
-    region = is_coarse(i) ? body_region[i] : static_cast<u8>(g_region_at(b.x, b.y));
+    level = blevel[i];
+    region = blevel[i] == 1 ? static_cast<u8>(g_region_at(b.x, b.y)) : body_region[i];
   }
 
   u64 region_hash(int region, u8 &level, u64 &pop) const {
     std::vector<std::size_t> members;
     for (std::size_t i = 0; i < bodies.size(); ++i) {
-      if (is_coarse(i)) {
+      if (blevel[i] != 1) {
         if (body_region[i] == region) {
           members.push_back(i);
         }
@@ -796,7 +970,7 @@ struct GravityWorld {
         }
       }
     }
-    level = region_coarse[region] ? 0 : 1;
+    level = rstate[region];
     pop = members.size();
     std::vector<u8> buf;
     buf.push_back(level);
@@ -847,13 +1021,14 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count) {
   GravityWorld reference(seed, body_count);
   struct Pending {
     int region;
-    bool to_coarse;
+    u8 level;
   };
   std::vector<Pending> pending;
   u64 ticks_seen = 0;
   u64 totals_seen = 0;
   u64 states_seen = 0;
   u64 bodies_seen = 0;
+  u64 collapses_seen = 0;
   f64 max_pos_dev = 0.0;
   u64 last_tick = 0;
   std::size_t off = 20;
@@ -869,9 +1044,12 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count) {
           return 2;
         }
         for (const Pending &p : pending) {
-          if (p.to_coarse) {
-            world.demote(p.region, world.tick + 1);
-          } else {
+          if (p.level == 0) {
+            // Demote on a collapsed region is a no-op (section 19).
+            if (world.rstate[p.region] != 2) {
+              world.demote(p.region, world.tick + 1);
+            }
+          } else if (p.level == 1) {
             world.promote(p.region, world.tick + 1);
           }
         }
@@ -931,14 +1109,18 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count) {
           return 2;
         }
         const u8 lv = data[off++];
-        if (rx > 1 || ry > 1 || lv > 1) {
+        if (rx > 1 || ry > 1 || lv > 2) {
           std::fprintf(stderr,
                        "error: bad RegionLevel (rx=%" PRIu32 " ry=%" PRIu32 " level=%" PRIu8
                        ") at offset %zu\n",
                        rx, ry, lv, rec_start);
           return 2;
         }
-        pending.push_back({static_cast<int>(ry) * 2 + static_cast<int>(rx), lv == 0});
+        // Level 2 (collapse) is applied when its RegionCollapsed record
+        // arrives; level 0/1 queue for the next tick boundary.
+        if (lv != 2) {
+          pending.push_back({static_cast<int>(ry) * 2 + static_cast<int>(rx), lv});
+        }
       } break;
       case 5: {
         u64 t = 0;
@@ -992,7 +1174,7 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count) {
           std::fprintf(stderr, "error: truncated BodyState at offset %zu\n", rec_start);
           return 2;
         }
-        if (lv > 1 || bid >= world.bodies.size()) {
+        if (lv > 2 || bid >= world.bodies.size()) {
           std::fprintf(stderr, "error: bad BodyState (id=%" PRIu32 " level=%" PRIu8
                                ") at offset %zu\n",
                        bid, lv, rec_start);
@@ -1035,7 +1217,47 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count) {
                        "MISMATCH: tick %" PRIu64 " totals stream=(fine=%" PRIu64
                        " coarse=%" PRIu64 " px=%.17g E=%.17g) computed=(fine=%" PRIu64
                        " coarse=%" PRIu64 " px=%.17g E=%.17g)\n",
-                       t, fine, cn, tpx, energy, w_fine, w_cn, w_px, w_energy);
+                        t, fine, cn, tpx, energy, w_fine, w_cn, w_px, w_energy);
+          return 1;
+        }
+      } break;
+      case 8: {
+        // Section 19 RegionCollapsed: apply the collapse at this boundary
+        // and validate the record's frozen totals bit-for-bit.
+        u64 t = 0;
+        u32 rx = 0;
+        u32 ry = 0;
+        u64 n = 0;
+        f64 mass = 0, com_x = 0, com_y = 0, pxt = 0, pyt = 0, energy = 0;
+        if (!take_u64(data, off, t) || !take_u32(data, off, rx) || !take_u32(data, off, ry) ||
+            !take_u64(data, off, n) || !take_f64(data, off, mass) ||
+            !take_f64(data, off, com_x) || !take_f64(data, off, com_y) ||
+            !take_f64(data, off, pxt) || !take_f64(data, off, pyt) ||
+            !take_f64(data, off, energy)) {
+          std::fprintf(stderr, "error: truncated RegionCollapsed at offset %zu\n", rec_start);
+          return 2;
+        }
+        if (rx > 1 || ry > 1) {
+          std::fprintf(stderr,
+                       "error: bad RegionCollapsed region (%" PRIu32 ",%" PRIu32
+                       ") at offset %zu\n",
+                       rx, ry, rec_start);
+          return 2;
+        }
+        ++collapses_seen;
+        const int region = static_cast<int>(ry) * 2 + static_cast<int>(rx);
+        const GCollapsed c = world.collapse(region, world.tick + 1);
+        if (t != world.tick + 1 || n != c.n || !f64_bits_eq(mass, c.mass) ||
+            !f64_bits_eq(com_x, c.com_x) || !f64_bits_eq(com_y, c.com_y) ||
+            !f64_bits_eq(pxt, c.pxt) || !f64_bits_eq(pyt, c.pyt) ||
+            !f64_bits_eq(energy, c.energy)) {
+          std::fprintf(stderr,
+                       "MISMATCH: RegionCollapsed tick=%" PRIu64 " region=(%" PRIu32 ",%" PRIu32
+                       ") stream=(n=%" PRIu64 " mass=%.17g com=(%.17g,%.17g) p=(%.17g,%.17g)"
+                       " E=%.17g) computed=(n=%" PRIu64 " mass=%.17g com=(%.17g,%.17g)"
+                       " p=(%.17g,%.17g) E=%.17g)\n",
+                       t, rx, ry, n, mass, com_x, com_y, pxt, pyt, energy, c.n, c.mass, c.com_x,
+                       c.com_y, c.pxt, c.pyt, c.energy);
           return 1;
         }
       } break;
@@ -1064,10 +1286,10 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count) {
       ((r_e0 > 0 ? r_e0 : -r_e0) > 1e-30 ? (r_e0 > 0 ? r_e0 : -r_e0) : 1e-30);
   std::printf(
       "OK: ticks=%" PRIu64 " totals=%" PRIu64 " region_states=%" PRIu64 " bodies=%" PRIu64
-      " fine=%" PRIu64 " coarse=%" PRIu64 " final_world_hash=%016" PRIx64
-      " max_pos_dev=%.3e mom_drift=%.3e energy_drift=%.3e\n",
-      ticks_seen, totals_seen, states_seen, bodies_seen, w_fine, w_cn, world.world_hash(),
-      max_pos_dev, mom_drift, e_drift);
+      " collapses=%" PRIu64 " fine=%" PRIu64 " coarse=%" PRIu64
+      " final_world_hash=%016" PRIx64 " max_pos_dev=%.3e mom_drift=%.3e energy_drift=%.3e\n",
+      ticks_seen, totals_seen, states_seen, bodies_seen, collapses_seen, w_fine, w_cn,
+      world.world_hash(), max_pos_dev, mom_drift, e_drift);
   return 0;
 }
 

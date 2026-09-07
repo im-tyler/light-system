@@ -49,6 +49,10 @@ struct ClusterRecord {
     uint32_t page_index = 0;
     Bounds3f bounds;
     float normal_cone_axis[4] = {0.0f, 0.0f, 1.0f, 0.0f};
+    // Bounding sphere used by the radius-compensated cone cull: xyz = center,
+    // w = radius (meshopt_Bounds center/radius). Files older than schema v5
+    // lack this; loaders synthesize it from the AABB (conservative).
+    float cull_sphere[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float local_error = 0.0f;
     uint32_t material_section_index = 0;
     uint32_t flags = 0;
@@ -78,6 +82,8 @@ struct LodClusterRecord {
     uint32_t page_index = 0;
     Bounds3f bounds;
     float normal_cone_axis[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    // Same packing as ClusterRecord::cull_sphere.
+    float cull_sphere[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float local_error = 0.0f;
     uint32_t material_section_index = 0;
     uint32_t flags = 0;
@@ -223,16 +229,5 @@ TraversalSelection simulate_traversal(const VGeoResource& resource, float error_
                                       const std::vector<uint8_t>& resident_pages);
 void write_resource(const VGeoResource& resource, const std::filesystem::path& output_path);
 void write_summary(const VGeoResource& resource, const std::filesystem::path& output_path);
-
-// File-space offsets of the two payload regions within a serialized .vgeo.
-// Computed from the resource's in-memory counts (same math write_resource
-// uses), so callers that want to pread() a single page's bytes from disk
-// can map `page.byte_offset` into an absolute file offset without re-
-// parsing the header.
-struct VGeoPayloadOffsets {
-    std::uint64_t cluster_geometry_payload_offset = 0;
-    std::uint64_t lod_geometry_payload_offset = 0;
-};
-VGeoPayloadOffsets compute_payload_offsets(const VGeoResource& resource);
 
 }  // namespace meridian

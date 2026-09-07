@@ -17,6 +17,10 @@
 #include <string>
 #include <vector>
 
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
 #endif
@@ -62,37 +66,42 @@ struct Stream {
     std::vector<StreamFrame> frames;
 };
 
-bool take_u32(const std::vector<u8>& d, std::size_t& off, u32& out) {
-    if (d.size() - off < 4) return false;
-    out = static_cast<u32>(d[off]) | (static_cast<u32>(d[off + 1]) << 8) |
-          (static_cast<u32>(d[off + 2]) << 16) | (static_cast<u32>(d[off + 3]) << 24);
+struct ByteView {
+    const u8* data = nullptr;
+    std::size_t size = 0;
+};
+
+bool take_u32(ByteView d, std::size_t& off, u32& out) {
+    if (d.size - off < 4) return false;
+    out = static_cast<u32>(d.data[off]) | (static_cast<u32>(d.data[off + 1]) << 8) |
+          (static_cast<u32>(d.data[off + 2]) << 16) | (static_cast<u32>(d.data[off + 3]) << 24);
     off += 4;
     return true;
 }
 
-bool take_u64(const std::vector<u8>& d, std::size_t& off, u64& out) {
-    if (d.size() - off < 8) return false;
+bool take_u64(ByteView d, std::size_t& off, u64& out) {
+    if (d.size - off < 8) return false;
     u64 lo = 0;
     u64 hi = 0;
     for (int i = 0; i < 4; ++i) {
-        lo |= static_cast<u64>(d[off + i]) << (8 * i);
-        hi |= static_cast<u64>(d[off + 4 + i]) << (8 * i);
+        lo |= static_cast<u64>(d.data[off + i]) << (8 * i);
+        hi |= static_cast<u64>(d.data[off + 4 + i]) << (8 * i);
     }
     out = lo | (hi << 32);
     off += 8;
     return true;
 }
 
-bool take_f64(const std::vector<u8>& d, std::size_t& off, f64& out) {
+bool take_f64(ByteView d, std::size_t& off, f64& out) {
     u64 bits = 0;
     if (!take_u64(d, off, bits)) return false;
     std::memcpy(&out, &bits, 8);
     return true;
 }
 
-u32 le32_at(const std::vector<u8>& d, std::size_t off) {
-    return static_cast<u32>(d[off]) | (static_cast<u32>(d[off + 1]) << 8) |
-           (static_cast<u32>(d[off + 2]) << 16) | (static_cast<u32>(d[off + 3]) << 24);
+u32 le32_at(ByteView d, std::size_t off) {
+    return static_cast<u32>(d.data[off]) | (static_cast<u32>(d.data[off + 1]) << 8) |
+           (static_cast<u32>(d.data[off + 2]) << 16) | (static_cast<u32>(d.data[off + 3]) << 24);
 }
 
 [[noreturn]] void stream_error(const char* what, std::size_t offset) {
@@ -119,23 +128,28 @@ void finalize_frame(StreamFrame& frame, bool has_snapshot, u64 snapshot_populati
 }
 
 // Parsing logic ported from tools/ontos/ontos_stream_dump.cpp (record walk
-// only; records are trusted, no re-simulation).
+// only; records are trusted, no re-simulation). The file is mmap'd read-only
+// for the walk and unmapped again; only the parsed frames stay in RAM.
 Stream parse_stream(const std::filesystem::path& path) {
     std::FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) {
         throw std::runtime_error("cannot open stream file: " + path.string());
     }
-    std::vector<u8> data;
-    {
-        u8 buf[65536];
-        std::size_t n = 0;
-        while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) {
-            data.insert(data.end(), buf, buf + n);
-        }
+    struct stat st {};
+    if (::fstat(::fileno(f), &st) != 0 || st.st_size <= 0) {
         std::fclose(f);
+        throw std::runtime_error("cannot stat stream file: " + path.string());
     }
+    const std::size_t file_size = static_cast<std::size_t>(st.st_size);
+    void* mapped = ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, ::fileno(f), 0);
+    std::fclose(f);
+    if (mapped == MAP_FAILED) {
+        throw std::runtime_error("cannot mmap stream file: " + path.string());
+    }
+    ByteView data{static_cast<const u8*>(mapped), file_size};
 
-    if (data.size() < 20 || std::memcmp(data.data(), "ONTO", 4) != 0) {
+    if (data.size < 20 || std::memcmp(data.data, "ONTO", 4) != 0) {
+        ::munmap(mapped, file_size);
         throw std::runtime_error("not an ontos v2 stream (bad magic or truncated header)");
     }
     const u32 version = le32_at(data, 4);
@@ -143,16 +157,19 @@ Stream parse_stream(const std::filesystem::path& path) {
     const u32 world_h = le32_at(data, 12);
     const u32 body_count = le32_at(data, 16);
     if (version != 2) {
+        ::munmap(mapped, file_size);
         std::ostringstream message;
         message << "unsupported stream version " << version << " (ontos_view requires v2)";
         throw std::runtime_error(message.str());
     }
     if (world_w != 128 || world_h != 128) {
+        ::munmap(mapped, file_size);
         std::ostringstream message;
         message << "unsupported world size " << world_w << "x" << world_h;
         throw std::runtime_error(message.str());
     }
     if (body_count == 0 || body_count > 100000) {
+        ::munmap(mapped, file_size);
         std::ostringstream message;
         message << "implausible body count " << body_count;
         throw std::runtime_error(message.str());
@@ -165,132 +182,138 @@ Stream parse_stream(const std::filesystem::path& path) {
     u64 snapshot_population = 0;
     std::size_t off = 20;
 
-    while (off < data.size()) {
-        const std::size_t rec_start = off;
-        const u8 tag = data[off++];
-        switch (tag) {
-            case 1: {
-                u64 t = 0;
-                if (!take_u64(data, off, t)) stream_error("truncated TickHeader", rec_start);
-                if (!stream.frames.empty()) {
-                    finalize_frame(stream.frames.back(), has_snapshot, snapshot_population,
-                                   body_count, region_level);
+    try {
+            while (off < data.size) {
+            const std::size_t rec_start = off;
+            const u8 tag = data.data[off++];
+            switch (tag) {
+                case 1: {
+                    u64 t = 0;
+                    if (!take_u64(data, off, t)) stream_error("truncated TickHeader", rec_start);
+                    if (!stream.frames.empty()) {
+                        finalize_frame(stream.frames.back(), has_snapshot, snapshot_population,
+                                       body_count, region_level);
+                    }
+                    StreamFrame frame;
+                    frame.tick = t;
+                    stream.frames.push_back(std::move(frame));
+                    has_snapshot = false;
+                    snapshot_population = 0;
+                } break;
+                case 2: {
+                    u64 p = 0;
+                    if (!take_u64(data, off, p)) stream_error("truncated Snapshot", rec_start);
+                    has_snapshot = true;
+                    snapshot_population = p;
+                } break;
+                case 3: {
+                    u64 t = 0;
+                    u32 x = 0;
+                    u32 y = 0;
+                    if (!take_u64(data, off, t) || !take_u32(data, off, x) || !take_u32(data, off, y)) {
+                        stream_error("truncated CellFlipped", rec_start);
+                    }
+                } break;
+                case 4: {
+                    u32 rx = 0;
+                    u32 ry = 0;
+                    if (!take_u32(data, off, rx) || !take_u32(data, off, ry) ||
+                        data.size - off < 1) {
+                        stream_error("truncated RegionLevel", rec_start);
+                    }
+                    const u8 lv = data.data[off++];
+                    if (rx > 1 || ry > 1 || lv > 1) {
+                        stream_error("bad RegionLevel", rec_start);
+                    }
+                    region_level[ry * 2 + rx] = lv;
+                } break;
+                case 5: {
+                    u64 t = 0;
+                    u32 rx = 0;
+                    u32 ry = 0;
+                    u64 p = 0;
+                    u64 h = 0;
+                    if (!take_u64(data, off, t) || !take_u32(data, off, rx) ||
+                        !take_u32(data, off, ry) || data.size - off < 1) {
+                        stream_error("truncated RegionState", rec_start);
+                    }
+                    const u8 lv = data.data[off++];
+                    if (!take_u64(data, off, p) || !take_u64(data, off, h)) {
+                        stream_error("truncated RegionState", rec_start);
+                    }
+                    if (rx > 1 || ry > 1 || lv > 1) {
+                        stream_error("bad RegionState", rec_start);
+                    }
+                    if (stream.frames.empty()) {
+                        stream_error("RegionState before any TickHeader", rec_start);
+                    }
+                    region_level[ry * 2 + rx] = lv;
+                } break;
+                case 6: {
+                    u64 t = 0;
+                    u32 bid = 0;
+                    u8 reg = 0;
+                    u8 lv = 0;
+                    f64 x = 0, y = 0, vx = 0, vy = 0, mass = 0;
+                    if (!take_u64(data, off, t) || !take_u32(data, off, bid) ||
+                        data.size - off < 2) {
+                        stream_error("truncated BodyState", rec_start);
+                    }
+                    reg = data.data[off++];
+                    lv = data.data[off++];
+                    if (!take_f64(data, off, x) || !take_f64(data, off, y) ||
+                        !take_f64(data, off, vx) || !take_f64(data, off, vy) ||
+                        !take_f64(data, off, mass)) {
+                        stream_error("truncated BodyState", rec_start);
+                    }
+                    if (stream.frames.empty()) {
+                        stream_error("BodyState before any TickHeader", rec_start);
+                    }
+                    StreamFrame& frame = stream.frames.back();
+                    if (bid != frame.bodies.size() || bid >= body_count || lv > 1 ||
+                        (reg > 3 && reg != 255) || t != frame.tick) {
+                        stream_error("bad BodyState", rec_start);
+                    }
+                    StreamBody body;
+                    body.id = bid;
+                    body.region = reg;
+                    body.level = lv;
+                    body.x = x;
+                    body.y = y;
+                    body.vx = vx;
+                    body.vy = vy;
+                    body.mass = mass;
+                    frame.bodies.push_back(body);
+                } break;
+                case 7: {
+                    u64 t = 0;
+                    u64 fine = 0;
+                    u64 cn = 0;
+                    f64 mass = 0, tpx = 0, tpy = 0, energy = 0;
+                    if (!take_u64(data, off, t) || !take_u64(data, off, fine) ||
+                        !take_u64(data, off, cn) || !take_f64(data, off, mass) ||
+                        !take_f64(data, off, tpx) || !take_f64(data, off, tpy) ||
+                        !take_f64(data, off, energy)) {
+                        stream_error("truncated TotalsState", rec_start);
+                    }
+                    if (stream.frames.empty()) {
+                        stream_error("TotalsState before any TickHeader", rec_start);
+                    }
+                    stream.frames.back().fine = fine;
+                    stream.frames.back().coarse = cn;
+                } break;
+                default: {
+                    std::ostringstream message;
+                    message << "unknown record tag " << tag << " at offset " << rec_start;
+                    throw std::runtime_error(message.str());
                 }
-                StreamFrame frame;
-                frame.tick = t;
-                stream.frames.push_back(std::move(frame));
-                has_snapshot = false;
-                snapshot_population = 0;
-            } break;
-            case 2: {
-                u64 p = 0;
-                if (!take_u64(data, off, p)) stream_error("truncated Snapshot", rec_start);
-                has_snapshot = true;
-                snapshot_population = p;
-            } break;
-            case 3: {
-                u64 t = 0;
-                u32 x = 0;
-                u32 y = 0;
-                if (!take_u64(data, off, t) || !take_u32(data, off, x) || !take_u32(data, off, y)) {
-                    stream_error("truncated CellFlipped", rec_start);
-                }
-            } break;
-            case 4: {
-                u32 rx = 0;
-                u32 ry = 0;
-                if (!take_u32(data, off, rx) || !take_u32(data, off, ry) ||
-                    data.size() - off < 1) {
-                    stream_error("truncated RegionLevel", rec_start);
-                }
-                const u8 lv = data[off++];
-                if (rx > 1 || ry > 1 || lv > 1) {
-                    stream_error("bad RegionLevel", rec_start);
-                }
-                region_level[ry * 2 + rx] = lv;
-            } break;
-            case 5: {
-                u64 t = 0;
-                u32 rx = 0;
-                u32 ry = 0;
-                u64 p = 0;
-                u64 h = 0;
-                if (!take_u64(data, off, t) || !take_u32(data, off, rx) ||
-                    !take_u32(data, off, ry) || data.size() - off < 1) {
-                    stream_error("truncated RegionState", rec_start);
-                }
-                const u8 lv = data[off++];
-                if (!take_u64(data, off, p) || !take_u64(data, off, h)) {
-                    stream_error("truncated RegionState", rec_start);
-                }
-                if (rx > 1 || ry > 1 || lv > 1) {
-                    stream_error("bad RegionState", rec_start);
-                }
-                if (stream.frames.empty()) {
-                    stream_error("RegionState before any TickHeader", rec_start);
-                }
-                region_level[ry * 2 + rx] = lv;
-            } break;
-            case 6: {
-                u64 t = 0;
-                u32 bid = 0;
-                u8 reg = 0;
-                u8 lv = 0;
-                f64 x = 0, y = 0, vx = 0, vy = 0, mass = 0;
-                if (!take_u64(data, off, t) || !take_u32(data, off, bid) ||
-                    data.size() - off < 2) {
-                    stream_error("truncated BodyState", rec_start);
-                }
-                reg = data[off++];
-                lv = data[off++];
-                if (!take_f64(data, off, x) || !take_f64(data, off, y) ||
-                    !take_f64(data, off, vx) || !take_f64(data, off, vy) ||
-                    !take_f64(data, off, mass)) {
-                    stream_error("truncated BodyState", rec_start);
-                }
-                if (stream.frames.empty()) {
-                    stream_error("BodyState before any TickHeader", rec_start);
-                }
-                StreamFrame& frame = stream.frames.back();
-                if (bid != frame.bodies.size() || bid >= body_count || lv > 1 ||
-                    (reg > 3 && reg != 255) || t != frame.tick) {
-                    stream_error("bad BodyState", rec_start);
-                }
-                StreamBody body;
-                body.id = bid;
-                body.region = reg;
-                body.level = lv;
-                body.x = x;
-                body.y = y;
-                body.vx = vx;
-                body.vy = vy;
-                body.mass = mass;
-                frame.bodies.push_back(body);
-            } break;
-            case 7: {
-                u64 t = 0;
-                u64 fine = 0;
-                u64 cn = 0;
-                f64 mass = 0, tpx = 0, tpy = 0, energy = 0;
-                if (!take_u64(data, off, t) || !take_u64(data, off, fine) ||
-                    !take_u64(data, off, cn) || !take_f64(data, off, mass) ||
-                    !take_f64(data, off, tpx) || !take_f64(data, off, tpy) ||
-                    !take_f64(data, off, energy)) {
-                    stream_error("truncated TotalsState", rec_start);
-                }
-                if (stream.frames.empty()) {
-                    stream_error("TotalsState before any TickHeader", rec_start);
-                }
-                stream.frames.back().fine = fine;
-                stream.frames.back().coarse = cn;
-            } break;
-            default: {
-                std::ostringstream message;
-                message << "unknown record tag " << tag << " at offset " << rec_start;
-                throw std::runtime_error(message.str());
             }
-        }
+            }
+    } catch (...) {
+        ::munmap(mapped, file_size);
+        throw;
     }
+    ::munmap(mapped, file_size);
 
     if (stream.frames.empty()) {
         throw std::runtime_error("stream contains no ticks");
@@ -325,6 +348,7 @@ struct BodyInstance {
 
 struct ViewPush {
     float sx, sy, tx, ty;
+    float z;
 };
 
 struct Camera2D {
@@ -540,10 +564,20 @@ struct Viewer {
     VkQueue queue = VK_NULL_HANDLE;
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     VkFormat swapchain_format = VK_FORMAT_B8G8R8A8_UNORM;
+    VkFormat depth_format = VK_FORMAT_D32_SFLOAT;
+    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
     VkExtent2D extent{};
+
+
     std::vector<VkImage> images;
     std::vector<VkImageView> image_views;
     std::vector<VkFramebuffer> framebuffers;
+    VkImage msaa_color = VK_NULL_HANDLE;
+    VkDeviceMemory msaa_color_memory = VK_NULL_HANDLE;
+    VkImageView msaa_color_view = VK_NULL_HANDLE;
+    VkImage depth_image = VK_NULL_HANDLE;
+    VkDeviceMemory depth_memory = VK_NULL_HANDLE;
+    VkImageView depth_view = VK_NULL_HANDLE;
     VkRenderPass render_pass = VK_NULL_HANDLE;
     VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
     VkPipeline body_pipeline = VK_NULL_HANDLE;
@@ -556,11 +590,30 @@ struct Viewer {
     GpuBuffer quad_buffer;
     GpuBuffer line_buffer;
     GpuBuffer line_instance_buffer;
-    GpuBuffer body_instance_buffer;
+    // Double-buffered so the CPU fills slot (frame + 1) & 1 while the GPU may
+    // still be reading the other slot from the previous submit.
+    GpuBuffer body_instance_buffers[2];
 
-    void destroy_swapchain_views() {
+    void destroy_extent_resources() {
+        if (device != VK_NULL_HANDLE) vkDeviceWaitIdle(device);
         for (VkFramebuffer fb : framebuffers) vkDestroyFramebuffer(device, fb, nullptr);
         framebuffers.clear();
+        if (msaa_color_view != VK_NULL_HANDLE) vkDestroyImageView(device, msaa_color_view, nullptr);
+        msaa_color_view = VK_NULL_HANDLE;
+        if (msaa_color != VK_NULL_HANDLE) vkDestroyImage(device, msaa_color, nullptr);
+        msaa_color = VK_NULL_HANDLE;
+        if (msaa_color_memory != VK_NULL_HANDLE) vkFreeMemory(device, msaa_color_memory, nullptr);
+        msaa_color_memory = VK_NULL_HANDLE;
+        if (depth_view != VK_NULL_HANDLE) vkDestroyImageView(device, depth_view, nullptr);
+        depth_view = VK_NULL_HANDLE;
+        if (depth_image != VK_NULL_HANDLE) vkDestroyImage(device, depth_image, nullptr);
+        depth_image = VK_NULL_HANDLE;
+        if (depth_memory != VK_NULL_HANDLE) vkFreeMemory(device, depth_memory, nullptr);
+        depth_memory = VK_NULL_HANDLE;
+    }
+
+    void destroy_swapchain_views() {
+        destroy_extent_resources();
         for (VkImageView view : image_views) vkDestroyImageView(device, view, nullptr);
         image_views.clear();
         images.clear();
@@ -573,7 +626,8 @@ struct Viewer {
     void destroy() {
         if (device != VK_NULL_HANDLE) vkDeviceWaitIdle(device);
         destroy_swapchain_views();
-        destroy_buffer(device, body_instance_buffer);
+        destroy_buffer(device, body_instance_buffers[0]);
+        destroy_buffer(device, body_instance_buffers[1]);
         destroy_buffer(device, line_instance_buffer);
         destroy_buffer(device, line_buffer);
         destroy_buffer(device, quad_buffer);
@@ -603,6 +657,55 @@ struct Viewer {
     }
 };
 
+struct GpuImage {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+};
+
+void create_image(Viewer& v, VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect,
+                  GpuImage& out) {
+    VkImageCreateInfo image_info{};
+    image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    image_info.imageType = VK_IMAGE_TYPE_2D;
+    image_info.format = format;
+    image_info.extent = {v.extent.width, v.extent.height, 1};
+    image_info.mipLevels = 1;
+    image_info.arrayLayers = 1;
+    image_info.samples = v.samples;
+    image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_info.usage = usage;
+    image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkResult result = vkCreateImage(v.device, &image_info, nullptr, &out.image);
+    if (result != VK_SUCCESS) throw std::runtime_error("vkCreateImage failed");
+
+    VkMemoryRequirements requirements{};
+    vkGetImageMemoryRequirements(v.device, out.image, &requirements);
+    VkMemoryAllocateInfo allocate{};
+    allocate.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocate.allocationSize = requirements.size;
+    allocate.memoryTypeIndex =
+        find_memory_type(v.physical_device, requirements.memoryTypeBits,
+                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (allocate.memoryTypeIndex == std::numeric_limits<uint32_t>::max()) {
+        throw std::runtime_error("no device-local memory type");
+    }
+    result = vkAllocateMemory(v.device, &allocate, nullptr, &out.memory);
+    if (result != VK_SUCCESS) throw std::runtime_error("vkAllocateMemory failed");
+    result = vkBindImageMemory(v.device, out.image, out.memory, 0);
+    if (result != VK_SUCCESS) throw std::runtime_error("vkBindImageMemory failed");
+
+    VkImageViewCreateInfo view_info{};
+    view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view_info.image = out.image;
+    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_info.format = format;
+    view_info.subresourceRange.aspectMask = aspect;
+    view_info.subresourceRange.levelCount = 1;
+    view_info.subresourceRange.layerCount = 1;
+    result = vkCreateImageView(v.device, &view_info, nullptr, &out.view);
+    if (result != VK_SUCCESS) throw std::runtime_error("vkCreateImageView failed");
+}
 void create_swapchain(Viewer& v, GLFWwindow* window) {
     VkSurfaceCapabilitiesKHR capabilities{};
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(v.physical_device, v.surface, &capabilities);
@@ -694,23 +797,52 @@ void create_swapchain(Viewer& v, GLFWwindow* window) {
         result = vkCreateImageView(v.device, &view_info, nullptr, &v.image_views[i]);
         if (result != VK_SUCCESS) throw std::runtime_error("vkCreateImageView failed");
     }
+}
+
+// Creates the extent-sized attachments (MSAA color resolve source + depth)
+// and the per-swapchain-image framebuffers. Must run after create_swapchain
+// and again after every resize.
+void create_extent_resources(Viewer& v) {
+    if (v.samples != VK_SAMPLE_COUNT_1_BIT) {
+        GpuImage msaa{};
+        create_image(v, v.swapchain_format,
+                     VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                     VK_IMAGE_ASPECT_COLOR_BIT, msaa);
+        v.msaa_color = msaa.image;
+        v.msaa_color_memory = msaa.memory;
+        v.msaa_color_view = msaa.view;
+    }
+    {
+        GpuImage depth{};
+        create_image(v, v.depth_format,
+                     VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                     VK_IMAGE_ASPECT_DEPTH_BIT, depth);
+        v.depth_image = depth.image;
+        v.depth_memory = depth.memory;
+        v.depth_view = depth.view;
+    }
 
     v.framebuffers.resize(v.images.size());
     for (size_t i = 0; i < v.images.size(); ++i) {
+        const VkImageView attachments[3] = {v.msaa_color_view, v.image_views[i], v.depth_view};
+        const uint32_t attachment_count = v.samples != VK_SAMPLE_COUNT_1_BIT ? 3 : 2;
+        const VkImageView* used_attachments =
+            v.samples != VK_SAMPLE_COUNT_1_BIT ? attachments : attachments + 1;
         VkFramebufferCreateInfo fb_info{};
         fb_info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
         fb_info.renderPass = v.render_pass;
-        fb_info.attachmentCount = 1;
-        fb_info.pAttachments = &v.image_views[i];
+        fb_info.attachmentCount = attachment_count;
+        fb_info.pAttachments = used_attachments;
         fb_info.width = v.extent.width;
         fb_info.height = v.extent.height;
         fb_info.layers = 1;
-        result = vkCreateFramebuffer(v.device, &fb_info, nullptr, &v.framebuffers[i]);
+        const VkResult result =
+            vkCreateFramebuffer(v.device, &fb_info, nullptr, &v.framebuffers[i]);
         if (result != VK_SUCCESS) throw std::runtime_error("vkCreateFramebuffer failed");
     }
 }
 
-VkPipeline create_pipeline(Viewer& v, VkPrimitiveTopology topology) {
+VkPipeline create_pipeline(Viewer& v, VkPrimitiveTopology topology, bool depth_write) {
     const std::string vert_source = load_shader_source(resolve_shader_path("ontos_bodies.vert"));
     const std::string frag_source = load_shader_source(resolve_shader_path("ontos_bodies.frag"));
     const std::vector<uint32_t> vert_spirv =
@@ -796,7 +928,17 @@ VkPipeline create_pipeline(Viewer& v, VkPrimitiveTopology topology) {
 
     VkPipelineMultisampleStateCreateInfo multisample{};
     multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    multisample.rasterizationSamples = v.samples;
+
+    // Both pipelines depth-test LESS with z pushed per pipeline: grid lines
+    // sit at z ~ 0.5, body discs slightly nearer, so blended bodies always
+    // layer over the grid regardless of draw order (bodies never write depth,
+    // keeping alpha blending commutative with painter's order).
+    VkPipelineDepthStencilStateCreateInfo depth_stencil{};
+    depth_stencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    depth_stencil.depthTestEnable = VK_TRUE;
+    depth_stencil.depthWriteEnable = depth_write ? VK_TRUE : VK_FALSE;
+    depth_stencil.depthCompareOp = VK_COMPARE_OP_LESS;
 
     VkPipelineColorBlendAttachmentState attachment{};
     attachment.blendEnable = VK_TRUE;
@@ -829,6 +971,7 @@ VkPipeline create_pipeline(Viewer& v, VkPrimitiveTopology topology) {
     pipeline_info.pViewportState = &viewport_state;
     pipeline_info.pRasterizationState = &rasterization;
     pipeline_info.pMultisampleState = &multisample;
+    pipeline_info.pDepthStencilState = &depth_stencil;
     pipeline_info.pColorBlendState = &color_blend;
     pipeline_info.pDynamicState = &dynamic;
     pipeline_info.layout = v.pipeline_layout;
@@ -872,7 +1015,7 @@ void fill_body_instances(const StreamFrame& frame, BodyInstance* instances) {
     }
 }
 
-ViewPush compute_view_push(const Camera2D& camera, VkExtent2D extent) {
+ViewPush compute_view_push(const Camera2D& camera, VkExtent2D extent, float z) {
     const float sx = static_cast<float>(2.0 * camera.zoom / extent.width);
     const float sy = static_cast<float>(2.0 * camera.zoom / extent.height);
     ViewPush push{};
@@ -880,6 +1023,7 @@ ViewPush compute_view_push(const Camera2D& camera, VkExtent2D extent) {
     push.sy = sy;
     push.tx = static_cast<float>(-camera.cx * sx);
     push.ty = static_cast<float>(-camera.cy * sy);
+    push.z = z;
     return push;
 }
 
@@ -1154,25 +1298,90 @@ int main(int argc, char** argv) {
         }
         if (!found) throw std::runtime_error("no compatible Vulkan device found");
 
+        // Pick a depth format and the MSAA sample count supported for it.
         {
-            VkAttachmentDescription color{};
-            color.format = v.swapchain_format;
-            color.samples = VK_SAMPLE_COUNT_1_BIT;
-            color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-            color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-            color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-            color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-            color.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            color.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            const VkFormat depth_candidates[] = {VK_FORMAT_D32_SFLOAT, VK_FORMAT_D24_UNORM_S8_UINT,
+                                                 VK_FORMAT_D16_UNORM};
+            bool depth_ok = false;
+            for (VkFormat candidate : depth_candidates) {
+                VkFormatProperties properties{};
+                vkGetPhysicalDeviceFormatProperties(v.physical_device, candidate, &properties);
+                if ((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) !=
+                    0) {
+                    v.depth_format = candidate;
+                    depth_ok = true;
+                    break;
+                }
+            }
+            if (!depth_ok) throw std::runtime_error("no supported depth format");
 
+            VkPhysicalDeviceProperties properties{};
+            vkGetPhysicalDeviceProperties(v.physical_device, &properties);
+            const VkSampleCountFlags color_samples = properties.limits.framebufferColorSampleCounts;
+            const VkSampleCountFlags depth_samples = properties.limits.framebufferDepthSampleCounts;
+            const VkSampleCountFlags shared = color_samples & depth_samples;
+            v.samples = VK_SAMPLE_COUNT_1_BIT;
+            for (VkSampleCountFlagBits candidate : {VK_SAMPLE_COUNT_8_BIT, VK_SAMPLE_COUNT_4_BIT,
+                                                    VK_SAMPLE_COUNT_2_BIT}) {
+                if ((shared & candidate) != 0) {
+                    v.samples = candidate;
+                    break;
+                }
+            }
+        }
+
+        {
+            // Attachments: [0] color (MSAA when enabled, else the swapchain
+            // image directly), [1] resolve target (swapchain, MSAA path only),
+            // [2] depth (MSAA sample count or 1).
+            VkAttachmentDescription attachments[3]{};
+            attachments[0].format = v.swapchain_format;
+            attachments[0].samples = v.samples;
+            attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            attachments[0].storeOp = v.samples != VK_SAMPLE_COUNT_1_BIT
+                                         ? VK_ATTACHMENT_STORE_OP_DONT_CARE
+                                         : VK_ATTACHMENT_STORE_OP_STORE;
+            attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            attachments[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            attachments[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+            attachments[1].format = v.swapchain_format;
+            attachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
+            attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            attachments[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            attachments[1].finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+            attachments[2].format = v.depth_format;
+            attachments[2].samples = v.samples;
+            attachments[2].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            attachments[2].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            attachments[2].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            attachments[2].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            attachments[2].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            attachments[2].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+            const uint32_t attachment_count = v.samples != VK_SAMPLE_COUNT_1_BIT ? 3 : 2;
             VkAttachmentReference color_ref{};
             color_ref.attachment = 0;
             color_ref.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            VkAttachmentReference resolve_ref{};
+            resolve_ref.attachment = 1;
+            resolve_ref.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            VkAttachmentReference depth_ref{};
+            depth_ref.attachment = v.samples != VK_SAMPLE_COUNT_1_BIT ? 2 : 1;
+            depth_ref.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
             VkSubpassDescription subpass{};
             subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
             subpass.colorAttachmentCount = 1;
             subpass.pColorAttachments = &color_ref;
+            subpass.pResolveAttachments =
+                v.samples != VK_SAMPLE_COUNT_1_BIT ? &resolve_ref : nullptr;
+            subpass.pDepthStencilAttachment = &depth_ref;
 
             VkSubpassDependency dependency{};
             dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
@@ -1184,8 +1393,8 @@ int main(int argc, char** argv) {
 
             VkRenderPassCreateInfo render_pass_info{};
             render_pass_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-            render_pass_info.attachmentCount = 1;
-            render_pass_info.pAttachments = &color;
+            render_pass_info.attachmentCount = attachment_count;
+            render_pass_info.pAttachments = attachments;
             render_pass_info.subpassCount = 1;
             render_pass_info.pSubpasses = &subpass;
             render_pass_info.dependencyCount = 1;
@@ -1208,9 +1417,12 @@ int main(int argc, char** argv) {
             if (result != VK_SUCCESS) throw std::runtime_error("vkCreatePipelineLayout failed");
         }
 
-        v.body_pipeline = create_pipeline(v, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP);
-        v.line_pipeline = create_pipeline(v, VK_PRIMITIVE_TOPOLOGY_LINE_LIST);
+        v.body_pipeline =
+            create_pipeline(v, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, /*depth_write=*/false);
+        v.line_pipeline =
+            create_pipeline(v, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, /*depth_write=*/true);
         create_swapchain(v, window);
+        create_extent_resources(v);
 
         {
             VkCommandPoolCreateInfo pool_info{};
@@ -1268,9 +1480,13 @@ int main(int argc, char** argv) {
             create_host_buffer(v.physical_device, v.device, &line_instance, sizeof(BodyInstance),
                                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, false, v.line_instance_buffer);
 
-            create_host_buffer(v.physical_device, v.device, nullptr,
-                               static_cast<VkDeviceSize>(stream.body_count) * sizeof(BodyInstance),
-                               VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, true, v.body_instance_buffer);
+            for (uint32_t slot = 0; slot < 2; ++slot) {
+                create_host_buffer(v.physical_device, v.device, nullptr,
+                                   static_cast<VkDeviceSize>(stream.body_count) *
+                                       sizeof(BodyInstance),
+                                   VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, true,
+                                   v.body_instance_buffers[slot]);
+            }
         }
 
         glfwGetFramebufferSize(window, &state.fb_width, &state.fb_height);
@@ -1365,9 +1581,37 @@ int main(int argc, char** argv) {
             }
 
             const StreamFrame& frame = stream.frames[tick_index];
+
+            if (state.resized) {
+                state.resized = false;
+                vkDeviceWaitIdle(v.device);
+                for (VkSemaphore semaphore : v.render_finished_per_image) {
+                    vkDestroySemaphore(v.device, semaphore, nullptr);
+                }
+                v.render_finished_per_image.clear();
+                v.destroy_swapchain_views();
+                create_swapchain(v, window);
+                create_extent_resources(v);
+                VkSemaphoreCreateInfo semaphore_info{};
+                semaphore_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+                v.render_finished_per_image.resize(v.images.size(), VK_NULL_HANDLE);
+                for (uint32_t i = 0; i < v.render_finished_per_image.size(); ++i) {
+                    result = vkCreateSemaphore(v.device, &semaphore_info, nullptr,
+                                               &v.render_finished_per_image[i]);
+                    if (result != VK_SUCCESS) throw std::runtime_error("vkCreateSemaphore failed");
+                }
+            }
+
+            const double frame_start = glfwGetTime();
+            vkWaitForFences(v.device, 1, &v.in_flight, VK_TRUE, UINT64_MAX);
+            vkResetFences(v.device, 1, &v.in_flight);
+
+            // Fill the slot the previous submit did NOT read: the fence above
+            // guarantees the frame-before-last retired, so this slot's bytes
+            // are no longer in flight.
+            GpuBuffer& instance_slot = v.body_instance_buffers[frame_number & 1];
             if (tick_changed) {
-                fill_body_instances(frame,
-                                    static_cast<BodyInstance*>(v.body_instance_buffer.mapped));
+                fill_body_instances(frame, static_cast<BodyInstance*>(instance_slot.mapped));
                 ticks_shown += 1;
                 std::printf("tick %" PRIu64 " bodies=%zu fine=%" PRIu64 " coarse=%" PRIu64 "\n",
                             frame.tick, frame.bodies.size(), frame.fine, frame.coarse);
@@ -1383,29 +1627,6 @@ int main(int argc, char** argv) {
                 }
                 tick_changed = false;
             }
-
-            if (state.resized) {
-                state.resized = false;
-                vkDeviceWaitIdle(v.device);
-                for (VkSemaphore semaphore : v.render_finished_per_image) {
-                    vkDestroySemaphore(v.device, semaphore, nullptr);
-                }
-                v.render_finished_per_image.clear();
-                v.destroy_swapchain_views();
-                create_swapchain(v, window);
-                VkSemaphoreCreateInfo semaphore_info{};
-                semaphore_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-                v.render_finished_per_image.resize(v.images.size(), VK_NULL_HANDLE);
-                for (uint32_t i = 0; i < v.render_finished_per_image.size(); ++i) {
-                    result = vkCreateSemaphore(v.device, &semaphore_info, nullptr,
-                                               &v.render_finished_per_image[i]);
-                    if (result != VK_SUCCESS) throw std::runtime_error("vkCreateSemaphore failed");
-                }
-            }
-
-            const double frame_start = glfwGetTime();
-            vkWaitForFences(v.device, 1, &v.in_flight, VK_TRUE, UINT64_MAX);
-            vkResetFences(v.device, 1, &v.in_flight);
 
             uint32_t image_index = 0;
             result = vkAcquireNextImageKHR(v.device, v.swapchain, UINT64_MAX, v.image_available,
@@ -1425,15 +1646,25 @@ int main(int argc, char** argv) {
             result = vkBeginCommandBuffer(v.command_buffer, &begin);
             if (result != VK_SUCCESS) throw std::runtime_error("vkBeginCommandBuffer failed");
 
-            VkClearValue clear{};
-            clear.color = {{0.05f, 0.06f, 0.08f, 1.0f}};
+            VkClearValue clears[3]{};
+            clears[0].color = {{0.05f, 0.06f, 0.08f, 1.0f}};
+            uint32_t clear_count = 0;
+            if (v.samples != VK_SAMPLE_COUNT_1_BIT) {
+                // [0] MSAA color clear, [1] resolve (dont-care), [2] depth clear
+                clears[2].depthStencil = {1.0f, 0};
+                clear_count = 3;
+            } else {
+                // [0] color clear, [1] depth clear
+                clears[1].depthStencil = {1.0f, 0};
+                clear_count = 2;
+            }
             VkRenderPassBeginInfo render_begin{};
             render_begin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
             render_begin.renderPass = v.render_pass;
             render_begin.framebuffer = v.framebuffers[image_index];
             render_begin.renderArea.extent = v.extent;
-            render_begin.clearValueCount = 1;
-            render_begin.pClearValues = &clear;
+            render_begin.clearValueCount = clear_count;
+            render_begin.pClearValues = clears;
             vkCmdBeginRenderPass(v.command_buffer, &render_begin, VK_SUBPASS_CONTENTS_INLINE);
 
             VkViewport viewport{};
@@ -1445,21 +1676,22 @@ int main(int argc, char** argv) {
             vkCmdSetViewport(v.command_buffer, 0, 1, &viewport);
             vkCmdSetScissor(v.command_buffer, 0, 1, &scissor);
 
-            const ViewPush push = compute_view_push(state.camera, v.extent);
-            vkCmdPushConstants(v.command_buffer, v.pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
-                               sizeof(ViewPush), &push);
-
             const VkDeviceSize offsets[2] = {0, 0};
             vkCmdBindVertexBuffers(v.command_buffer, 0, 1, &v.line_buffer.buffer, &offsets[0]);
             vkCmdBindVertexBuffers(v.command_buffer, 1, 1, &v.line_instance_buffer.buffer,
                                    &offsets[1]);
             vkCmdBindPipeline(v.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, v.line_pipeline);
+            const ViewPush line_push = compute_view_push(state.camera, v.extent, 0.5f);
+            vkCmdPushConstants(v.command_buffer, v.pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                               sizeof(ViewPush), &line_push);
             vkCmdDraw(v.command_buffer, 12, 1, 0, 0);
 
             vkCmdBindVertexBuffers(v.command_buffer, 0, 1, &v.quad_buffer.buffer, &offsets[0]);
-            vkCmdBindVertexBuffers(v.command_buffer, 1, 1, &v.body_instance_buffer.buffer,
-                                   &offsets[1]);
+            vkCmdBindVertexBuffers(v.command_buffer, 1, 1, &instance_slot.buffer, &offsets[1]);
             vkCmdBindPipeline(v.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, v.body_pipeline);
+            const ViewPush body_push = compute_view_push(state.camera, v.extent, 0.25f);
+            vkCmdPushConstants(v.command_buffer, v.pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                               sizeof(ViewPush), &body_push);
             vkCmdDraw(v.command_buffer, 4, static_cast<uint32_t>(frame.bodies.size()), 0, 0);
 
             vkCmdEndRenderPass(v.command_buffer);

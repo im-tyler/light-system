@@ -99,6 +99,20 @@ bool AsyncReader::read_sync(uint64_t offset, std::size_t size, void* dst) const 
     return true;
 }
 
+void AsyncReader::discard_range(uint64_t offset, std::size_t size) const {
+    if (mapped_ == nullptr || size == 0 || offset + size > file_size_) return;
+    const long page_size = ::sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) return;
+    const uintptr_t page_mask = ~(static_cast<uintptr_t>(page_size) - 1);
+    const uintptr_t start =
+        reinterpret_cast<uintptr_t>(static_cast<const char*>(mapped_) + offset) & page_mask;
+    const uintptr_t end =
+        (reinterpret_cast<uintptr_t>(static_cast<const char*>(mapped_) + offset + size) +
+         static_cast<uintptr_t>(page_size) - 1) & page_mask;
+    if (end <= start) return;
+    ::madvise(reinterpret_cast<void*>(start), end - start, MADV_DONTNEED);
+}
+
 std::size_t AsyncReader::pending_count() const {
     std::lock_guard<std::mutex> lk(queue_mutex_);
     return pending_.size();

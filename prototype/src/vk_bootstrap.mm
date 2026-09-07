@@ -4,6 +4,7 @@
 #include "gpu_profiler.h"
 #include "math_utils.h"
 #include "async_reader.h"
+#include "builder_internal.h"
 #include "runtime_model.h"
 #include "shader_loader.h"
 #include "streaming_scheduler.h"
@@ -2192,36 +2193,88 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             sc.eviction_grace_frames = config.eviction_grace_frames;
             streaming_scheduler = create_streaming_scheduler(resource, sc);
 
-            // Real async disk I/O path: serialize the resource to a temp
-            // .vgeo, mmap it, and serve page loads from a worker thread
-            // that copies each page's byte range out of the mapping. If
-            // anything fails here we fall back to the latency-window
-            // simulation (async_io_active stays false) and keep the
-            // full startup payload upload.
+            // Real async disk I/O path: mmap a .vgeo and serve page loads
+            // from a worker thread that copies each page's byte range out of
+            // the mapping. The byte source is the manifest's persisted
+            // output .vgeo when it exists and its header matches the freshly
+            // built resource (no startup write at all); otherwise we
+            // serialize the resource to a temp .vgeo and mmap that. If
+            // anything fails we fall back to the latency-window simulation
+            // (async_io_active stays false) and keep the full startup
+            // payload upload.
             try {
-                const std::string unique =
-                    std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
-                temp_vgeo_path = std::filesystem::temp_directory_path() /
-                                 (std::string("meridian-stream-") + unique + ".vgeo");
-                write_resource(resource, temp_vgeo_path);
-                const VGeoPayloadOffsets payload_offsets = compute_payload_offsets(resource);
+                std::filesystem::path source_path;
+                bool from_persisted = false;
+                if (!config.persisted_vgeo_path.empty() &&
+                    std::filesystem::path(config.persisted_vgeo_path).extension() == ".vgeo") {
+                    std::error_code ec;
+                    const std::filesystem::path candidate(config.persisted_vgeo_path);
+                    if (std::filesystem::exists(candidate, ec)) {
+                        std::ifstream header_input(candidate, std::ios::binary);
+                        detail::FileHeader header{};
+                        if (header_input &&
+                            header_input.read(reinterpret_cast<char*>(&header), sizeof(header)) &&
+                            std::equal(std::begin(header.magic), std::end(header.magic),
+                                       detail::kMagic.begin()) &&
+                            header.schema_version >= 1 &&
+                            header.schema_version <= detail::kSchemaVersion &&
+                            header.builder_version == detail::kBuilderVersion &&
+                            header.total_hierarchy_nodes == resource.hierarchy_nodes.size() &&
+                            header.total_clusters == resource.clusters.size() &&
+                            header.total_pages == resource.pages.size() &&
+                            header.total_lod_groups == resource.lod_groups.size() &&
+                            header.total_lod_clusters == resource.lod_clusters.size() &&
+                            header.total_cluster_geometry_bytes ==
+                                resource.cluster_geometry_payload.size() &&
+                            header.total_lod_geometry_bytes ==
+                                resource.lod_geometry_payload.size()) {
+                            source_path = candidate;
+                            from_persisted = true;
+                        }
+                    }
+                }
+                if (!from_persisted) {
+                    const std::string unique =
+                        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+                    temp_vgeo_path = std::filesystem::temp_directory_path() /
+                                     (std::string("meridian-stream-") + unique + ".vgeo");
+                    write_resource(resource, temp_vgeo_path);
+                    source_path = temp_vgeo_path;
+                }
+                // Payload region offsets come from the file's own header --
+                // the layout math changed across schema versions (the base-
+                // run table landed between v2 and v3), so recomputing them
+                // from in-memory counts is version-fragile.
+                std::ifstream header_input(source_path, std::ios::binary);
+                detail::FileHeader header{};
+                if (!header_input ||
+                    !header_input.read(reinterpret_cast<char*>(&header), sizeof(header)) ||
+                    !std::equal(std::begin(header.magic), std::end(header.magic),
+                                detail::kMagic.begin())) {
+                    throw BuilderError("failed to read .vgeo header back: " + source_path.string());
+                }
                 for (uint32_t p = 0; p < resource.pages.size(); ++p) {
                     const PageRecord& page = resource.pages[p];
                     const uint64_t base = (page.lod_cluster_count != 0)
-                                              ? payload_offsets.lod_geometry_payload_offset
-                                              : payload_offsets.cluster_geometry_payload_offset;
+                                              ? header.lod_geometry_payload_offset
+                                              : header.cluster_geometry_payload_offset;
                     page_file_ranges[p] = {base + page.byte_offset, page.uncompressed_byte_size};
                 }
-                async_io_active = async_reader.open(temp_vgeo_path);
+                async_io_active = async_reader.open(source_path);
                 if (!async_io_active) {
                     std::fprintf(stderr,
                                  "MERIDIAN_STREAM: async_reader.open failed, "
                                  "falling back to latency simulation\n");
+                } else {
+                    std::fprintf(stderr, "MERIDIAN_STREAM: mmap source = %s\n",
+                                 from_persisted ? source_path.string().c_str()
+                                                : "temp .vgeo (startup write)");
                 }
             } catch (const std::exception& e) {
                 std::fprintf(stderr,
-                             "MERIDIAN_STREAM: temp .vgeo write failed (%s), "
-                             "falling back to latency simulation\n", e.what());
+                             "MERIDIAN_STREAM: streaming setup failed (%s), "
+                             "falling back to latency simulation\n",
+                             e.what());
                 async_io_active = false;
             }
         }
@@ -2771,9 +2824,17 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                 residency_input.completed_pages = std::move(completed_this_frame);
                 // Explicit eviction: step_residency does not take an evict
                 // list, so transition the scheduler-selected pages directly.
+                // Evicted page ranges are dropped from the mmap page cache
+                // (MADV_DONTNEED) so streaming stops holding memory for
+                // geometry the GPU no longer has.
                 for (uint32_t p : streaming_scheduler.evict_queue) {
                     if (p < residency_model.pages.size()) {
                         residency_model.pages[p].state = PageResidencyState::unloaded;
+                        if (async_io_active && p < page_file_ranges.size() &&
+                            page_file_ranges[p].size > 0) {
+                            async_reader.discard_range(page_file_ranges[p].offset,
+                                                       page_file_ranges[p].size);
+                        }
                     }
                 }
                 (void)sched_in; // we use the scheduler state directly.
@@ -2996,7 +3057,7 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             //   1. Frustum AABB test (base + LOD) -- mirrors instance_cull but at
             //      cluster granularity. Assumes cluster bounds are world-space
             //      (single-instance / identity transform scenes).
-            //   2. Normal-cone backface cull (base only, LOD clusters don't carry cones).
+            //   2. Normal-cone backface cull (base + LOD clusters), radius-compensated.
             const FrustumPlanes frustum =
                 extract_frustum_planes(camera_frame.view_projection);
             auto aabb_outside_frustum = [&](const float bmin[4], const float bmax[4]) -> bool {
@@ -3084,26 +3145,23 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
 
                     // Main-pass entry has camera-frustum + normal-cone culls.
                     if (aabb_outside_frustum(c.bounds_min.data(), c.bounds_max.data())) continue;
-                    // Normal-cone backface cull (mirrors shader is_base_cluster_backfacing).
+                    // Normal-cone backface cull (mirrors is_base_cluster_backfacing).
                     // Cone packing: xyz = cone axis, w = cone cutoff. Cutoff >= 1.0 means
                     // meshoptimizer could not compute a useful cone; do not cull.
+                    // Radius-compensated test (meshopt canonical, sphere formulation):
+                    // reject when dot(center - cam, axis) >= cutoff * |center - cam| + radius,
+                    // with the cluster's bounding sphere. Without the radius term, tight
+                    // front-facing cones get wrongly culled.
                     const float cone_cutoff = c.normal_cone[3];
                     if (cone_cutoff < 1.0f) {
-                        const float cx = (c.bounds_min[0] + c.bounds_max[0]) * 0.5f;
-                        const float cy = (c.bounds_min[1] + c.bounds_max[1]) * 0.5f;
-                        const float cz = (c.bounds_min[2] + c.bounds_max[2]) * 0.5f;
-                        float vx = cx - cam.x;
-                        float vy = cy - cam.y;
-                        float vz = cz - cam.z;
+                        const float vx = c.cull_sphere[0] - cam.x;
+                        const float vy = c.cull_sphere[1] - cam.y;
+                        const float vz = c.cull_sphere[2] - cam.z;
                         const float len = std::sqrt(vx * vx + vy * vy + vz * vz);
-                        if (len > 1e-6f) {
-                            const float inv = 1.0f / len;
-                            vx *= inv; vy *= inv; vz *= inv;
-                        }
                         const float d = vx * c.normal_cone[0] +
                                         vy * c.normal_cone[1] +
                                         vz * c.normal_cone[2];
-                        if (d < -cone_cutoff) continue;
+                        if (d >= cone_cutoff * len + c.cull_sphere[3]) continue;
                     }
                     GpuDrawEntry e = cascade_entry;
                     e.geometry_kind = 0u |
@@ -3125,24 +3183,18 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                     push_to_shadow_list(cascade_entry, c.bounds_min.data(), c.bounds_max.data());
 
                     if (aabb_outside_frustum(c.bounds_min.data(), c.bounds_max.data())) continue;
-                    // Normal-cone backface cull, same test as the base-cluster path.
+                    // Normal-cone backface cull, same radius-compensated test as
+                    // the base-cluster path (cull_sphere + cutoff * length).
                     const float cone_cutoff = c.normal_cone[3];
                     if (cone_cutoff < 1.0f) {
-                        const float cx = (c.bounds_min[0] + c.bounds_max[0]) * 0.5f;
-                        const float cy = (c.bounds_min[1] + c.bounds_max[1]) * 0.5f;
-                        const float cz = (c.bounds_min[2] + c.bounds_max[2]) * 0.5f;
-                        float vx = cx - cam.x;
-                        float vy = cy - cam.y;
-                        float vz = cz - cam.z;
+                        const float vx = c.cull_sphere[0] - cam.x;
+                        const float vy = c.cull_sphere[1] - cam.y;
+                        const float vz = c.cull_sphere[2] - cam.z;
                         const float len = std::sqrt(vx * vx + vy * vy + vz * vz);
-                        if (len > 1e-6f) {
-                            const float inv = 1.0f / len;
-                            vx *= inv; vy *= inv; vz *= inv;
-                        }
                         const float d = vx * c.normal_cone[0] +
                                         vy * c.normal_cone[1] +
                                         vz * c.normal_cone[2];
-                        if (d < -cone_cutoff) continue;
+                        if (d >= cone_cutoff * len + c.cull_sphere[3]) continue;
                     }
                     GpuDrawEntry e = cascade_entry;
                     e.geometry_kind = 1u |
@@ -3347,7 +3399,10 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             }
         }
         // Screenshot capture (raw PPM; extension is forced to .ppm so the
-        // container always matches the bytes)
+        // container always matches the bytes). The target image is acquired
+        // properly (dedicated semaphore + fence) -- reading a swapchain image
+        // without acquiring it trips the validation layer, and post-present
+        // images must be re-acquired before use.
         if (!config.screenshot_path.empty() && report.presented_frame_count > 0 &&
             !swapchain.images.empty() && frame.command_pool != VK_NULL_HANDLE) {
             std::filesystem::path screenshot_path(config.screenshot_path);
@@ -3359,61 +3414,92 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             const VkDeviceSize pixel_size = 4; // BGRA
             const VkDeviceSize buf_size = w * h * pixel_size;
 
-            UploadedBuffer readback{};
-            if (create_uploaded_buffer(selection.physical_device, device, nullptr, buf_size,
-                                       VK_BUFFER_USAGE_TRANSFER_DST_BIT, readback) == VK_SUCCESS) {
-                vkResetCommandPool(device, frame.command_pool, 0);
-                VkCommandBufferBeginInfo begin{};
-                begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-                begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-                vkBeginCommandBuffer(frame.command_buffer, &begin);
+            VkSemaphore acquire_semaphore = VK_NULL_HANDLE;
+            VkFence acquire_fence = VK_NULL_HANDLE;
+            VkSemaphoreCreateInfo semaphore_info{};
+            semaphore_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+            VkFenceCreateInfo fence_info{};
+            fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+            uint32_t shot_image_index = 0;
+            const bool image_acquired =
+                vkCreateSemaphore(device, &semaphore_info, nullptr, &acquire_semaphore) ==
+                    VK_SUCCESS &&
+                vkCreateFence(device, &fence_info, nullptr, &acquire_fence) == VK_SUCCESS &&
+                vkAcquireNextImageKHR(device, swapchain.swapchain, UINT64_MAX, acquire_semaphore,
+                                      acquire_fence, &shot_image_index) == VK_SUCCESS;
+            if (image_acquired) {
+                vkWaitForFences(device, 1, &acquire_fence, VK_TRUE, UINT64_MAX);
 
-                // Transition swapchain image to transfer src
-                VkImageMemoryBarrier to_src{};
-                to_src.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-                to_src.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-                to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-                to_src.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-                to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-                to_src.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                to_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                to_src.image = swapchain.images.back();
-                to_src.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-                vkCmdPipelineBarrier(frame.command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
-                                     1, &to_src);
+                UploadedBuffer readback{};
+                if (create_uploaded_buffer(selection.physical_device, device, nullptr, buf_size,
+                                           VK_BUFFER_USAGE_TRANSFER_DST_BIT, readback) ==
+                    VK_SUCCESS) {
+                    vkResetCommandPool(device, frame.command_pool, 0);
+                    VkCommandBufferBeginInfo begin{};
+                    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+                    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                    vkBeginCommandBuffer(frame.command_buffer, &begin);
 
-                VkBufferImageCopy region{};
-                region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-                region.imageExtent = {w, h, 1};
-                vkCmdCopyImageToBuffer(frame.command_buffer, swapchain.images.back(),
-                                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.buffer, 1, &region);
+                    // Transition swapchain image to transfer src
+                    VkImageMemoryBarrier to_src{};
+                    to_src.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                    to_src.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+                    to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                    to_src.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+                    to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                    to_src.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    to_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    to_src.image = swapchain.images[shot_image_index];
+                    to_src.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                    vkCmdPipelineBarrier(frame.command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                                         1, &to_src);
 
-                vkEndCommandBuffer(frame.command_buffer);
-                VkSubmitInfo sub{};
-                sub.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-                sub.commandBufferCount = 1;
-                sub.pCommandBuffers = &frame.command_buffer;
-                vkQueueSubmit(graphics_queue, 1, &sub, VK_NULL_HANDLE);
-                vkQueueWaitIdle(graphics_queue);
+                    VkBufferImageCopy region{};
+                    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                    region.imageExtent = {w, h, 1};
+                    vkCmdCopyImageToBuffer(frame.command_buffer,
+                                           swapchain.images[shot_image_index],
+                                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.buffer, 1,
+                                           &region);
 
-                void* mapped = nullptr;
-                if (vkMapMemory(device, readback.memory, 0, buf_size, 0, &mapped) == VK_SUCCESS) {
-                    const uint8_t* pixels = static_cast<const uint8_t*>(mapped);
-                    std::ofstream ppm(screenshot_path, std::ios::binary);
-                    if (ppm) {
-                        ppm << "P6\n" << w << " " << h << "\n255\n";
-                        for (uint32_t i = 0; i < w * h; ++i) {
-                            // BGRA -> RGB
-                            ppm.put(static_cast<char>(pixels[i * 4 + 2]));
-                            ppm.put(static_cast<char>(pixels[i * 4 + 1]));
-                            ppm.put(static_cast<char>(pixels[i * 4 + 0]));
+                    vkEndCommandBuffer(frame.command_buffer);
+                    VkSubmitInfo sub{};
+                    sub.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+                    const VkPipelineStageFlags acquire_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+                    sub.waitSemaphoreCount = 1;
+                    sub.pWaitSemaphores = &acquire_semaphore;
+                    sub.pWaitDstStageMask = &acquire_stage;
+                    sub.commandBufferCount = 1;
+                    sub.pCommandBuffers = &frame.command_buffer;
+                    vkQueueSubmit(graphics_queue, 1, &sub, VK_NULL_HANDLE);
+                    vkQueueWaitIdle(graphics_queue);
+
+                    void* mapped = nullptr;
+                    if (vkMapMemory(device, readback.memory, 0, buf_size, 0, &mapped) ==
+                        VK_SUCCESS) {
+                        const uint8_t* pixels = static_cast<const uint8_t*>(mapped);
+                        std::ofstream ppm(screenshot_path, std::ios::binary);
+                        if (ppm) {
+                            ppm << "P6\n" << w << " " << h << "\n255\n";
+                            for (uint32_t i = 0; i < w * h; ++i) {
+                                // BGRA -> RGB
+                                ppm.put(static_cast<char>(pixels[i * 4 + 2]));
+                                ppm.put(static_cast<char>(pixels[i * 4 + 1]));
+                                ppm.put(static_cast<char>(pixels[i * 4 + 0]));
+                            }
+                            std::cout << "screenshot=" << screenshot_path.string() << '\n';
                         }
-                        std::cout << "screenshot=" << screenshot_path.string() << '\n';
+                        vkUnmapMemory(device, readback.memory);
                     }
-                    vkUnmapMemory(device, readback.memory);
+                    destroy_uploaded_buffer(device, readback);
                 }
-                destroy_uploaded_buffer(device, readback);
+            }
+            if (acquire_semaphore != VK_NULL_HANDLE) {
+                vkDestroySemaphore(device, acquire_semaphore, nullptr);
+            }
+            if (acquire_fence != VK_NULL_HANDLE) {
+                vkDestroyFence(device, acquire_fence, nullptr);
             }
         }
 

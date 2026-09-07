@@ -60,6 +60,12 @@ public:
     // Reads from the mapping when active, otherwise pread()s the fd.
     bool read_sync(uint64_t offset, std::size_t size, void* dst) const;
 
+    // Drops the mapped pages covering [offset, offset+size) from the page
+    // cache (MADV_DONTNEED) so evicted page ranges stop holding memory.
+    // No-op on the pread backend. Safe to call while the worker reads other
+    // ranges of the same mapping.
+    void discard_range(uint64_t offset, std::size_t size) const;
+
     // Diagnostics.
     std::size_t pending_count() const;
     std::uint64_t completed_count() const { return completed_count_.load(std::memory_order_relaxed); }

@@ -25,6 +25,11 @@ struct VkBootstrapConfig {
     uint32_t streaming_load_latency_frames = 2;
     uint32_t streaming_seed_pages = 64;
     std::string screenshot_path;
+    // Persisted .vgeo for this asset (typically the manifest's output_path).
+    // When it exists and its header matches the freshly built resource, the
+    // demand-streaming path mmaps it directly instead of writing a temp
+    // copy. Empty or stale files fall back to the temp-write path.
+    std::string persisted_vgeo_path;
 };
 
 struct VkBootstrapReport {

@@ -68,6 +68,7 @@ int main(int argc, char** argv) {
         config.debug_error_threshold = error_threshold;
         config.enable_validation = validate;
         config.demand_streaming = demand_streaming;
+        config.persisted_vgeo_path = manifest.output_path.string();
         const meridian::VkBootstrapReport report =
             meridian::build_vk_bootstrap_report(resource, config);
 

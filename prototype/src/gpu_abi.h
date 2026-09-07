@@ -68,6 +68,9 @@ struct GpuClusterRecord {
     std::array<float, 4> bounds_min = {0.0f, 0.0f, 0.0f, 0.0f};
     std::array<float, 4> bounds_max = {0.0f, 0.0f, 0.0f, 0.0f};
     std::array<float, 4> normal_cone = {0.0f, 0.0f, 0.0f, 0.0f};
+    // xyz = bounding-sphere center, w = radius (meshopt_Bounds). Consumed by
+    // the radius-compensated cone cull on CPU and in cluster_select.comp.
+    std::array<float, 4> cull_sphere = {0.0f, 0.0f, 0.0f, 0.0f};
 };
 
 struct GpuLodGroupRecord {
@@ -98,6 +101,8 @@ struct GpuLodClusterRecord {
     std::array<float, 4> bounds_min = {0.0f, 0.0f, 0.0f, 0.0f};
     std::array<float, 4> bounds_max = {0.0f, 0.0f, 0.0f, 0.0f};
     std::array<float, 4> normal_cone = {0.0f, 0.0f, 0.0f, 1.0f};
+    // Same packing as GpuClusterRecord::cull_sphere.
+    std::array<float, 4> cull_sphere = {0.0f, 0.0f, 0.0f, 0.0f};
 };
 
 struct GpuNodeLodLinkRecord {
@@ -136,9 +141,9 @@ static_assert(std::is_standard_layout<GpuPageResidencyEntry>::value);
 
 // Word counts for raw-uint SSBO access in shaders (sizeof / 4).
 static_assert(sizeof(GpuHierarchyNodeRecord) == 76);
-static_assert(sizeof(GpuClusterRecord) == 96);
+static_assert(sizeof(GpuClusterRecord) == 112);
 static_assert(sizeof(GpuLodGroupRecord) == 64);
-static_assert(sizeof(GpuLodClusterRecord) == 96);
+static_assert(sizeof(GpuLodClusterRecord) == 112);
 static_assert(sizeof(GpuNodeLodLinkRecord) == 4);
 static_assert(sizeof(GpuPageResidencyEntry) == 16);
 static_assert(sizeof(GpuInstanceRecord) == 112);
