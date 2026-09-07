@@ -1,6 +1,6 @@
 # Implementation Status
 
-Last updated: 2026-09-05
+Last updated: 2026-09-06
 
 ## Phase 1: Offline Builder (Complete)
 
@@ -12,6 +12,7 @@ Last updated: 2026-09-05
 - dual payload domains (base clusters + LOD clusters) with page table
 - adjacent replacement-level page dependency hints for streaming prefetch
 - `meridian_dump`, `meridian_trace`, `meridian_residency`, `meridian_replay` CLI tools
+- `ontos_stream_dump` (tools/ontos, standalone C++17 no-deps): third independent implementation of the ontos stream spec (after ontos's Rust and simval's Python); verifies streams bit-for-bit. Spike toward the ontos Phase 3 viewer bridge (JoltViewer thin-consumer pattern, zero coupling to the renderer core).
 - validated on synthetic benchmarks + external pirate.glb + Stanford Dragon (871K triangles) + generated 1M-triangle city
 
 ## Phase 2: Standalone Vulkan Renderer (In Progress)
@@ -52,7 +53,7 @@ GPU timestamp profiler emits `MERIDIAN_GPU: cull=.. sel=.. occ=.. shadow=.. main
 
 - **No texture support**: all shading is procedural (per-cluster color hash + hemisphere ambient). No UV interpolation or texture sampling.
 - **Meshlet boundary seams (residual)**: smooth normals are now angle-weighted and position-welded in the builder (`compute_smooth_normals`), which matches normal values across index-split duplicates at the same position. Any remaining boundary seams come from LOD-level T-junctions at cluster borders of different detail, which are mitigated but not fully eliminated by seam-locked vertex simplification.
-- **City LOD hierarchy is degenerate (clusterlod output)**: `massive_city` LOD group errors are min ~0.036 / median ~0.1 with root-level groups at FLT_MAX, and there is a selection cliff between threshold ~5 (31K base clusters, ~39 groups activate) and ~20 (collapses to 1 group / 2 clusters). Between those bounds there is no useful middle representation, so the renderer default (0.001) keeps the city at full detail (correct but ~31K draws). Fixing this requires builder-side changes (coarser district partitioning or simplification caps), not traversal changes. `meridian_trace` now prints the error distribution, and `meridian_vk_bootstrap` accepts `--error-threshold` to tune per scene.
+- **City LOD hierarchy fixed (2026-09-06)**: the degeneracy was attachment collapse, not the error ladder. `partition_cluster_ids` fed raw vertex indices to `meshopt_partitionClusters` while the clusterlod DAG partitions position-remapped indices, so on index-split geometry (thousands of disconnected boxes) the two partitioners disagreed on adjacency; combined with a flat one-cut hierarchy (no intermediate levels), all LOD-group attachments piled onto ~43 near-root nodes and selection collapsed to a cliff. Fix (builder-side): partitions now use position-remapped indices, and `build_temp_hierarchy` grows district targets (`max(partition_size, count/8)`) so the tree gains fanout-8 intermediate levels. City trace now has a smooth ladder (t=0.05: 1894 groups / 14K+15K clusters -> t=8: 60+57; no cliff). Interleaved A/B on the renderer: city at t=1.0 runs 90.6ms / 21223 draws vs 143.5ms / 31394 at full detail (-37% frame time); dragon improves too (5532 vs 8543 draws at default threshold, no regression; `visibility_selection_subset=true` holds). Remaining (lower severity): the clusterlod DAG still smears provenance (~1.9x overlap at depth 1), so ~5K base clusters stay uncovered at mid thresholds and draw counts are slightly non-monotonic around t=4; depth-0 groups are no-op replacements.
 - **Page residency initialized as all-resident by default**; pass `--demand-streaming` to run the StreamingScheduler + async-disk-load path. Under that flag pages start unloaded (seed pages autodetected via a coarse `simulate_traversal`), the scheduler throttles loads to `streaming_max_loads_per_frame` per frame, and a page's `loading -> resident` transition now waits on a real `pread()` from a worker thread (`AsyncReader`) against a serialized temp `.vgeo` written at startup. A latency-window simulation remains as the fallback path when the temp-file write or reader open fails. The GPU payload buffer is still populated in full at startup -- async reads currently validate the I/O path rather than replace the live buffer; the next step to remove startup memory cost is mmap-backed payload streaming plus per-page sub-buffer uploads.
 - **GPU cluster_select.comp is retained but not dispatched**: CPU `simulate_traversal` produces the draw list each frame; the serial DFS compute shader predates the multi-run coverage model and is kept as reference only. Rebuilding it (BFS-per-level or workgroup-DFS) is worth doing only if profiling shows CPU selection as a bottleneck for some scene class.
 
@@ -87,4 +88,4 @@ Per-frame CPU (emitted every 60 frames as `MERIDIAN_CPU: ...`, measured post-CSM
 - Compressed geometry payloads
 - Deeper Godot runtime integration
 - Parallel GPU traversal (BFS-per-level or workgroup-DFS) to replace the retained-but-not-dispatched serial compute_select.comp
-- City-class scene LOD: coarser district partitioning or simplification caps so generated cities get a usable mid-error representation
+- Ontos viewer bridge beyond the stream-dump spike (region grid as instanced geometry via the existing instance path; waits on ontos Phase 2 fields)
