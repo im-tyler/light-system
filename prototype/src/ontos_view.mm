@@ -222,7 +222,7 @@ Stream parse_stream(const std::filesystem::path& path) {
                         stream_error("truncated RegionLevel", rec_start);
                     }
                     const u8 lv = data.data[off++];
-                    if (rx > 1 || ry > 1 || lv > 1) {
+                    if (rx > 1 || ry > 1 || lv > 2) {
                         stream_error("bad RegionLevel", rec_start);
                     }
                     region_level[ry * 2 + rx] = lv;
@@ -241,7 +241,7 @@ Stream parse_stream(const std::filesystem::path& path) {
                     if (!take_u64(data, off, p) || !take_u64(data, off, h)) {
                         stream_error("truncated RegionState", rec_start);
                     }
-                    if (rx > 1 || ry > 1 || lv > 1) {
+                    if (rx > 1 || ry > 1 || lv > 2) {
                         stream_error("bad RegionState", rec_start);
                     }
                     if (stream.frames.empty()) {
@@ -270,7 +270,7 @@ Stream parse_stream(const std::filesystem::path& path) {
                         stream_error("BodyState before any TickHeader", rec_start);
                     }
                     StreamFrame& frame = stream.frames.back();
-                    if (bid != frame.bodies.size() || bid >= body_count || lv > 1 ||
+                    if (bid != frame.bodies.size() || bid >= body_count || lv > 2 ||
                         (reg > 3 && reg != 255) || t != frame.tick) {
                         stream_error("bad BodyState", rec_start);
                     }
@@ -301,6 +301,12 @@ Stream parse_stream(const std::filesystem::path& path) {
                     }
                     stream.frames.back().fine = fine;
                     stream.frames.back().coarse = cn;
+                } break;
+                case 8: {
+                    if (data.size - off < 72) {
+                        stream_error("truncated RegionCollapsed", rec_start);
+                    }
+                    off += 72;
                 } break;
                 default: {
                     std::ostringstream message;
