@@ -8,10 +8,12 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <charconv>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -214,11 +216,14 @@ inline bool parse_bool(std::string_view value) {
 
 inline float parse_float(std::string_view value) {
     const std::string trimmed = trim(value);
-    float parsed = 0.0f;
-    const auto* begin = trimmed.data();
-    const auto* end = trimmed.data() + trimmed.size();
-    const auto result = std::from_chars(begin, end, parsed);
-    if (result.ec != std::errc() || result.ptr != end) {
+    if (trimmed.empty()) {
+        throw BuilderError("invalid float value: " + trimmed);
+    }
+    const char* begin = trimmed.c_str();
+    char* parse_end = nullptr;
+    errno = 0;
+    const float parsed = std::strtof(begin, &parse_end);
+    if (errno == ERANGE || parse_end != begin + trimmed.size()) {
         throw BuilderError("invalid float value: " + trimmed);
     }
     return parsed;
