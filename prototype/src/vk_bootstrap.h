@@ -15,6 +15,11 @@ struct VkBootstrapConfig {
     uint32_t window_height = 720;
     uint32_t present_frame_count = 120;
     float debug_error_threshold = 0.001f;
+    // Shadow caster LOD: the shadow pass selects casters at the main error
+    // threshold multiplied by this scale (values <= 1 disable it and share
+    // the main-pass selection). Depth-only silhouettes tolerate far more
+    // geometric error than the shaded main pass.
+    float shadow_error_scale = 8.0f;
     uint32_t resident_budget = 0xffffffffu;
     uint32_t eviction_grace_frames = 1;
     // When true, pages start in the unloaded state and the streaming

@@ -2466,6 +2466,13 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                          threshold, median_error, group_errors.size());
             return threshold;
         }();
+        if (config.shadow_error_scale > 1.0f) {
+            std::fprintf(stderr,
+                         "MERIDIAN_SHADOW: caster LOD error threshold %.4f (scale %.2fx of "
+                         "main)\n",
+                         error_threshold * config.shadow_error_scale,
+                         config.shadow_error_scale);
+        }
         const TraversalSelection initial_selection =
             simulate_traversal(resource, error_threshold, initial_resident_pages);
         report.runtime_missing_page_count =
@@ -2794,6 +2801,19 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             const std::vector<uint8_t> resident_pages = build_resident_page_mask(residency_model);
             const TraversalSelection selection_for_frame =
                 simulate_traversal(resource, error_threshold, resident_pages);
+            // Shadow caster LOD: casters come from a second traversal at a
+            // coarser error threshold. Shadow maps are depth-only and filtered
+            // (2048px cascades + 8-tap PCF), so silhouette detail far below
+            // the texel footprint cannot survive into the shaded result.
+            // Scale <= 1 falls back to sharing the main-pass selection.
+            TraversalSelection shadow_selection_storage;
+            const TraversalSelection* shadow_selection = &selection_for_frame;
+            if (config.shadow_error_scale > 1.0f) {
+                shadow_selection_storage =
+                    simulate_traversal(resource, error_threshold * config.shadow_error_scale,
+                                       resident_pages);
+                shadow_selection = &shadow_selection_storage;
+            }
             auto t_traverse_end = clock_t::now();
             static double acc_traverse_ms = 0.0;
             static double acc_build_ms = 0.0;
@@ -2805,11 +2825,33 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             acc_traverse_ms +=
                 std::chrono::duration<double, std::milli>(t_traverse_end - t_traverse_start).count();
 
+            // Residency keeps pages for BOTH selections alive: append the
+            // shadow selection's page lists to the main selection's (page
+            // indices may repeat; both consumers are idempotent per page).
+            TraversalSelection residency_selection_storage;
+            const TraversalSelection* residency_selection = &selection_for_frame;
+            if (shadow_selection != &selection_for_frame) {
+                residency_selection_storage = selection_for_frame;
+                residency_selection_storage.selected_page_indices.insert(
+                    residency_selection_storage.selected_page_indices.end(),
+                    shadow_selection->selected_page_indices.begin(),
+                    shadow_selection->selected_page_indices.end());
+                residency_selection_storage.missing_page_indices.insert(
+                    residency_selection_storage.missing_page_indices.end(),
+                    shadow_selection->missing_page_indices.begin(),
+                    shadow_selection->missing_page_indices.end());
+                residency_selection_storage.prefetch_page_indices.insert(
+                    residency_selection_storage.prefetch_page_indices.end(),
+                    shadow_selection->prefetch_page_indices.begin(),
+                    shadow_selection->prefetch_page_indices.end());
+                residency_selection = &residency_selection_storage;
+            }
+
             ResidencyUpdateInput residency_input;
             residency_input.frame_index = frame_index;
             residency_input.resident_budget = config.resident_budget;
             residency_input.eviction_grace_frames = config.eviction_grace_frames;
-            residency_input.selected_pages = selection_for_frame.selected_page_indices;
+            residency_input.selected_pages = residency_selection->selected_page_indices;
             if (config.demand_streaming) {
                 // Run the scheduler against the current selection to get a
                 // throttled load queue (cap max_loads_per_frame) and evict
@@ -2818,7 +2860,7 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                 // frame/budget fields; override missing/prefetch with the
                 // throttled queue so step_residency requests only those.
                 ResidencyUpdateInput sched_in = update_streaming_scheduler(
-                    streaming_scheduler, residency_model, selection_for_frame, frame_index);
+                    streaming_scheduler, residency_model, *residency_selection, frame_index);
                 residency_input.missing_pages = streaming_scheduler.load_queue;
                 residency_input.prefetch_pages.clear(); // load_queue already covers prefetch priority
                 residency_input.completed_pages = std::move(completed_this_frame);
@@ -2839,8 +2881,8 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                 }
                 (void)sched_in; // we use the scheduler state directly.
             } else {
-                residency_input.missing_pages = selection_for_frame.missing_page_indices;
-                residency_input.prefetch_pages = selection_for_frame.prefetch_page_indices;
+                residency_input.missing_pages = residency_selection->missing_page_indices;
+                residency_input.prefetch_pages = residency_selection->prefetch_page_indices;
             }
             auto t_residency_start = clock_t::now();
             const ResidencyUpdateResult residency_update =
@@ -2919,9 +2961,9 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
 
             update_debug_selection_report(selection_for_frame, report.uploadable_scene, report);
             report.runtime_missing_page_count =
-                static_cast<uint32_t>(selection_for_frame.missing_page_indices.size());
+                static_cast<uint32_t>(residency_selection->missing_page_indices.size());
             report.runtime_prefetch_page_count =
-                static_cast<uint32_t>(selection_for_frame.prefetch_page_indices.size());
+                static_cast<uint32_t>(residency_selection->prefetch_page_indices.size());
             report.runtime_requested_page_count =
                 static_cast<uint32_t>(residency_update.requested_pages.size());
             report.runtime_loading_page_count =
@@ -3053,11 +3095,17 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             // the serial DFS compute dispatch (was ~18ms on 1M-tri city on M4) with
             // CPU traversal + HOST_COHERENT write (~1-3ms total).
             //
-            // Filters applied here:
+            // The main pass draws the main selection; the shadow pass draws the
+            // (possibly coarser) shadow caster selection.
+            //
+            // Filters applied to the main list:
             //   1. Frustum AABB test (base + LOD) -- mirrors instance_cull but at
             //      cluster granularity. Assumes cluster bounds are world-space
             //      (single-instance / identity transform scenes).
             //   2. Normal-cone backface cull (base + LOD clusters), radius-compensated.
+            // The shadow list applies only the per-cascade ortho-frustum overlap
+            // test: camera-facing culls don't apply to casters (a cluster facing
+            // away from the camera can still cast a shadow into the camera's view).
             const FrustumPlanes frustum =
                 extract_frustum_planes(camera_frame.view_projection);
             auto aabb_outside_frustum = [&](const float bmin[4], const float bmax[4]) -> bool {
@@ -3074,16 +3122,16 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                 return false;
             };
             // Per-cascade frustum planes, extracted from each cascade's
-            // light view-projection. Used below to filter the main draw list
-            // into per-cascade draw lists so the shadow pass only draws
-            // clusters that actually overlap the cascade's volume.
+            // light view-projection. Used below to filter the caster list so
+            // the shadow pass only draws clusters that actually overlap the
+            // cascade's volume.
             FrustumPlanes cascade_frusta[kShadowCascadeCount];
             for (uint32_t c = 0; c < kShadowCascadeCount; ++c) {
                 cascade_frusta[c] = extract_frustum_planes(shadow.cascades.light_vp[c]);
             }
             auto aabb_outside_planes = [](const FrustumPlanes& fp,
-                                          const float bmin[4],
-                                          const float bmax[4]) -> bool {
+                                           const float bmin[4],
+                                           const float bmax[4]) -> bool {
                 for (int p = 0; p < 6; ++p) {
                     const float nx = fp.planes[p][0];
                     const float ny = fp.planes[p][1];
@@ -3104,7 +3152,8 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                 std::vector<GpuDrawEntry> shadow_draws;
                 cpu_draws.reserve(selection_for_frame.selected_cluster_indices.size() +
                                   selection_for_frame.selected_lod_cluster_indices.size());
-                shadow_draws.reserve(cpu_draws.capacity());
+                shadow_draws.reserve(shadow_selection->selected_cluster_indices.size() +
+                                     shadow_selection->selected_lod_cluster_indices.size());
                 const Vec3f cam = camera_frame.camera_position;
                 // Compute the cluster's cascade overlap mask and append a
                 // merged shadow entry when at least one cascade sees it. The
@@ -3112,7 +3161,7 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                 // slots are strided by kShadowInstanceStride so shadow.vert
                 // can recover the entry index from gl_InstanceIndex.
                 auto push_to_shadow_list = [&](GpuDrawEntry& entry,
-                                               const float bmin[4], const float bmax[4]) {
+                                                const float bmin[4], const float bmax[4]) {
                     uint32_t mask = 0;
                     for (uint32_t c = 0; c < kShadowCascadeCount; ++c) {
                         if (aabb_outside_planes(cascade_frusta[c], bmin, bmax)) continue;
@@ -3128,21 +3177,6 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                 };
                 for (const uint32_t ci : selection_for_frame.selected_cluster_indices) {
                     const GpuClusterRecord& c = report.uploadable_scene.clusters[ci];
-                    // Cascade filtering uses the raw AABB only -- backface
-                    // culling against the camera doesn't apply to shadow
-                    // casters (a cluster facing away from the camera can
-                    // still cast a shadow into the camera's view).
-                    GpuDrawEntry cascade_entry{};
-                    cascade_entry.draw_vertex_count = c.local_triangle_count * 3u;
-                    cascade_entry.draw_instance_count = 1u;
-                    cascade_entry.draw_first_vertex = 0u;
-                    cascade_entry.cluster_index = ci;
-                    cascade_entry.geometry_kind =
-                        0u | ((c.flags & kClusterFlagHasUv) != 0 ? kGeometryKindHasUv : 0u);
-                    cascade_entry.payload_offset = c.payload_offset;
-                    cascade_entry.local_vertex_count = c.local_vertex_count;
-                    push_to_shadow_list(cascade_entry, c.bounds_min.data(), c.bounds_max.data());
-
                     // Main-pass entry has camera-frustum + normal-cone culls.
                     if (aabb_outside_frustum(c.bounds_min.data(), c.bounds_max.data())) continue;
                     // Normal-cone backface cull (mirrors is_base_cluster_backfacing).
@@ -3163,25 +3197,20 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                                         vz * c.normal_cone[2];
                         if (d >= cone_cutoff * len + c.cull_sphere[3]) continue;
                     }
-                    GpuDrawEntry e = cascade_entry;
-                    e.geometry_kind = 0u |
-                        ((c.flags & kClusterFlagHasUv) != 0 ? kGeometryKindHasUv : 0u);
+                    GpuDrawEntry e{};
+                    e.draw_vertex_count = c.local_triangle_count * 3u;
+                    e.draw_instance_count = 1u;
+                    e.draw_first_vertex = 0u;
+                    e.cluster_index = ci;
+                    e.geometry_kind =
+                        0u | ((c.flags & kClusterFlagHasUv) != 0 ? kGeometryKindHasUv : 0u);
+                    e.payload_offset = c.payload_offset;
+                    e.local_vertex_count = c.local_vertex_count;
                     e.draw_first_instance = static_cast<uint32_t>(cpu_draws.size());
                     cpu_draws.push_back(e);
                 }
                 for (const uint32_t ci : selection_for_frame.selected_lod_cluster_indices) {
                     const GpuLodClusterRecord& c = report.uploadable_scene.lod_clusters[ci];
-                    GpuDrawEntry cascade_entry{};
-                    cascade_entry.draw_vertex_count = c.local_triangle_count * 3u;
-                    cascade_entry.draw_instance_count = 1u;
-                    cascade_entry.draw_first_vertex = 0u;
-                    cascade_entry.cluster_index = ci;
-                    cascade_entry.geometry_kind =
-                        1u | ((c.flags & kClusterFlagHasUv) != 0 ? kGeometryKindHasUv : 0u);
-                    cascade_entry.payload_offset = c.payload_offset;
-                    cascade_entry.local_vertex_count = c.local_vertex_count;
-                    push_to_shadow_list(cascade_entry, c.bounds_min.data(), c.bounds_max.data());
-
                     if (aabb_outside_frustum(c.bounds_min.data(), c.bounds_max.data())) continue;
                     // Normal-cone backface cull, same radius-compensated test as
                     // the base-cluster path (cull_sphere + cutoff * length).
@@ -3196,11 +3225,46 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                                         vz * c.normal_cone[2];
                         if (d >= cone_cutoff * len + c.cull_sphere[3]) continue;
                     }
-                    GpuDrawEntry e = cascade_entry;
-                    e.geometry_kind = 1u |
-                        ((c.flags & kClusterFlagHasUv) != 0 ? kGeometryKindHasUv : 0u);
+                    GpuDrawEntry e{};
+                    e.draw_vertex_count = c.local_triangle_count * 3u;
+                    e.draw_instance_count = 1u;
+                    e.draw_first_vertex = 0u;
+                    e.cluster_index = ci;
+                    e.geometry_kind =
+                        1u | ((c.flags & kClusterFlagHasUv) != 0 ? kGeometryKindHasUv : 0u);
+                    e.payload_offset = c.payload_offset;
+                    e.local_vertex_count = c.local_vertex_count;
                     e.draw_first_instance = static_cast<uint32_t>(cpu_draws.size());
                     cpu_draws.push_back(e);
+                }
+                // Caster list: clusters from the shadow selection, tested only
+                // against the cascade volumes. Backface culling against the
+                // camera doesn't apply to shadow casters.
+                for (const uint32_t ci : shadow_selection->selected_cluster_indices) {
+                    const GpuClusterRecord& c = report.uploadable_scene.clusters[ci];
+                    GpuDrawEntry cascade_entry{};
+                    cascade_entry.draw_vertex_count = c.local_triangle_count * 3u;
+                    cascade_entry.draw_instance_count = 1u;
+                    cascade_entry.draw_first_vertex = 0u;
+                    cascade_entry.cluster_index = ci;
+                    cascade_entry.geometry_kind =
+                        0u | ((c.flags & kClusterFlagHasUv) != 0 ? kGeometryKindHasUv : 0u);
+                    cascade_entry.payload_offset = c.payload_offset;
+                    cascade_entry.local_vertex_count = c.local_vertex_count;
+                    push_to_shadow_list(cascade_entry, c.bounds_min.data(), c.bounds_max.data());
+                }
+                for (const uint32_t ci : shadow_selection->selected_lod_cluster_indices) {
+                    const GpuLodClusterRecord& c = report.uploadable_scene.lod_clusters[ci];
+                    GpuDrawEntry cascade_entry{};
+                    cascade_entry.draw_vertex_count = c.local_triangle_count * 3u;
+                    cascade_entry.draw_instance_count = 1u;
+                    cascade_entry.draw_first_vertex = 0u;
+                    cascade_entry.cluster_index = ci;
+                    cascade_entry.geometry_kind =
+                        1u | ((c.flags & kClusterFlagHasUv) != 0 ? kGeometryKindHasUv : 0u);
+                    cascade_entry.payload_offset = c.payload_offset;
+                    cascade_entry.local_vertex_count = c.local_vertex_count;
+                    push_to_shadow_list(cascade_entry, c.bounds_min.data(), c.bounds_max.data());
                 }
                 cpu_draw_count = static_cast<uint32_t>(cpu_draws.size());
                 shadow_draw_count = static_cast<uint32_t>(shadow_draws.size());

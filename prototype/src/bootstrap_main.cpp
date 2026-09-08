@@ -9,11 +9,13 @@
 namespace {
 
 void print_usage() {
-    std::cerr << "Usage: meridian_vk_bootstrap --manifest <path> [--interactive] [--screenshot <path>] [--budget <pages>] [--demand-streaming] [--error-threshold <value>] [--validate]\n"
+    std::cerr << "Usage: meridian_vk_bootstrap --manifest <path> [--interactive] [--screenshot <path>] [--budget <pages>] [--demand-streaming] [--error-threshold <value>] [--shadow-error-scale <value>] [--validate]\n"
                  "  --screenshot writes a raw PPM image (extension forced to .ppm)\n"
                  "  --error-threshold sets the LOD selection threshold (default: auto =\n"
                  "  max(0.001, 8.9x the scene's median LOD-group geometric error), so\n"
-                 "  scene-scale ladders activate instead of selecting full detail)\n";
+                 "  scene-scale ladders activate instead of selecting full detail)\n"
+                 "  --shadow-error-scale multiplies the LOD threshold for shadow casters\n"
+                 "  (default 8.0; <= 1 shares the main-pass selection)\n";
 }
 
 }  // namespace
@@ -23,6 +25,7 @@ int main(int argc, char** argv) {
     std::string screenshot_path;
     uint32_t resident_budget = 0xffffffffu;
     float error_threshold = -1.0f;  // negative = auto (scene-scaled)
+    float shadow_error_scale = 8.0f;
     bool validate = false;
     bool interactive = false;
     bool demand_streaming = false;
@@ -36,6 +39,8 @@ int main(int argc, char** argv) {
             resident_budget = static_cast<uint32_t>(std::atoi(argv[++i]));
         } else if (arg == "--error-threshold" && i + 1 < argc) {
             error_threshold = std::atof(argv[++i]);
+        } else if (arg == "--shadow-error-scale" && i + 1 < argc) {
+            shadow_error_scale = std::atof(argv[++i]);
         } else if (arg == "--validate") {
             validate = true;
         } else if (arg == "--interactive") {
@@ -66,6 +71,7 @@ int main(int argc, char** argv) {
         config.screenshot_path = screenshot_path;
         config.resident_budget = resident_budget;
         config.debug_error_threshold = error_threshold;
+        config.shadow_error_scale = shadow_error_scale;
         config.enable_validation = validate;
         config.demand_streaming = demand_streaming;
         config.persisted_vgeo_path = manifest.output_path.string();

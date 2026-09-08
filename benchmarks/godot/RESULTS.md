@@ -3,6 +3,88 @@
 First automated comparison captured with `run_bench.sh` (see
 [README.md](./README.md) for method and caveats).
 
+## 2026-09-07 17:34 local: shadow caster LOD — city gap 4.9x -> ~2.9x
+
+Same machine/os/godot as below, but the machine was heavily loaded the
+whole session (load average ~85-100: an iOS-simulator game at ~98% CPU
+plus its SimMetalHost GPU companion, concurrent builds). Both engines ran
+under the same conditions back-to-back; renderer numbers below are
+nonetheless inflated versus an idle machine (the 2026-09-07 evening
+section is the idle reference). One change, measured on this tree:
+
+Shadow caster LOD: the shadow pass now selects casters from a second
+`simulate_traversal` at the main error threshold x 8 (`--shadow-error-scale`,
+default 8.0, <= 1 disables). Depth-only silhouettes far below the
+2048px-cascade texel footprint cannot survive PCF filtering, so casters
+select their own coarser LOD level; the merged layered shadow pass,
+per-cascade overlap masks, and draw machinery are unchanged. Residency
+merges the shadow selection's pages (matters only for
+`--demand-streaming`). Paired A/B under identical load, minutes apart:
+
+| scene | metric | before | after |
+| --- | --- | --- | --- |
+| massive_city | median ms | 21.18 | 12.14 |
+| massive_city | shadow draws | 20746 | 3239 |
+| massive_city | GPU shadow pass | 3.2-3.9 ms | 0.6-1.5 ms |
+| massive_city | vkQueueSubmit | 9.46 ms | 5.87 ms |
+| massive_city | fence (GPU) | 7.43 ms | 1.88 ms |
+| stanford_dragon | median ms | 11.10 | 8.64 |
+| stanford_dragon | shadow draws | 5532 | 800 |
+| stanford_dragon | GPU shadow pass | ~4.5 ms | 0.32 ms |
+| stanford_dragon | fence (GPU) | 5.50 ms | 2.57 ms |
+
+Main-pass draws are untouched (city 20732, dragon 4002); the shadow
+draw counts match `meridian_trace` selections at threshold x8 exactly
+(city 1955 base + 1284 LOD; the LOD ladder cliffs to 2 clusters just
+above x8, so 8 is the ceiling for the city ladder).
+
+### Per-run results (2026-09-07 17:34, REPEAT=2, loaded machine)
+
+| engine | scene | run | median ms | avg ms | p99 ms | avg fps |
+| --- | --- | --- | --- | --- | --- | --- |
+| renderer | stanford_dragon | 1 | 8.34 | 8.34 | 10.33 | 119.9 |
+| renderer | stanford_dragon | 2 | 8.46 | 8.42 | 10.47 | 118.8 |
+| godot | stanford_dragon | 1 | 16.59 | 16.68 | 19.70 | 59.9 (capped) |
+| godot | stanford_dragon | 2 | 6.91 | 7.93 | 18.76 | 126.1 (unthrottled) |
+| renderer | massive_city | 1 | 13.92 | 14.52 | 23.78 | 68.9 |
+| renderer | massive_city | 2 | 13.05 | 13.27 | 19.02 | 75.4 |
+| godot | massive_city | 1 | 16.75 | 16.65 | 20.29 | 60.1 (capped) |
+| godot | massive_city | 2 | 16.64 | 16.53 | 24.89 | 60.5 (capped) |
+
+Under this load Godot's city runs sat ON the 60 Hz cap with p99 ~25 ms
+(it could not hold 60 fps), so no unthrottled Godot city number was
+obtainable this session. Against the idle-machine unthrottled Godot city
+reference (4.12 ms), the renderer's paired 12.14 ms closes the gap from
+~4.9x to ~2.9x — while itself being load-inflated. Dragon now clears
+100 fps under load (8.3-8.6 ms vs 9.17 ms idle pre-change).
+
+Steady-state renderer profile after (city): submit 5.9 ms, fence 1.9 ms
+(GPU main 1.7-3.4 + shadow 0.6-1.5), traverse 2.8 ms (main + shadow
+traversals), build 1.0 ms, draws main 20732 / shadow 3239.
+
+Verification: clean `-Wall -Wextra -Wpedantic` build of all meridian
+targets; `--validate` clean on dragon + city (only the preexisting
+MoltenVK blend-state warning); `visibility_selection_subset=true` on
+dragon, city, terrace and uv_seam; terrace + uv_seam replays and the
+builder smoke set pass; `--demand-streaming --budget 96` dragon passes
+(page uploads include the shadow-LOD pages; residency held at 95/3617).
+Screenshot pixel-compare was NOT usable this session: the screenshot
+path re-acquires a presented swapchain image, and with a hidden window
+under compositor load that content came back black/non-composited —
+reproduced on the unmodified pre-change binary, so it is an
+environmental flake of the capture path, not a rendering change
+(cross-checked: binary-identical code at `--shadow-error-scale 1`
+produced the same black captures as the changed build, and the scale
+1/2/8 captures were 98.5-99.3% identical to each other with a gradual
+coarsening gradient).
+
+Remaining city gap (~2.9x to the idle unthrottled Godot), in order:
+(a) main-pass draw count 20.7K — the shadow pass is now 3.2K of ~24K
+total encodes, so the MoltenVK per-draw submit tax is dominated by the
+main list; (b) CPU traverse+build ~3.8 ms — serial DFS x2 plus
+per-cluster AABB/cone tests, parallelizable; (c) main-pass GPU 1.7-3.4
+ms under load.
+
 ## 2026-09-07 (evening): submit-path fixes — dragon at parity+, city gap cut 4x
 
 Same machine/os/godot/build recipe as the morning section below. Renderer

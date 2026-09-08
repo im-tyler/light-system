@@ -1,6 +1,6 @@
 # Task List
 
-Last updated: 2026-09-05
+Last updated: 2026-09-07
 
 ## Completed
 
@@ -68,6 +68,7 @@ Last updated: 2026-09-05
 - [x] PCF shadow filtering (8-tap Poisson disk + per-pixel rotation, slope-scaled bias)
 - [x] cascaded shadow maps for outdoor / large scenes (3-cascade, log/uniform split blend, manual depth compare to work around MoltenVK sampler2DArrayShadow limitation)
 - [x] per-cascade frustum culling to reduce 3x draw-submit cost (each cascade now pulls a CPU-filtered subset of the main draw list against its own orthographic frustum; shadow.cascade_draw_lists[3] + shadow.cascade_descriptor_sets[3])
+- [x] shadow caster LOD (2026-09-07): second simulate_traversal at 8x the main error threshold selects casters for the shadow pass (`--shadow-error-scale`, <= 1 disables); residency merges shadow-selection pages under --demand-streaming. City shadow draws 20746 -> 3239 / GPU shadow 3.2-3.9 -> 0.6-1.5ms, dragon 5532 -> 800 / ~4.5 -> 0.32ms; city 21.2 -> 12.1ms, dragon 11.1 -> 8.6ms paired under load (see benchmarks/godot/RESULTS.md)
 
 ## Streaming
 

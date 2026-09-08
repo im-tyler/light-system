@@ -23,7 +23,7 @@ Per-frame pipeline order:
 1. Compute instance culling (frustum 6-plane AABB test, atomic append) -- GPU
 2. Cluster/LOD selection -- **CPU** (`simulate_traversal`) with normal-cone backface cull; output uploaded to the same buffers the GPU shader used to populate. The serial DFS compute shader is retained for reference but not dispatched.
 3. Occlusion refinement (project cluster AABB against previous frame's HZB -- skipped on frame 0) -- GPU compute
-4. Shadow pass (3 cascaded shadow maps, depth-only render from per-cascade orthographic projections that tight-fit the camera sub-frusta, 2048px per cascade in a 2D-array depth image, log/uniform split blend lambda=0.7, depth bias) -- GPU graphics
+4. Shadow pass (3 cascaded shadow maps, depth-only render from per-cascade orthographic projections that tight-fit the camera sub-frusta, 2048px per cascade in a 2D-array depth image, log/uniform split blend lambda=0.7, depth bias) -- GPU graphics. Caster selection uses a second CPU traversal at a coarser error threshold (shadow caster LOD, default 8x `--shadow-error-scale`), so the shadow pass draws far fewer, coarser clusters than the main pass.
 
 5. Main geometry pass (vertex pulling from payload SSBOs, smooth vertex normals + hemisphere ambient + directional lighting + 8-tap Poisson-disk PCF shadow with per-pixel rotation and slope-scaled bias) -- GPU graphics
 6. HZB construction (depth-copy compute shader + per-mip max-downsample cascade) -- GPU compute
@@ -71,6 +71,8 @@ Massive City (1M tris): median 30.6ms / ~33 FPS at the default full-detail thres
 
 Per-cascade culling closed ~8ms of the CSM regression on Dragon (32 -> 24ms) and ~6ms on City (73 -> 67ms) by filtering the CPU draw list against each cascade's orthographic frustum before submitting, so most clusters land in only one or two cascades instead of all three.
 
+Shadow caster LOD (2026-09-07 17:34): the shadow pass selects casters from a second `simulate_traversal` at 8x the main error threshold (`--shadow-error-scale`, <= 1 disables and shares the main selection); residency merges the shadow selection's pages for `--demand-streaming`. City shadow draws 20746 -> 3239, dragon 5532 -> 800; GPU shadow pass city 3.2-3.9 -> 0.6-1.5ms, dragon ~4.5 -> 0.32ms. Under-load paired A/B: city 21.2 -> 12.1ms, dragon 11.1 -> 8.6ms (idle-machine Godot city reference 4.12ms unthrottled: gap ~4.9x -> ~2.9x). The remaining city gap is main-pass draw count + submit tax (shadow is now 3.2K of ~24K encodes), CPU traverse+build, and main-pass GPU. The city LOD ladder cliffs to 2 clusters just above 8x, so 8 is the ladder ceiling for that asset.
+
 Per-pass GPU (Dragon, steady state): cull 0.1ms, sel 0.0ms (CPU), occ 0.05ms, shadow 3-5ms, main 2-4ms, hzb 0.1-0.2ms.
 
 Per-frame CPU (emitted every 60 frames as `MERIDIAN_CPU: ...`, measured post-CSM + per-cascade culling):
@@ -82,7 +84,7 @@ Per-frame CPU (emitted every 60 frames as `MERIDIAN_CPU: ...`, measured post-CSM
 
 - (done 2026-09-08) persisted `.vgeo` inputs mmap directly (header-validated); startup temp write only for non-.vgeo inputs. Also fixed silent streamed-payload corruption (payload offsets omitted the base-run table — 229KB shift on dragon; streamed vs resident is now bit-identical on terrace) and added MADV_DONTNEED on eviction.
 - Per-material textures, real image decode, compression, mipmaps (v1 = one embedded checker), OBJ `vt` import
-- Godot gap after 2026-09-08 perf work: dragon 9.2ms (clears 60fps, faster than Godot's capped reading); city 20.4ms vs 4.12ms unthrottled (~4.9x, GPU-bound: shadow caster LOD, ~8.4ms submits, 3.3ms CPU DFS) — root cause of the old 2x submit overhead was MoltenVK's drawIndirectCount stub (fallback drew capacity counts)
+- Godot gap after shadow caster LOD (2026-09-07 17:34, loaded machine — see benchmarks/godot/RESULTS.md): dragon 8.3-8.6ms under load (9.17ms idle pre-change; clears 100fps); city 12.1-13.9ms vs 4.12ms idle unthrottled Godot (~2.9x, was ~4.9x), GPU-bound component resolved (shadow pass now 0.6-1.5ms) — remaining gap is main-pass draws/submit tax (~20.7K encodes), CPU traverse+build (~3.8ms), main GPU. Shadow caster LOD shipped; distance/texel-size caster culling deemed redundant at current cluster sizes.
 - Broader glTF import coverage
 - **Normal-cone cull FIXED 2026-09-08 (schema v5)**: culls per meshopt's canonical test (dot >= cutoff*len + radius) with bounding-sphere center+radius threaded through cluster records, CPU selection, and compute shaders. The old test was inverted — it culled front-facing tight cones and kept back-facing ones; the documented past 'culling gains' were the wrong half. uv_seam now renders (0 -> 69K visible px); dragon 4101->4002 draws, city 20.9->19.3ms; subset property holds on all scenes.
 - (fixed 2026-09-08) screenshot acquire path validated clean.
