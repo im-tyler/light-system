@@ -85,6 +85,10 @@ struct UploadedSceneBuffers {
 
 struct DebugRenderContext {
     VkRenderPass render_pass = VK_NULL_HANDLE;
+    // Same pass with the visibility attachment store-op flipped to
+    // DONT_CARE; used for all frames except the capture frame that the
+    // post-loop diagnostic epilogue reads back.
+    VkRenderPass render_pass_transient = VK_NULL_HANDLE;
     VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
     std::vector<VkFramebuffer> framebuffers;

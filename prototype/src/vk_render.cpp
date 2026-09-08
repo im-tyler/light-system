@@ -445,6 +445,22 @@ VkResult create_debug_render_context(VkPhysicalDevice physical_device, VkDevice 
         return result;
     }
 
+    // Transient variant: identical except the visibility attachment is not
+    // stored. The visibility image is only read once per run (diagnostic
+    // epilogue copy after the final frame), so normal frames skip the
+    // 7.3MB store-back. Store-op differences do not affect render-pass
+    // compatibility, so the framebuffers created against context.render_pass
+    // are used with either pass.
+    VkAttachmentDescription transient_attachments[] = {color_attachment, depth_attachment,
+                                                       visibility_attachment};
+    transient_attachments[2].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    render_pass_info.pAttachments = transient_attachments;
+    result = vkCreateRenderPass(device, &render_pass_info, nullptr,
+                                &context.render_pass_transient);
+    if (result != VK_SUCCESS) {
+        return result;
+    }
+
     const std::string vertex_shader_source = load_shader_source(resolve_shader_path("main_geometry.vert"));
     const std::string fragment_shader_source = load_shader_source(resolve_shader_path("main_geometry.frag"));
 

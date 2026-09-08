@@ -779,6 +779,9 @@ void destroy_debug_render_context(VkDevice device, DebugRenderContext& context) 
     if (context.pipeline_layout != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(device, context.pipeline_layout, nullptr);
     }
+    if (context.render_pass_transient != VK_NULL_HANDLE) {
+        vkDestroyRenderPass(device, context.render_pass_transient, nullptr);
+    }
     if (context.render_pass != VK_NULL_HANDLE) {
         vkDestroyRenderPass(device, context.render_pass, nullptr);
     }
@@ -1481,20 +1484,29 @@ constexpr uint32_t kDrawBucketCount = 4;
 // for instance-folded submission. Reorders entries bucket-major and
 // reassigns draw_first_instance = global_index * instance_stride so the
 // vertex shader still resolves its entry from gl_InstanceIndex. Returns
-// the number of nonempty buckets.
+// the number of nonempty buckets. When wasted_vertex_invocations is given
+// it receives (encoded - useful) vertex-shader invocations for the fold:
+// every instance in a bucket draws the bucket's max corner count, so
+// clusters below the max contribute degenerate-corner vertices (and, for
+// the strided shadow list, unused stride slots contribute whole
+// degenerate instances).
 uint32_t fold_draws_into_buckets(std::vector<GpuDrawEntry>& draws,
                                  uint32_t instance_stride,
-                                 DrawBucket (&buckets)[kDrawBucketCount]) {
+                                 DrawBucket (&buckets)[kDrawBucketCount],
+                                 uint64_t* wasted_vertex_invocations = nullptr) {
     for (uint32_t b = 0; b < kDrawBucketCount; ++b) {
         buckets[b] = {};
     }
     if (draws.empty()) {
         return 0;
     }
+    uint64_t useful_vertex_invocations = 0;
     std::vector<uint32_t> corner_counts;
     corner_counts.reserve(draws.size());
     for (const GpuDrawEntry& e : draws) {
         corner_counts.push_back(e.draw_vertex_count);
+        useful_vertex_invocations +=
+            static_cast<uint64_t>(e.draw_vertex_count) * e.draw_instance_count;
     }
     uint32_t bucket_edges[kDrawBucketCount - 1] = {};
     if (corner_counts.size() >= kDrawBucketCount) {
@@ -1540,7 +1552,247 @@ uint32_t fold_draws_into_buckets(std::vector<GpuDrawEntry>& draws,
         folded[i].draw_first_instance = i * instance_stride;
     }
     draws.swap(folded);
+    if (wasted_vertex_invocations != nullptr) {
+        uint64_t encoded_vertex_invocations = 0;
+        for (uint32_t b = 0; b < kDrawBucketCount; ++b) {
+            encoded_vertex_invocations += static_cast<uint64_t>(buckets[b].vertex_count) *
+                                          buckets[b].instance_count;
+        }
+        *wasted_vertex_invocations =
+            encoded_vertex_invocations > useful_vertex_invocations
+                ? encoded_vertex_invocations - useful_vertex_invocations
+                : 0;
+    }
     return nonempty;
+}
+
+// Per-frame GPU passes that no draw path consumes are recorded here once
+// per run (see submit_diagnostic_epilogue) instead of every frame:
+//   - instance cull: its output only fed the retained-but-not-dispatched
+//     cluster_select compute shader; the report reads the survivor counter.
+//   - occlusion refine + HZB: only the drawIndirectCount path can consume
+//     the GPU-written survivor list, so on the MoltenVK fallback they are
+//     dead work per frame (the fallback folds the CPU list).
+//   - visibility image -> buffer copy: read back once after the present
+//     loop by analyze_visibility_readback; copying 921K pixels x 8 bytes
+//     every frame cost a Metal blit encode plus two barriers for nothing.
+void record_instance_cull_pass(VkCommandBuffer cmd, const ComputeCullContext& compute_cull,
+                               const FrustumPlanes& frustum) {
+    vkCmdFillBuffer(cmd, compute_cull.counter.buffer, 0, sizeof(uint32_t), 0);
+
+    VkMemoryBarrier fill_barrier{};
+    fill_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    fill_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    fill_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &fill_barrier,
+                         0, nullptr, 0, nullptr);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, compute_cull.pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            compute_cull.pipeline_layout, 0, 1, &compute_cull.descriptor_set,
+                            0, nullptr);
+
+    CullPushConstants cull_push{};
+    std::memcpy(cull_push.frustum_planes, frustum.planes, sizeof(frustum.planes));
+    cull_push.instance_count = compute_cull.max_instances;
+    vkCmdPushConstants(cmd, compute_cull.pipeline_layout,
+                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(CullPushConstants), &cull_push);
+
+    const uint32_t group_count = (compute_cull.max_instances + 63) / 64;
+    vkCmdDispatch(cmd, group_count, 1, 1);
+
+    VkMemoryBarrier compute_barrier{};
+    compute_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    compute_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    compute_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 1, &compute_barrier, 0, nullptr, 0, nullptr);
+}
+
+void record_occlusion_refine_pass(VkCommandBuffer cmd,
+                                  const OcclusionRefineContext& occlusion_refine,
+                                  const HzbContext& hzb,
+                                  const ComputeSelectionContext& compute_selection,
+                                  const CameraFrameData& camera_frame) {
+    vkCmdFillBuffer(cmd, occlusion_refine.output_count.buffer, 0, sizeof(uint32_t), 0);
+
+    VkMemoryBarrier fill_bar{};
+    fill_bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    fill_bar.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    fill_bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &fill_bar,
+                         0, nullptr, 0, nullptr);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, occlusion_refine.pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            occlusion_refine.pipeline_layout, 0, 1,
+                            &occlusion_refine.descriptor_set, 0, nullptr);
+
+    OcclusionPushConstants occ_push{};
+    std::memcpy(occ_push.view_projection, camera_frame.view_projection.m,
+                sizeof(occ_push.view_projection));
+    occ_push.hzb_width = hzb.width;
+    occ_push.hzb_height = hzb.height;
+    vkCmdPushConstants(cmd, occlusion_refine.pipeline_layout,
+                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(OcclusionPushConstants), &occ_push);
+
+    const uint32_t occ_groups = (compute_selection.max_draws + 63) / 64;
+    vkCmdDispatch(cmd, std::max(occ_groups, 1u), 1, 1);
+
+    VkMemoryBarrier occ_bar{};
+    occ_bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    occ_bar.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    occ_bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+                            VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT |
+                         VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+                         0, 1, &occ_bar, 0, nullptr, 0, nullptr);
+}
+
+// HZB build from the main-pass depth image. depth_old_layout depends on the
+// caller: the drawIndirectCount path builds the HZB every frame right after
+// the main pass (DEPTH_STENCIL_ATTACHMENT_OPTIMAL), the diagnostic epilogue
+// builds it once from the final frame's depth (same layout on the fallback
+// path because no per-frame HZB transition ran).
+void record_hzb_build_pass(VkCommandBuffer cmd, const HzbContext& hzb, VkImage depth_image,
+                           VkImageLayout depth_old_layout) {
+    VkImageMemoryBarrier depth_to_read{};
+    depth_to_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    depth_to_read.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    depth_to_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    depth_to_read.oldLayout = depth_old_layout;
+    depth_to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    depth_to_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    depth_to_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    depth_to_read.image = depth_image;
+    depth_to_read.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    depth_to_read.subresourceRange.levelCount = 1;
+    depth_to_read.subresourceRange.layerCount = 1;
+
+    VkImageMemoryBarrier hzb_all_to_general{};
+    hzb_all_to_general.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    hzb_all_to_general.srcAccessMask = 0;
+    hzb_all_to_general.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    hzb_all_to_general.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    hzb_all_to_general.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    hzb_all_to_general.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    hzb_all_to_general.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    hzb_all_to_general.image = hzb.image;
+    hzb_all_to_general.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    hzb_all_to_general.subresourceRange.levelCount = hzb.mip_count;
+    hzb_all_to_general.subresourceRange.layerCount = 1;
+
+    VkImageMemoryBarrier pre_barriers[2] = {depth_to_read, hzb_all_to_general};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
+                         2, pre_barriers);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, hzb.depth_copy_pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            hzb.depth_copy_pipeline_layout, 0, 1,
+                            &hzb.depth_copy_descriptor_set, 0, nullptr);
+    vkCmdDispatch(cmd, (hzb.width + 7) / 8, (hzb.height + 7) / 8, 1);
+
+    VkMemoryBarrier mip0_visibility{};
+    mip0_visibility.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mip0_visibility.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mip0_visibility.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mip0_visibility, 0,
+                         nullptr, 0, nullptr);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, hzb.pipeline);
+    uint32_t src_w = hzb.width, src_h = hzb.height;
+    for (uint32_t mip = 0; mip + 1 < hzb.mip_count; ++mip) {
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                hzb.pipeline_layout, 0, 1, &hzb.mip_descriptor_sets[mip],
+                                0, nullptr);
+
+        uint32_t push_data[2] = {src_w, src_h};
+        vkCmdPushConstants(cmd, hzb.pipeline_layout,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, push_data);
+
+        const uint32_t dst_w = std::max(src_w / 2, 1u);
+        const uint32_t dst_h = std::max(src_h / 2, 1u);
+        vkCmdDispatch(cmd, (dst_w + 7) / 8, (dst_h + 7) / 8, 1);
+
+        if (mip + 2 < hzb.mip_count) {
+            VkMemoryBarrier mip_visibility{};
+            mip_visibility.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            mip_visibility.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            mip_visibility.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mip_visibility,
+                                 0, nullptr, 0, nullptr);
+        }
+        src_w = dst_w;
+        src_h = dst_h;
+    }
+
+    VkImageMemoryBarrier hzb_to_read{};
+    hzb_to_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    hzb_to_read.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    hzb_to_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    hzb_to_read.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    hzb_to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    hzb_to_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    hzb_to_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    hzb_to_read.image = hzb.image;
+    hzb_to_read.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    hzb_to_read.subresourceRange.levelCount = hzb.mip_count;
+    hzb_to_read.subresourceRange.layerCount = 1;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
+                         1, &hzb_to_read);
+}
+
+void record_visibility_copy_pass(VkCommandBuffer cmd, const DebugRenderContext& debug_render,
+                                 VkExtent2D extent) {
+    VkImageMemoryBarrier image_barrier{};
+    image_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    image_barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    image_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    image_barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    image_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    image_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    image_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    image_barrier.image = debug_render.visibility_image;
+    image_barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    image_barrier.subresourceRange.baseMipLevel = 0;
+    image_barrier.subresourceRange.levelCount = 1;
+    image_barrier.subresourceRange.baseArrayLayer = 0;
+    image_barrier.subresourceRange.layerCount = 1;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                         &image_barrier);
+
+    VkBufferImageCopy copy_region{};
+    copy_region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copy_region.imageSubresource.mipLevel = 0;
+    copy_region.imageSubresource.baseArrayLayer = 0;
+    copy_region.imageSubresource.layerCount = 1;
+    copy_region.imageExtent.width = extent.width;
+    copy_region.imageExtent.height = extent.height;
+    copy_region.imageExtent.depth = 1;
+    vkCmdCopyImageToBuffer(cmd, debug_render.visibility_image,
+                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           debug_render.visibility_readback_buffer.buffer, 1, &copy_region);
+
+    VkBufferMemoryBarrier buffer_barrier{};
+    buffer_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    buffer_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    buffer_barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    buffer_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    buffer_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    buffer_barrier.buffer = debug_render.visibility_readback_buffer.buffer;
+    buffer_barrier.size = debug_render.visibility_readback_buffer.size;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &buffer_barrier, 0,
+                         nullptr);
 }
 
 VkResult record_debug_command_buffer(FrameContext& frame, const DebugRenderContext& debug_render,
@@ -1558,10 +1810,11 @@ VkResult record_debug_command_buffer(FrameContext& frame, const DebugRenderConte
                                        uint32_t frame_index,
                                        uint32_t image_index,
                                        bool has_draw_indirect_count,
-                                       uint32_t shadow_draw_count,
-                                       const DrawBucket* shadow_buckets,
-                                       const DrawBucket* main_buckets,
-                                       const GpuProfiler& profiler) {
+                                        uint32_t shadow_draw_count,
+                                        const DrawBucket* shadow_buckets,
+                                        const DrawBucket* main_buckets,
+                                        const GpuProfiler& profiler,
+                                        bool capture_visibility) {
     VkCommandBufferBeginInfo begin_info{};
     begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     VkResult result = vkBeginCommandBuffer(frame.command_buffer, &begin_info);
@@ -1578,41 +1831,10 @@ VkResult record_debug_command_buffer(FrameContext& frame, const DebugRenderConte
                             profiler.query_pool, 12); // total start
     }
 
-    // Compute instance culling pass
-    if (compute_cull.pipeline != VK_NULL_HANDLE && compute_cull.descriptor_set != VK_NULL_HANDLE) {
-        // Reset counter to zero
-        vkCmdFillBuffer(frame.command_buffer, compute_cull.counter.buffer, 0, sizeof(uint32_t), 0);
-
-        VkMemoryBarrier fill_barrier{};
-        fill_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        fill_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        fill_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-        vkCmdPipelineBarrier(frame.command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &fill_barrier,
-                             0, nullptr, 0, nullptr);
-
-        vkCmdBindPipeline(frame.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, compute_cull.pipeline);
-        vkCmdBindDescriptorSets(frame.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                compute_cull.pipeline_layout, 0, 1, &compute_cull.descriptor_set,
-                                0, nullptr);
-
-        CullPushConstants cull_push{};
-        std::memcpy(cull_push.frustum_planes, frustum.planes, sizeof(frustum.planes));
-        cull_push.instance_count = compute_cull.max_instances;
-        vkCmdPushConstants(frame.command_buffer, compute_cull.pipeline_layout,
-                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(CullPushConstants), &cull_push);
-
-        const uint32_t group_count = (compute_cull.max_instances + 63) / 64;
-        vkCmdDispatch(frame.command_buffer, group_count, 1, 1);
-
-        VkMemoryBarrier compute_barrier{};
-        compute_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        compute_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        compute_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
-        vkCmdPipelineBarrier(frame.command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             0, 1, &compute_barrier, 0, nullptr, 0, nullptr);
-    }
+    // Instance culling runs once in the diagnostic epilogue (see
+    // submit_diagnostic_epilogue): its output only fed the retained
+    // cluster_select shader, which is not dispatched, and the report reads
+    // the survivor counter after the loop.
 
     if (profiler.query_pool != VK_NULL_HANDLE) {
         vkCmdWriteTimestamp(frame.command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
@@ -1644,46 +1866,16 @@ VkResult record_debug_command_buffer(FrameContext& frame, const DebugRenderConte
                             profiler.query_pool, 4); // occ start
     }
 
-    // Occlusion refinement pass (uses previous frame's HZB; skip frame 0)
-    if (frame_index > 0 && occlusion_refine.pipeline != VK_NULL_HANDLE &&
+    // Occlusion refinement pass (uses previous frame's HZB; skip frame 0).
+    // Only the drawIndirectCount path can consume the GPU-written survivor
+    // list; on the fallback (MoltenVK) the CPU-folded list is drawn directly
+    // and this pass is dead per-frame work, so it runs once in the
+    // diagnostic epilogue instead.
+    if (has_draw_indirect_count && frame_index > 0 &&
+        occlusion_refine.pipeline != VK_NULL_HANDLE &&
         occlusion_refine.descriptor_set != VK_NULL_HANDLE) {
-        vkCmdFillBuffer(frame.command_buffer, occlusion_refine.output_count.buffer, 0,
-                        sizeof(uint32_t), 0);
-
-        VkMemoryBarrier fill_bar{};
-        fill_bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        fill_bar.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        fill_bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-        vkCmdPipelineBarrier(frame.command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &fill_bar,
-                             0, nullptr, 0, nullptr);
-
-        vkCmdBindPipeline(frame.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                          occlusion_refine.pipeline);
-        vkCmdBindDescriptorSets(frame.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                occlusion_refine.pipeline_layout, 0, 1,
-                                &occlusion_refine.descriptor_set, 0, nullptr);
-
-        OcclusionPushConstants occ_push{};
-        std::memcpy(occ_push.view_projection, camera_frame.view_projection.m,
-                    sizeof(occ_push.view_projection));
-        occ_push.hzb_width = hzb.width;
-        occ_push.hzb_height = hzb.height;
-        vkCmdPushConstants(frame.command_buffer, occlusion_refine.pipeline_layout,
-                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(OcclusionPushConstants), &occ_push);
-
-        const uint32_t occ_groups = (compute_selection.max_draws + 63) / 64;
-        vkCmdDispatch(frame.command_buffer, std::max(occ_groups, 1u), 1, 1);
-
-        VkMemoryBarrier occ_bar{};
-        occ_bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        occ_bar.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        occ_bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT |
-                                VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
-        vkCmdPipelineBarrier(frame.command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT |
-                             VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
-                             0, 1, &occ_bar, 0, nullptr, 0, nullptr);
+        record_occlusion_refine_pass(frame.command_buffer, occlusion_refine, hzb,
+                                     compute_selection, camera_frame);
     }
 
     if (profiler.query_pool != VK_NULL_HANDLE) {
@@ -1767,7 +1959,11 @@ VkResult record_debug_command_buffer(FrameContext& frame, const DebugRenderConte
 
     VkRenderPassBeginInfo render_pass_info{};
     render_pass_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    render_pass_info.renderPass = debug_render.render_pass;
+    render_pass_info.renderPass = capture_visibility && debug_render.render_pass != VK_NULL_HANDLE
+        ? debug_render.render_pass
+        : (debug_render.render_pass_transient != VK_NULL_HANDLE
+               ? debug_render.render_pass_transient
+               : debug_render.render_pass);
     render_pass_info.framebuffer = debug_render.framebuffers[image_index];
     render_pass_info.renderArea.extent = swapchain.extent;
     render_pass_info.clearValueCount = 3;
@@ -1841,104 +2037,13 @@ VkResult record_debug_command_buffer(FrameContext& frame, const DebugRenderConte
                             profiler.query_pool, 10); // hzb start
     }
 
-    // HZB build: use the downsample shader to seed mip 0 from depth, then cascade
-    if (hzb.pipeline != VK_NULL_HANDLE && hzb.mip_count > 1 && hzb.depth_copy_pipeline != VK_NULL_HANDLE) {
-        // Transition depth to shader-readable, HZB mip 0 to general for storage write
-        VkImageMemoryBarrier depth_to_read{};
-        depth_to_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        depth_to_read.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-        depth_to_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        depth_to_read.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-        depth_to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        depth_to_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        depth_to_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        depth_to_read.image = debug_render.depth_image;
-        depth_to_read.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-        depth_to_read.subresourceRange.levelCount = 1;
-        depth_to_read.subresourceRange.layerCount = 1;
-
-        VkImageMemoryBarrier hzb_all_to_general{};
-        hzb_all_to_general.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        hzb_all_to_general.srcAccessMask = 0;
-        hzb_all_to_general.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        hzb_all_to_general.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        hzb_all_to_general.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        hzb_all_to_general.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        hzb_all_to_general.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        hzb_all_to_general.image = hzb.image;
-        hzb_all_to_general.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        hzb_all_to_general.subresourceRange.levelCount = hzb.mip_count;
-        hzb_all_to_general.subresourceRange.layerCount = 1;
-
-        VkImageMemoryBarrier pre_barriers[2] = {depth_to_read, hzb_all_to_general};
-        vkCmdPipelineBarrier(frame.command_buffer,
-                             VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
-                             2, pre_barriers);
-
-        // Dispatch depth-copy shader to write depth into HZB mip 0
-        vkCmdBindPipeline(frame.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                          hzb.depth_copy_pipeline);
-        vkCmdBindDescriptorSets(frame.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                hzb.depth_copy_pipeline_layout, 0, 1,
-                                &hzb.depth_copy_descriptor_set, 0, nullptr);
-        vkCmdDispatch(frame.command_buffer, (hzb.width + 7) / 8, (hzb.height + 7) / 8, 1);
-
-        // Barrier: mip 0 writes visible to the downsample reads (layout stays GENERAL)
-        VkMemoryBarrier mip0_visibility{};
-        mip0_visibility.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        mip0_visibility.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        mip0_visibility.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier(frame.command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mip0_visibility, 0,
-                             nullptr, 0, nullptr);
-
-        // Downsample each mip level
-        vkCmdBindPipeline(frame.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, hzb.pipeline);
-        uint32_t src_w = hzb.width, src_h = hzb.height;
-        for (uint32_t mip = 0; mip + 1 < hzb.mip_count; ++mip) {
-            vkCmdBindDescriptorSets(frame.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                    hzb.pipeline_layout, 0, 1, &hzb.mip_descriptor_sets[mip],
-                                    0, nullptr);
-
-            uint32_t push_data[2] = {src_w, src_h};
-            vkCmdPushConstants(frame.command_buffer, hzb.pipeline_layout,
-                               VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, push_data);
-
-            const uint32_t dst_w = std::max(src_w / 2, 1u);
-            const uint32_t dst_h = std::max(src_h / 2, 1u);
-            vkCmdDispatch(frame.command_buffer, (dst_w + 7) / 8, (dst_h + 7) / 8, 1);
-
-            // Barrier: written mip visible to the next downsample step (layout stays GENERAL)
-            if (mip + 2 < hzb.mip_count) {
-                VkMemoryBarrier mip_visibility{};
-                mip_visibility.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-                mip_visibility.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-                mip_visibility.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-                vkCmdPipelineBarrier(frame.command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mip_visibility,
-                                     0, nullptr, 0, nullptr);
-            }
-            src_w = dst_w;
-            src_h = dst_h;
-        }
-
-        // Transition entire HZB to shader-readable for occlusion testing
-        VkImageMemoryBarrier hzb_to_read{};
-        hzb_to_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        hzb_to_read.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        hzb_to_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        hzb_to_read.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-        hzb_to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        hzb_to_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        hzb_to_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        hzb_to_read.image = hzb.image;
-        hzb_to_read.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        hzb_to_read.subresourceRange.levelCount = hzb.mip_count;
-        hzb_to_read.subresourceRange.layerCount = 1;
-        vkCmdPipelineBarrier(frame.command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
-                             1, &hzb_to_read);
+    // HZB build: only needed per frame where the occlusion-refined list is
+    // consumed (drawIndirectCount path). The fallback builds it once in the
+    // diagnostic epilogue for the survivor-count report.
+    if (has_draw_indirect_count && hzb.pipeline != VK_NULL_HANDLE && hzb.mip_count > 1 &&
+        hzb.depth_copy_pipeline != VK_NULL_HANDLE) {
+        record_hzb_build_pass(frame.command_buffer, hzb, debug_render.depth_image,
+                              VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
     }
 
     // (Occlusion refinement moved before shadow/main passes above)
@@ -1950,48 +2055,82 @@ VkResult record_debug_command_buffer(FrameContext& frame, const DebugRenderConte
                             profiler.query_pool, 13); // total end
     }
 
-    VkImageMemoryBarrier image_barrier{};
-    image_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    image_barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    image_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    image_barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-    image_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    image_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    image_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    image_barrier.image = debug_render.visibility_image;
-    image_barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    image_barrier.subresourceRange.baseMipLevel = 0;
-    image_barrier.subresourceRange.levelCount = 1;
-    image_barrier.subresourceRange.baseArrayLayer = 0;
-    image_barrier.subresourceRange.layerCount = 1;
-    vkCmdPipelineBarrier(frame.command_buffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
-                         &image_barrier);
+    // The visibility image -> readback-buffer copy moved to the diagnostic
+    // epilogue: analyze_visibility_readback consumes it once after the
+    // present loop, so the per-frame 7.3MB blit encode plus two barriers
+    // and an image layout round-trip were pure submit cost.
 
-    VkBufferImageCopy copy_region{};
-    copy_region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    copy_region.imageSubresource.mipLevel = 0;
-    copy_region.imageSubresource.baseArrayLayer = 0;
-    copy_region.imageSubresource.layerCount = 1;
-    copy_region.imageExtent.width = swapchain.extent.width;
-    copy_region.imageExtent.height = swapchain.extent.height;
-    copy_region.imageExtent.depth = 1;
-    vkCmdCopyImageToBuffer(frame.command_buffer, debug_render.visibility_image,
-                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           debug_render.visibility_readback_buffer.buffer, 1, &copy_region);
-
-    VkBufferMemoryBarrier buffer_barrier{};
-    buffer_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-    buffer_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    buffer_barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-    buffer_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    buffer_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    buffer_barrier.buffer = debug_render.visibility_readback_buffer.buffer;
-    buffer_barrier.size = debug_render.visibility_readback_buffer.size;
-    vkCmdPipelineBarrier(frame.command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &buffer_barrier, 0,
-                         nullptr);
     return vkEndCommandBuffer(frame.command_buffer);
+}
+
+// One-shot submit after the present loop that refreshes every diagnostic the
+// report still needs: the instance-cull survivor counter (dropped from the
+// per-frame stream -- only the not-dispatched cluster_select shader ever
+// read it), the occlusion survivor count on the fallback path (HZB build +
+// refine against the final frame's depth and draw list), and the visibility
+// readback copy that analyze_visibility_readback consumes. Semantics note:
+// the per-frame occlusion pass tested the CURRENT draw list against the
+// PREVIOUS frame's HZB; the epilogue tests the final list against the final
+// frame's own HZB (identical in the static-camera benchmark/validate runs).
+VkResult submit_diagnostic_epilogue(VkDevice device, VkQueue queue, FrameContext& frame,
+                                    const DebugRenderContext& debug_render,
+                                    const ComputeCullContext& compute_cull,
+                                    const ComputeSelectionContext& compute_selection,
+                                    const HzbContext& hzb,
+                                    const OcclusionRefineContext& occlusion_refine,
+                                    const CameraFrameData& camera_frame,
+                                    const FrustumPlanes& frustum,
+                                    const SwapchainContext& swapchain,
+                                    bool has_draw_indirect_count) {
+    const bool need_cull = compute_cull.pipeline != VK_NULL_HANDLE &&
+                           compute_cull.descriptor_set != VK_NULL_HANDLE;
+    const bool need_occ = !has_draw_indirect_count &&
+                          occlusion_refine.pipeline != VK_NULL_HANDLE &&
+                          occlusion_refine.descriptor_set != VK_NULL_HANDLE &&
+                          hzb.pipeline != VK_NULL_HANDLE && hzb.mip_count > 1 &&
+                          hzb.depth_copy_pipeline != VK_NULL_HANDLE;
+    const bool need_copy = debug_render.visibility_image != VK_NULL_HANDLE &&
+                           debug_render.visibility_readback_buffer.buffer != VK_NULL_HANDLE;
+    if (!need_cull && !need_occ && !need_copy) {
+        return VK_SUCCESS;
+    }
+
+    vkResetCommandPool(device, frame.command_pool, 0);
+    VkCommandBufferBeginInfo begin{};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VkResult result = vkBeginCommandBuffer(frame.command_buffer, &begin);
+    if (result != VK_SUCCESS) {
+        return result;
+    }
+
+    if (need_cull) {
+        record_instance_cull_pass(frame.command_buffer, compute_cull, frustum);
+    }
+    if (need_occ) {
+        record_hzb_build_pass(frame.command_buffer, hzb, debug_render.depth_image,
+                              VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        record_occlusion_refine_pass(frame.command_buffer, occlusion_refine, hzb,
+                                     compute_selection, camera_frame);
+    }
+    if (need_copy) {
+        record_visibility_copy_pass(frame.command_buffer, debug_render, swapchain.extent);
+    }
+
+    result = vkEndCommandBuffer(frame.command_buffer);
+    if (result != VK_SUCCESS) {
+        return result;
+    }
+
+    VkSubmitInfo submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &frame.command_buffer;
+    result = vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
+    if (result != VK_SUCCESS) {
+        return result;
+    }
+    return vkQueueWaitIdle(queue);
 }
 
 #endif
@@ -2230,7 +2369,7 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
         vkGetDeviceQueue(device, selection.queues.present_family, 0, &present_queue);
 
         // Create GPU profiler (7 timer pairs: cull, sel, occ, shadow, main, hzb, total)
-        {
+        if (config.enable_gpu_timers) {
             VkResult prof_result = create_gpu_profiler(selection.physical_device, device, 7, gpu_profiler);
             if (prof_result == VK_SUCCESS) {
                 gpu_profiler.names[0] = "cull";
@@ -3282,6 +3421,8 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             uint32_t shadow_draw_count = 0;
             uint32_t main_encode_count = 0;
             uint32_t shadow_encode_count = 0;
+            uint64_t main_wasted_vs = 0;
+            uint64_t shadow_wasted_vs = 0;
             DrawBucket main_buckets[kDrawBucketCount] = {};
             DrawBucket shadow_buckets[kDrawBucketCount] = {};
             {
@@ -3527,9 +3668,10 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                 // vertex shader recovers the entry index). Entry order
                 // changes bucket-major; the shaders resolve entries through
                 // gl_InstanceIndex, so no other consumer cares about order.
-                main_encode_count = fold_draws_into_buckets(cpu_draws, 1, main_buckets);
-                shadow_encode_count =
-                    fold_draws_into_buckets(shadow_draws, kShadowInstanceStride, shadow_buckets);
+                main_encode_count =
+                    fold_draws_into_buckets(cpu_draws, 1, main_buckets, &main_wasted_vs);
+                shadow_encode_count = fold_draws_into_buckets(shadow_draws, kShadowInstanceStride,
+                                                               shadow_buckets, &shadow_wasted_vs);
                 auto t_build_end = clock_t::now();
                 acc_build_ms +=
                     std::chrono::duration<double, std::milli>(t_build_end - t_build_start).count();
@@ -3574,13 +3716,20 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
 
             // frustum was already extracted above for cluster-level CPU culling
             auto t_cmdrec_start = clock_t::now();
+            // Capture frame for the visibility readback: the final index of
+            // a fixed-count run, or every frame while interactive (the loop
+            // breaks on close before rendering the observing frame, so no
+            // last-frame signal exists there).
+            const bool capture_visibility =
+                config.interactive || (frame_index + 1 == config.present_frame_count);
             result = record_debug_command_buffer(frame, debug_render, compute_cull, compute_selection,
                                                  hzb, occlusion_refine, shadow, swapchain,
                                                  camera_frame, frustum, error_threshold,
                                                  selection_for_frame, report.uploadable_scene,
                                                  frame_index, image_index,
                                                  has_draw_indirect_count, shadow_draw_count,
-                                                 shadow_buckets, main_buckets, gpu_profiler);
+                                                 shadow_buckets, main_buckets, gpu_profiler,
+                                                 capture_visibility);
             auto t_cmdrec_end = clock_t::now();
             acc_cmdrec_ms +=
                 std::chrono::duration<double, std::milli>(t_cmdrec_end - t_cmdrec_start).count();
@@ -3615,7 +3764,7 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             cpu_prof_samples++;
             if (cpu_prof_samples % 60 == 0) {
                 std::fprintf(stderr,
-                    "MERIDIAN_CPU: threads=%u traverse=%.2f residency=%.2f build=%.2f upload=%.2f cmdrec=%.2f submit=%.2f fence=%.2f present=%.2f draws=main:%u shadow:%u encodes main:%u shadow:%u (ms/frame, n=%u)\n",
+                    "MERIDIAN_CPU: threads=%u traverse=%.2f residency=%.2f build=%.2f upload=%.2f cmdrec=%.2f submit=%.2f fence=%.2f present=%.2f draws=main:%u shadow:%u encodes main:%u shadow:%u wastedvs main:%llu shadow:%llu (ms/frame, n=%u)\n",
                     resolved_worker_threads,
                     acc_traverse_ms / cpu_prof_samples,
                     acc_residency_ms / cpu_prof_samples,
@@ -3629,6 +3778,8 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                     shadow_draw_count,
                     main_encode_count,
                     shadow_encode_count,
+                    static_cast<unsigned long long>(main_wasted_vs),
+                    static_cast<unsigned long long>(shadow_wasted_vs),
                     cpu_prof_samples);
             }
             if (result != VK_SUCCESS) {
@@ -3672,6 +3823,27 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
         }
 
         vkDeviceWaitIdle(device);
+        // Diagnostic epilogue: refreshes the cull counter, the fallback-path
+        // occlusion survivor count, and the visibility readback in one
+        // post-loop submit so none of them cost per-frame submit time.
+        // Runs after the device wait (the pool reset inside needs the last
+        // frame's command buffer retired) and blocks once on its own queue.
+        if (report.presented_frame_count > 0) {
+            const FrustumPlanes epilogue_frustum =
+                extract_frustum_planes(camera_frame.view_projection);
+            result = submit_diagnostic_epilogue(device, graphics_queue, frame, debug_render,
+                                                compute_cull, compute_selection, hzb,
+                                                occlusion_refine, camera_frame,
+                                                epilogue_frustum, swapchain,
+                                                has_draw_indirect_count);
+            if (result != VK_SUCCESS) {
+                std::ostringstream message;
+                message << "diagnostic epilogue submit failed with code " << result;
+                report.status = message.str();
+                cleanup();
+                return report;
+            }
+        }
         // Tear down the async reader and remove the temp .vgeo before the
         // visibility readback / cleanup path runs. Closing here instead of
         // in `cleanup` keeps the reader local to the streaming block where

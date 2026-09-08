@@ -18,7 +18,9 @@ void print_usage() {
                  "  (default 8.0; <= 1 shares the main-pass selection)\n"
                  "  --threads sets the total worker threads for traversal and draw-list\n"
                  "  build (default: auto = min(hardware_concurrency, 8); 1 = serial;\n"
-                 "  output is bit-identical at any count)\n";
+                 "  output is bit-identical at any count)\n"
+                 "  --no-gpu-timers disables the per-frame GPU timestamp queries and the\n"
+                 "  MERIDIAN_GPU lines (measures the unprofiled submit path)\n";
 }
 
 }  // namespace
@@ -33,6 +35,7 @@ int main(int argc, char** argv) {
     bool validate = false;
     bool interactive = false;
     bool demand_streaming = false;
+    bool enable_gpu_timers = true;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg = argv[i];
         if (arg == "--manifest" && i + 1 < argc) {
@@ -53,6 +56,8 @@ int main(int argc, char** argv) {
             interactive = true;
         } else if (arg == "--demand-streaming") {
             demand_streaming = true;
+        } else if (arg == "--no-gpu-timers") {
+            enable_gpu_timers = false;
         } else {
             print_usage();
             return 1;
@@ -81,6 +86,7 @@ int main(int argc, char** argv) {
         config.enable_validation = validate;
         config.demand_streaming = demand_streaming;
         config.worker_threads = worker_threads;
+        config.enable_gpu_timers = enable_gpu_timers;
         config.persisted_vgeo_path = manifest.output_path.string();
         const meridian::VkBootstrapReport report =
             meridian::build_vk_bootstrap_report(resource, config);

@@ -39,6 +39,10 @@ struct VkBootstrapConfig {
     // traversal and draw-list build. 0 = auto (min of hardware_concurrency
     // and 8). 1 forces the serial path. Output is bit-identical either way.
     uint32_t worker_threads = 0;
+    // When false, the per-frame GPU timestamp queries are skipped (no query
+    // pool, no MERIDIAN_GPU lines). On MoltenVK each timestamp writes a
+    // counter sample, so timer-off runs measure the unprofiled submit cost.
+    bool enable_gpu_timers = true;
 };
 
 struct VkBootstrapReport {

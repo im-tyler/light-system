@@ -3,6 +3,106 @@
 First automated comparison captured with `run_bench.sh` (see
 [README.md](./README.md) for method and caveats).
 
+## 2026-09-08 local: dead-pass pruning + visibility-store elision — submit mystery profiled to Metal encode; city GPU total -0.3 to -1.6ms
+
+Same machine/os/godot as below; machine loaded the whole session (load
+average ~20-31: the iOS-simulator game + companion plus concurrent agent
+workloads). All renderer A/B pairs are minutes apart under that load;
+draw/encode counts, wasted-vertex counters, and report fields are
+deterministic (load-independent). The idle-machine rerun remains pending
+for the whole 2026-09-07/08 series.
+
+Two changes, measured together and individually probed:
+
+1. **Dead per-frame passes removed (fallback path).** Profiling the
+   post-fold command stream showed four GPU work items that no draw path
+   consumes on MoltenVK, submitted every frame anyway: the instance-cull
+   dispatch (its output only fed the retained-but-not-dispatched
+   cluster_select shader), the occlusion-refine dispatch + its two
+   buffer fills and barriers (only the drawIndirectCount path can
+   consume the GPU-written survivor list), the full HZB build (12
+   dispatches, ~14 barriers, 3 image transitions — only occlusion reads
+   it), and the 7.3MB visibility image -> readback-buffer copy (read
+   once per run by the post-loop analysis). All four now run in a
+   one-shot "diagnostic epilogue" command buffer submitted after the
+   present loop, so every report field survives (`compute_cull_visible`,
+   `compute_occlusion_surviving` now computed against the final frame's
+   own HZB — 14020 vs 14015 on city, a 0.04% diagnostic drift from the
+   same-frame vs previous-frame HZB; static-camera benchmark runs are
+   unaffected). The drawIndirectCount path keeps occ + HZB per frame
+   (it consumes them).
+2. **Visibility store elided on non-capture frames.** The visibility
+   attachment's 7.3MB store-back was paid every frame for a readback
+   that happens once. A second render pass identical except
+   `storeOp = DONT_CARE` on the visibility attachment (render-pass
+   compatible, shared framebuffers) is used for all frames except the
+   capture frame — the final index of a fixed-count run, or every frame
+   while interactive (the loop breaks on close before rendering the
+   observing frame, so interactive has no last-frame signal).
+
+| scene | metric | before | after |
+| --- | --- | --- | --- |
+| massive_city | GPU total (per-frame timers, clean pair) | 2.78-3.95 ms | 2.05-2.38 ms |
+| massive_city | GPU total (medians, 3x paired round) | 3.47-3.80 ms | 2.96-3.30 ms |
+| massive_city | fence (GPU execution wait) | 1.7-2.5 ms | 1.9-2.0 ms |
+| massive_city | median ms (paired) | 8.52-9.16 | 8.48-8.53 |
+| stanford_dragon | median ms (paired) | 8.33-8.37 | 8.29-8.47 |
+| both | per-frame commands removed | cull fill+dispatch+2 barriers, occ fill+dispatch+2 barriers, HZB 2 transitions+12 dispatches+~12 barriers, visibility blit+2 barriers+transition | 0 (epilogue, once) |
+
+**The submit-cost mystery is closed, honestly negative:** the item was
+"MoltenVK fixed submit ~1.5-2ms beyond draws". Measured directly with
+`MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS=1` (encode at record time):
+city cmdrec 0.01 -> 2.51 ms while submit 2.21 -> 0.05 ms — the cost
+moves exactly, total unchanged. The ~2ms IS Metal command-buffer
+encoding of the frame's ~30-command stream, paid on the CPU no matter
+which timer wraps it. After the pruning above the stream is minimal
+(2 render passes, 2+2 draws, 1 barrier, timestamps), and the submit
+timer still reads ~2ms under load — that residual is the encode floor
+plus load noise (submit readings ranged 0.57-4.3 ms across the session
+with identical command streams; a full-detail city run with 51K draws
+folded to the same 2+2 encodes read submit=0.57 during a load spike).
+Also tried, no reproducible wall-time change under load:
+`MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS=1`, `MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS=1`
+(argbuf read ~0.5ms worse), GPU timestamps off via new `--no-gpu-timers`
+flag (fence -0.3-0.5ms from less GPU counter-sampling, wall flat). All
+knobs were env-only experiments; nothing relies on them at runtime.
+
+**Degenerate-corner cost counted (main-pass item, closed as
+negligible):** the fold now reports wasted vertex-shader invocations
+(`wastedvs` in MERIDIAN_CPU). City main 201597 (~3% of main VS work),
+shadow 736692 (~15%, mostly unused cascade-stride slots); dragon main
+56220 (~4.5%), shadow 389001 (~33%). Doubling kDrawBucketCount to 8
+produced an identical fold on city (still 2 nonempty buckets, same
+wasted counts) — the vertex-count distribution is too peaked for more
+buckets to matter, and even zeroing the waste is <0.05ms of GPU.
+Reverted to 4. The visibility-store elision measured -0.40/-0.07ms
+GPU-main across two dedicated A/B rounds (control pass variance
+±0.15ms) — expected ~0.1-0.15ms of store bandwidth, at the measurement
+floor. Main-pass GPU remains: city 1.2-1.5ms, dragon 0.6-0.7ms — that
+is now genuinely geometry + PCF shading, not structural waste.
+
+Verification: clean `-Wall -Wextra -Wpedantic` rebuild (0 warnings);
+dragon AND city screenshots pixel-identical to the pre-change build
+(0/921600 pixels >10 on both — draw order untouched); report fields
+identical (city 94790 valid pixels, cull counter 1, occ 14020);
+`visibility_selection_subset=true` on dragon, city, terrace, uv_seam,
+textured_uv_seam; `replay_runtime_parity=true` everywhere;
+`--validate` clean on dragon + city (only the preexisting MoltenVK
+blend-state warning); builder smoke set (4 manifests), meridian_dump,
+terrace + uv_seam replays, `meridian_trace --parallel 8`
+(parallel_match=true), and `--demand-streaming --budget 96` dragon
+(2016 page uploads, residency pinned 95, subset holds) all pass.
+
+Remaining city gap, honestly: (a) ~2ms Metal command-buffer encode
+floor — not command-count driven anymore; further cuts need MoltenVK
+or Metal-level work (or an idle-machine rerun to establish the true
+floor; current readings are load-inflated), (b) main-pass GPU
+1.2-1.5ms is real shading cost — further reduction means changing
+pixels (PCF tap count, material model), which the pixel-comparison
+bars currently forbid, (c) CPU traverse+build ~3.7ms under load
+(idle rerun pending, owned by the 2026-09-07 23:15 parallelization).
+
+
 ## 2026-09-07 23:15 local: parallel CPU traversal + draw build — city traverse+build 5.8 -> 3.7 ms paired, output bit-identical
 
 Same machine/os as below; the machine stayed loaded the whole session
