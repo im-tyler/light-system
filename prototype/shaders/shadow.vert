@@ -42,17 +42,29 @@ void main() {
     bool has_uv = (entry.geometry_kind & 0x10000u) != 0u;
     uint cascade_mask = (entry.geometry_kind >> 17u) & 7u;
 
+    // Instance-folded draws: every kShadowInstanceStride slot runs, including
+    // slots past this entry's cascade-overlap popcount, and vertexCount is the
+    // bucket maximum -- both cases collapse to a shared point (zero-area
+    // triangle, discarded by the rasterizer).
+    uint corner = gl_VertexIndex;
+    uint slot = gl_InstanceIndex & 3u;
     uint cascade = 0u;
+    bool slot_live = false;
     {
-        uint slot = gl_InstanceIndex & 3u;
         for (uint b = 0u; b < 3u; ++b) {
             if ((cascade_mask & (1u << b)) == 0u) continue;
             if (slot == 0u) {
                 cascade = b;
+                slot_live = true;
                 break;
             }
             slot -= 1u;
         }
+    }
+    if (!slot_live || corner >= entry.draw_vertex_count) {
+        gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
+        gl_Layer = 0;
+        return;
     }
 
     uint pos_base = entry.payload_offset + 8u;
