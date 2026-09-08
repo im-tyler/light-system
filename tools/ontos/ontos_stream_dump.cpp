@@ -347,11 +347,14 @@ struct GFit {
 // Section 19 collapsed-region state: totals frozen at collapse, membership,
 // and the splitmix64 state left after the jitter draws (the expansion spread
 // continues drawing from it). Jitter offsets live on the world (indexed by
-// body id).
+// body id). Section 20 multipole totals (mx, my and the second central
+// moments) freeze alongside; mp marks the cycle as section 20.
 struct GCollapsed {
   bool active = false;
+  bool mp = false;
   u64 n = 0;
   f64 mass = 0, com_x = 0, com_y = 0, pxt = 0, pyt = 0, vcx = 0, vcy = 0, energy = 0;
+  f64 mx = 0, my = 0, qxx = 0, qxy = 0, qyy = 0;
   u64 jitter_state = 0;
   std::vector<std::size_t> members;
 };
@@ -454,6 +457,7 @@ struct GravityWorld {
   u64 seed = 0;
   u64 tick = 0;
   f64 px = 0, py = 0;
+  bool mp_enabled = true;
   std::vector<GBody> bodies;
   std::vector<GFit> coarse;
   std::vector<u8> body_region;
@@ -670,6 +674,19 @@ struct GravityWorld {
       c.vcx = c.pxt / c.mass;
       c.vcy = c.pyt / c.mass;
     }
+    // Section 20 multipole totals: the exact dipole accumulators and the
+    // second central moments about com (id order, left-to-right sums).
+    c.mx = sum_mx;
+    c.my = sum_my;
+    for (std::size_t i : c.members) {
+      const GBody &b = bodies[i];
+      const f64 dx = b.x - c.com_x;
+      const f64 dy = b.y - c.com_y;
+      c.qxx += b.mass * dx * dx;
+      c.qxy += b.mass * dx * dy;
+      c.qyy += b.mass * dy * dy;
+    }
+    c.mp = mp_enabled;
     SplitMix64 jitter(seed ^ (static_cast<u64>(region) * 0x9E3779B97F4A7C15ULL));
     for (std::size_t i : c.members) {
       const u64 ux = jitter.draw();
@@ -688,11 +705,80 @@ struct GravityWorld {
     return c;
   }
 
-  // Section 19 expansion: positions from the frozen jitter, velocities
-  // v_com + spread with the last body absorbing the exact momentum
-  // residual (bit-identical per the spec).
+  // Section 19/20 expansion: positions per mode (section 20 synthesizes
+  // under dipole-exact + quadrupole-transform constraints; section 19 keeps
+  // com + raw jitter), velocities v_com + spread with the last body
+  // absorbing the exact momentum residual (bit-identical per the spec).
   void expand(int region) {
     GCollapsed &c = collapsed[region];
+    if (c.mp) {
+      std::vector<std::pair<f64, f64>> base;
+      base.reserve(c.members.size());
+      for (std::size_t i : c.members) {
+        base.emplace_back(body_jx[i], body_jy[i]);
+      }
+      if (c.members.size() >= 3) {
+        f64 swx = 0.0;
+        f64 swy = 0.0;
+        for (std::size_t a = 0; a < c.members.size(); ++a) {
+          const f64 m = bodies[c.members[a]].mass;
+          swx += m * base[a].first;
+          swy += m * base[a].second;
+        }
+        const f64 wx = swx / c.mass;
+        const f64 wy = swy / c.mass;
+        std::vector<std::pair<f64, f64>> dhat(c.members.size());
+        f64 jxx = 0.0;
+        f64 jxy = 0.0;
+        f64 jyy = 0.0;
+        for (std::size_t a = 0; a < c.members.size(); ++a) {
+          const f64 m = bodies[c.members[a]].mass;
+          const f64 dx = base[a].first - wx;
+          const f64 dy = base[a].second - wy;
+          jxx += m * dx * dx;
+          jxy += m * dx * dy;
+          jyy += m * dy * dy;
+          dhat[a] = {dx, dy};
+        }
+        if (jxx > 0.0 && c.qxx > 0.0) {
+          const f64 lj00 = std::sqrt(jxx);
+          const f64 lj10 = jxy / lj00;
+          const f64 jjd = jyy - lj10 * lj10;
+          if (jjd > 0.0) {
+            const f64 lq00 = std::sqrt(c.qxx);
+            const f64 lq10 = c.qxy / lq00;
+            const f64 qqd = c.qyy - lq10 * lq10;
+            if (qqd > 0.0) {
+              const f64 lj11 = std::sqrt(jjd);
+              const f64 lq11 = std::sqrt(qqd);
+              const f64 u00 = 1.0 / lj00;
+              const f64 u11 = 1.0 / lj11;
+              const f64 u10 = -(lj10 / (lj00 * lj11));
+              const f64 a00 = lq00 * u00;
+              const f64 a11 = lq11 * u11;
+              const f64 a10 = lq10 * u00 + lq11 * u10;
+              for (std::size_t a = 0; a < c.members.size(); ++a) {
+                base[a] = {a00 * dhat[a].first, a10 * dhat[a].first + a11 * dhat[a].second};
+              }
+            }
+          }
+        }
+      }
+      f64 sum_mx = 0.0;
+      f64 sum_my = 0.0;
+      for (std::size_t a = 0; a + 1 < c.members.size(); ++a) {
+        GBody &b = bodies[c.members[a]];
+        b.x = c.com_x + base[a].first;
+        b.y = c.com_y + base[a].second;
+        sum_mx += b.mass * b.x;
+        sum_my += b.mass * b.y;
+      }
+      if (!c.members.empty()) {
+        const std::size_t last = c.members.back();
+        bodies[last].x = (c.mx - sum_mx) / bodies[last].mass;
+        bodies[last].y = (c.my - sum_my) / bodies[last].mass;
+      }
+    }
     SplitMix64 jitter(c.jitter_state);
     f64 sum_mv_x = 0.0;
     f64 sum_mv_y = 0.0;
@@ -700,8 +786,10 @@ struct GravityWorld {
     for (std::size_t a = 0; a < c.members.size(); ++a) {
       const std::size_t i = c.members[a];
       GBody &b = bodies[i];
-      b.x = c.com_x + body_jx[i];
-      b.y = c.com_y + body_jy[i];
+      if (!c.mp) {
+        b.x = c.com_x + body_jx[i];
+        b.y = c.com_y + body_jy[i];
+      }
       if (a + 1 < c.members.size()) {
         const u64 ux = jitter.draw();
         const u64 uy = jitter.draw();
@@ -1023,7 +1111,20 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count) {
     int region;
     u8 level;
   };
+  struct PendingCollapse {
+    u64 t;
+    int region;
+    u64 n;
+    f64 mass, com_x, com_y, pxt, pyt, energy;
+  };
+  struct PendingMultipole {
+    u64 t;
+    int region;
+    f64 mx, my, qxx, qxy, qyy;
+  };
   std::vector<Pending> pending;
+  std::vector<PendingCollapse> pending_collapsed;
+  std::vector<PendingMultipole> pending_multipole;
   u64 ticks_seen = 0;
   u64 totals_seen = 0;
   u64 states_seen = 0;
@@ -1043,6 +1144,12 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count) {
           std::fprintf(stderr, "error: truncated TickHeader at offset %zu\n", rec_start);
           return 2;
         }
+        // Collapse mode is selected per cycle by the presence of the
+        // section 20 RegionMultipole record (section 19 streams carry
+        // none). RegionLevel records queue and apply here, at the tick
+        // boundary, in stream order — level 2 collapses validate against
+        // the world's frozen totals bit-for-bit.
+        world.mp_enabled = !pending_multipole.empty();
         for (const Pending &p : pending) {
           if (p.level == 0) {
             // Demote on a collapsed region is a no-op (section 19).
@@ -1051,9 +1158,46 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count) {
             }
           } else if (p.level == 1) {
             world.promote(p.region, world.tick + 1);
+          } else {
+            if (world.rstate[p.region] != 2) {
+              world.collapse(p.region, world.tick + 1);
+            }
           }
         }
         pending.clear();
+        for (const PendingCollapse &pc : pending_collapsed) {
+          ++collapses_seen;
+          const GCollapsed &c = world.collapsed[pc.region];
+          if (!c.active || pc.t != world.tick + 1 || pc.n != c.n || !f64_bits_eq(pc.mass, c.mass) ||
+              !f64_bits_eq(pc.com_x, c.com_x) || !f64_bits_eq(pc.com_y, c.com_y) ||
+              !f64_bits_eq(pc.pxt, c.pxt) || !f64_bits_eq(pc.pyt, c.pyt) ||
+              !f64_bits_eq(pc.energy, c.energy)) {
+            std::fprintf(stderr,
+                         "MISMATCH: RegionCollapsed tick=%" PRIu64 " region=%d"
+                         " stream=(n=%" PRIu64 " mass=%.17g com=(%.17g,%.17g) p=(%.17g,%.17g)"
+                         " E=%.17g) computed=(n=%" PRIu64 " mass=%.17g com=(%.17g,%.17g)"
+                         " p=(%.17g,%.17g) E=%.17g)\n",
+                         pc.t, pc.region, pc.n, pc.mass, pc.com_x, pc.com_y, pc.pxt, pc.pyt,
+                         pc.energy, c.n, c.mass, c.com_x, c.com_y, c.pxt, c.pyt, c.energy);
+            return 1;
+          }
+        }
+        pending_collapsed.clear();
+        for (const PendingMultipole &pm : pending_multipole) {
+          const GCollapsed &c = world.collapsed[pm.region];
+          if (!c.active || !c.mp || pm.t != world.tick + 1 || !f64_bits_eq(pm.mx, c.mx) ||
+              !f64_bits_eq(pm.my, c.my) || !f64_bits_eq(pm.qxx, c.qxx) ||
+              !f64_bits_eq(pm.qxy, c.qxy) || !f64_bits_eq(pm.qyy, c.qyy)) {
+            std::fprintf(stderr,
+                         "MISMATCH: RegionMultipole tick=%" PRIu64 " region=%d"
+                         " stream=(m=(%.17g,%.17g) q=(%.17g,%.17g,%.17g))"
+                         " computed=(m=(%.17g,%.17g) q=(%.17g,%.17g,%.17g))\n",
+                         pm.t, pm.region, pm.mx, pm.my, pm.qxx, pm.qxy, pm.qyy, c.mx, c.my,
+                         c.qxx, c.qxy, c.qyy);
+            return 1;
+          }
+        }
+        pending_multipole.clear();
         world.step();
         reference.step();
         if (t != world.tick) {
@@ -1116,11 +1260,9 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count) {
                        rx, ry, lv, rec_start);
           return 2;
         }
-        // Level 2 (collapse) is applied when its RegionCollapsed record
-        // arrives; level 0/1 queue for the next tick boundary.
-        if (lv != 2) {
-          pending.push_back({static_cast<int>(ry) * 2 + static_cast<int>(rx), lv});
-        }
+        // All levels (including 2/collapse) queue for the next tick
+        // boundary, where the collapse's RegionMultipole presence is known.
+        pending.push_back({static_cast<int>(ry) * 2 + static_cast<int>(rx), lv});
       } break;
       case 5: {
         u64 t = 0;
@@ -1222,8 +1364,8 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count) {
         }
       } break;
       case 8: {
-        // Section 19 RegionCollapsed: apply the collapse at this boundary
-        // and validate the record's frozen totals bit-for-bit.
+        // Section 19 RegionCollapsed: parsed here, applied and validated
+        // bit-for-bit at the tick boundary (see case 1).
         u64 t = 0;
         u32 rx = 0;
         u32 ry = 0;
@@ -1244,22 +1386,33 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count) {
                        rx, ry, rec_start);
           return 2;
         }
-        ++collapses_seen;
-        const int region = static_cast<int>(ry) * 2 + static_cast<int>(rx);
-        const GCollapsed c = world.collapse(region, world.tick + 1);
-        if (t != world.tick + 1 || n != c.n || !f64_bits_eq(mass, c.mass) ||
-            !f64_bits_eq(com_x, c.com_x) || !f64_bits_eq(com_y, c.com_y) ||
-            !f64_bits_eq(pxt, c.pxt) || !f64_bits_eq(pyt, c.pyt) ||
-            !f64_bits_eq(energy, c.energy)) {
-          std::fprintf(stderr,
-                       "MISMATCH: RegionCollapsed tick=%" PRIu64 " region=(%" PRIu32 ",%" PRIu32
-                       ") stream=(n=%" PRIu64 " mass=%.17g com=(%.17g,%.17g) p=(%.17g,%.17g)"
-                       " E=%.17g) computed=(n=%" PRIu64 " mass=%.17g com=(%.17g,%.17g)"
-                       " p=(%.17g,%.17g) E=%.17g)\n",
-                       t, rx, ry, n, mass, com_x, com_y, pxt, pyt, energy, c.n, c.mass, c.com_x,
-                       c.com_y, c.pxt, c.pyt, c.energy);
-          return 1;
+        pending_collapsed.push_back(
+            {t, static_cast<int>(ry) * 2 + static_cast<int>(rx), n, mass, com_x, com_y, pxt, pyt,
+             energy});
+      } break;
+      case 9: {
+        // Section 20 RegionMultipole: parsed here, validated bit-for-bit at
+        // the tick boundary.
+        u64 t = 0;
+        u32 rx = 0;
+        u32 ry = 0;
+        f64 mx = 0, my = 0, qxx = 0, qxy = 0, qyy = 0;
+        if (!take_u64(data, off, t) || !take_u32(data, off, rx) || !take_u32(data, off, ry) ||
+            !take_f64(data, off, mx) || !take_f64(data, off, my) ||
+            !take_f64(data, off, qxx) || !take_f64(data, off, qxy) ||
+            !take_f64(data, off, qyy)) {
+          std::fprintf(stderr, "error: truncated RegionMultipole at offset %zu\n", rec_start);
+          return 2;
         }
+        if (rx > 1 || ry > 1) {
+          std::fprintf(stderr,
+                       "error: bad RegionMultipole region (%" PRIu32 ",%" PRIu32
+                       ") at offset %zu\n",
+                       rx, ry, rec_start);
+          return 2;
+        }
+        pending_multipole.push_back(
+            {t, static_cast<int>(ry) * 2 + static_cast<int>(rx), mx, my, qxx, qxy, qyy});
       } break;
       default:
         std::fprintf(stderr, "error: unknown record tag %u at offset %zu\n", tag, rec_start);
