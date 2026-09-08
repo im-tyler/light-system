@@ -503,7 +503,7 @@ struct GravityWorld {
   std::vector<std::pair<u32, u32>> touching;
   std::vector<GContact> last_contacts;
 
-  explicit GravityWorld(u64 s, u32 count) : seed(s) {
+  explicit GravityWorld(u64 s, u32 count, const char *ic_profile = nullptr) : seed(s) {
     SplitMix64 rng(s);
     bodies.resize(count);
     coarse.resize(count);
@@ -520,10 +520,65 @@ struct GravityWorld {
       GBody &b = bodies[i];
       b.id = i;
       b.mass = 0.5 + static_cast<f64>(u0) * G_TWO_POW_NEG64 * 2.0;
-      b.x = 32.0 + static_cast<f64>(u1) * G_TWO_POW_NEG64 * 64.0;
-      b.y = 32.0 + static_cast<f64>(u2) * G_TWO_POW_NEG64 * 64.0;
-      b.vx = (static_cast<f64>(u3) * G_TWO_POW_NEG64 - 0.5) * 0.5;
-      b.vy = (static_cast<f64>(u4) * G_TWO_POW_NEG64 - 0.5) * 0.5;
+      if (ic_profile == nullptr) {
+        b.x = 32.0 + static_cast<f64>(u1) * G_TWO_POW_NEG64 * 64.0;
+        b.y = 32.0 + static_cast<f64>(u2) * G_TWO_POW_NEG64 * 64.0;
+        b.vx = (static_cast<f64>(u3) * G_TWO_POW_NEG64 - 0.5) * 0.5;
+        b.vy = (static_cast<f64>(u4) * G_TWO_POW_NEG64 - 0.5) * 0.5;
+      } else if (std::strcmp(ic_profile, "wallshot") == 0) {
+        // Test-only corpus ICs (ontos docs/DESIGN.md corpus coverage):
+        // body i targets wall i % 4, near it and inbound at 2..5.
+        const f64 along = 16.0 + static_cast<f64>(u1) * G_TWO_POW_NEG64 * 96.0;
+        const f64 off = static_cast<f64>(u2) * G_TWO_POW_NEG64 * 2.0;
+        const f64 speed = 2.0 + static_cast<f64>(u3) * G_TWO_POW_NEG64 * 3.0;
+        const f64 drift = (static_cast<f64>(u4) * G_TWO_POW_NEG64 - 0.5) * 0.5;
+        switch (i % 4) {
+          case 0:
+            b.x = 2.0 + off;
+            b.y = along;
+            b.vx = 0.0 - speed;
+            b.vy = drift;
+            break;
+          case 1:
+            b.x = 124.0 + off;
+            b.y = along;
+            b.vx = speed;
+            b.vy = drift;
+            break;
+          case 2:
+            b.x = along;
+            b.y = 2.0 + off;
+            b.vx = drift;
+            b.vy = 0.0 - speed;
+            break;
+          default:
+            b.x = along;
+            b.y = 124.0 + off;
+            b.vx = drift;
+            b.vy = speed;
+            break;
+        }
+      } else if (std::strcmp(ic_profile, "coarsehit") == 0) {
+        // Interceptors (ids 0..3) aimed at a demoted target cluster
+        // (ids 4..7) over shared y lanes; the fine body carries the
+        // smaller id because the section 21/24 sweep is lexicographic.
+        const f64 lane =
+            77.0 + 8.0 * static_cast<f64>(i % 4) + static_cast<f64>(u2) * G_TWO_POW_NEG64 * 2.0;
+        if (i < 4) {
+          b.x = 56.0 + static_cast<f64>(u1) * G_TWO_POW_NEG64 * 4.0;
+          b.y = lane;
+          b.vx = 56.0 + static_cast<f64>(u3) * G_TWO_POW_NEG64 * 16.0;
+          b.vy = (static_cast<f64>(u4) * G_TWO_POW_NEG64 - 0.5) * 0.5;
+        } else {
+          b.x = 84.0 + static_cast<f64>(u1) * G_TWO_POW_NEG64 * 4.0;
+          b.y = lane;
+          b.vx = (static_cast<f64>(u3) * G_TWO_POW_NEG64 - 0.5) * 0.5;
+          b.vy = (static_cast<f64>(u4) * G_TWO_POW_NEG64 - 0.5) * 0.5;
+        }
+      } else {
+        std::fprintf(stderr, "error: unknown corpus profile '%s'\n", ic_profile);
+        std::exit(3);
+      }
       px += b.mass * b.vx;
       py += b.mass * b.vy;
     }
@@ -1232,8 +1287,13 @@ struct GravityWorld {
         c.cx = cx;
         c.cy = cy;
         c.vn = vn;
+        // The contactant is measured at its post-impulse state for fine
+        // pairs (flags 1) and at its (frozen) polynomial evaluation for
+        // coarse pairs (flags 0) — never at the stale demote-time slot.
         c.vn_after =
-            (bodies[j].vx - bodies[i].vx) * nx + (bodies[j].vy - bodies[i].vy) * ny;
+            flags[j] == 1
+                ? (bodies[j].vx - bodies[i].vx) * nx + (bodies[j].vy - bodies[i].vy) * ny
+                : (sj.vx - bodies[i].vx) * nx + (sj.vy - bodies[i].vy) * ny;
         c.mu = mu;
         events.push_back(c);
       }
@@ -1568,9 +1628,9 @@ static bool f64_bits_eq(f64 a, f64 b) {
 }
 
 static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count,
-                       const char *wav_out) {
-  GravityWorld world(seed, body_count);
-  GravityWorld reference(seed, body_count);
+                       const char *wav_out, const char *ic_profile) {
+  GravityWorld world(seed, body_count, ic_profile);
+  GravityWorld reference(seed, body_count, ic_profile);
   struct Pending {
     int region;
     u8 level;
@@ -2134,11 +2194,26 @@ int main(int argc, char **argv) {
     return 3;
   }
   const char *wav_out = nullptr;
-  if (argc == 5 && std::strcmp(argv[3], "--wav") == 0) {
-    wav_out = argv[4];
-  } else if (argc != 3) {
-    std::fprintf(stderr, "usage: ontos_stream_dump <stream-file> <seed> [--wav out.wav]\n");
+  const char *ic_profile = nullptr;
+  if (argc < 3) {
+    std::fprintf(stderr,
+                 "usage: ontos_stream_dump <stream-file> <seed> [--wav out.wav] "
+                 "[--test-ic wallshot|coarsehit]\n");
     return 3;
+  }
+  for (int a = 3; a < argc; ++a) {
+    if (std::strcmp(argv[a], "--wav") == 0 && a + 1 < argc) {
+      wav_out = argv[a + 1];
+      ++a;
+    } else if (std::strcmp(argv[a], "--test-ic") == 0 && a + 1 < argc) {
+      ic_profile = argv[a + 1];
+      ++a;
+    } else {
+      std::fprintf(stderr,
+                   "usage: ontos_stream_dump <stream-file> <seed> [--wav out.wav] "
+                   "[--test-ic wallshot|coarsehit]\n");
+      return 3;
+    }
   }
 
   u64 seed = 0;
@@ -2199,7 +2274,7 @@ int main(int argc, char **argv) {
       std::fprintf(stderr, "error: implausible body count %" PRIu32 "\n", body_count);
       return 2;
     }
-    return run_gravity(data, seed, body_count, wav_out);
+    return run_gravity(data, seed, body_count, wav_out, ic_profile);
   }
 
   World world;

@@ -80,4 +80,8 @@ jobs:
           cmp /tmp/cpp3.wav simval/examples/ontos_contact/walls/ontos.wav
           /tmp/ontos_stream_dump simval/examples/ontos_contact/restitution/ontos.stream 11 --wav /tmp/cpp4.wav
           cmp /tmp/cpp4.wav simval/examples/ontos_contact/restitution/ontos.wav
+          /tmp/ontos_stream_dump simval/examples/ontos_contact/wallshot/ontos.stream 3 --test-ic wallshot --wav /tmp/cpp5.wav
+          cmp /tmp/cpp5.wav simval/examples/ontos_contact/wallshot/ontos.wav
+          /tmp/ontos_stream_dump simval/examples/ontos_contact/coarsehit/ontos.stream 11 --test-ic coarsehit --wav /tmp/cpp6.wav
+          cmp /tmp/cpp6.wav simval/examples/ontos_contact/coarsehit/ontos.wav
           echo "ontos_stream_dump + section-22 audio bit-identical on ${{ matrix.os }}"

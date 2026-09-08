@@ -6,6 +6,8 @@ Build: `clang++ -std=c++17 -O2 -ffp-contract=off -o ontos_stream_dump ontos_stre
 
 `-ffp-contract=off` is required: the spec bans FMA (determinism section), and clang contracts `a*b+c` into FMA by default at -O2, which breaks bit-exactness on the first tick.
 
-Usage: `./ontos_stream_dump <stream-file> <seed> [--wav out.wav]` (example streams + seeds: simval `examples/ontos*/`)
+Usage: `./ontos_stream_dump <stream-file> <seed> [--wav out.wav] [--test-ic wallshot|coarsehit]` (example streams + seeds: simval `examples/ontos*/`)
+
+`--test-ic` reconstructs the test-only corpus initial conditions (ontos `--test-ic`, simval `--test-ic`; see ontos docs/DESIGN.md corpus coverage) a stream was produced with: `wallshot` (near-wall inbound bodies — executes the wall-contact branch; `examples/ontos_contact/wallshot`) and `coarsehit` (fine interceptors vs an early-demoted coarse cluster — executes the fine x ephemeris-coarse static branch; `examples/ontos_contact/coarsehit`). Both corpora verify bit-for-bit including the WAV render.
 
 Exit codes: 0 = all records verified · 1 = verification mismatch (first bad record printed) · 2 = bad stream (magic/version/world size/truncation/unknown tag) · 3 = usage, I/O, or FNV self-check failure.
