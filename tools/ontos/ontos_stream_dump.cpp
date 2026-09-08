@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cerrno>
 #include <cinttypes>
 #include <cstdint>
@@ -5,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <utility>
 #include <vector>
 
 using u8 = std::uint8_t;
@@ -359,15 +361,19 @@ struct GFit {
 // continues drawing from it). Jitter offsets live on the world (indexed by
 // body id). Section 20 multipole totals (mx, my and the second central
 // moments) freeze alongside; mp marks the cycle as section 20. Section 23
-// adds the binding statistic; radial marks the cycle.
+// adds the binding statistic; radial marks the cycle. Section 25 adds the
+// per-shell intra-shell bindings (binding carries the section 23 total);
+// shells marks the cycle.
 struct GCollapsed {
   bool active = false;
   bool mp = false;
   bool radial = false;
+  bool shells = false;
   u64 n = 0;
   f64 mass = 0, com_x = 0, com_y = 0, pxt = 0, pyt = 0, vcx = 0, vcy = 0, energy = 0;
   f64 mx = 0, my = 0, qxx = 0, qxy = 0, qyy = 0;
   f64 binding = 0;
+  f64 shell_b[4] = {0.0, 0.0, 0.0, 0.0};
   u64 jitter_state = 0;
   std::vector<std::size_t> members;
 };
@@ -389,6 +395,56 @@ static int g_region_at(f64 x, f64 y) {
   const int rx = static_cast<int>(x / 64.0);
   const int ry = static_cast<int>(y / 64.0);
   return ry * 2 + rx;
+}
+
+// Spec section 25: S = min(4, max(1, n div 3)) for n >= 1; every shell
+// holds at least 3 members (single-pair shells are degenerate).
+static int g_shell_count(std::size_t n) {
+  if (n == 0) {
+    return 0;
+  }
+  int v = static_cast<int>(n / 3);
+  if (v < 1) {
+    v = 1;
+  }
+  if (v > 4) {
+    v = 4;
+  }
+  return v;
+}
+
+// Spec section 25 rank shells: sort members by (radius, id), split into S
+// equal-count groups (first n mod S groups one larger). Returns the shell
+// index per member, members in id order.
+static std::vector<int> g_shell_assignment(const std::vector<f64> &radii) {
+  const std::size_t n = radii.size();
+  std::vector<int> shells(n, 0);
+  if (n == 0) {
+    return shells;
+  }
+  std::vector<std::size_t> order(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    order[i] = i;
+  }
+  std::sort(order.begin(), order.end(), [&radii](std::size_t a, std::size_t b) {
+    if (radii[a] != radii[b]) {
+      return radii[a] < radii[b];
+    }
+    return a < b;
+  });
+  const int s = g_shell_count(n);
+  const std::size_t ss = static_cast<std::size_t>(s);
+  const std::size_t q = n / ss;
+  const std::size_t rem = n % ss;
+  std::size_t pos = 0;
+  for (std::size_t k = 0; k < ss; ++k) {
+    const std::size_t size = q + (k < rem ? 1u : 0u);
+    for (std::size_t j = 0; j < size; ++j) {
+      shells[order[pos]] = static_cast<int>(k);
+      ++pos;
+    }
+  }
+  return shells;
 }
 
 static f64 g_clenshaw(const f64 c[9], f64 s) {
@@ -482,6 +538,7 @@ struct GravityWorld {
   f64 px = 0, py = 0;
   bool mp_enabled = true;
   bool radial_enabled = false;
+  bool shells_enabled = false;
   // Section 24 extended contact parameters (from the ContactParams record).
   bool contacts_params = false;
   bool walls_on = false;
@@ -706,16 +763,18 @@ struct GravityWorld {
     }
   }
 
-  // Section 19 collapse: materialize ephemeris evaluations at the boundary
-  // tick, select in-box bodies, freeze the totals (fixed id-order sums), and
-  // draw the frozen jitter from a re-seeded generator. Returns the computed
-  // totals for record validation.
+  // Section 19/26 collapse: materialize ephemeris evaluations at the
+  // boundary tick (terminating the region's own window — out-of-box
+  // bodies leave as unmanaged fine, the section 14 refit exit rule),
+  // select in-box bodies by evaluated state with collapsed bodies
+  // excluded (the section 14 demote rule; foreign windows are absorbed
+  // and their fits discarded), freeze the totals (fixed id-order sums),
+  // and draw the frozen jitter from a re-seeded generator. Returns the
+  // computed totals for record validation.
   GCollapsed collapse(int region, u64 t) {
     const f64 x0 = static_cast<f64>(region % 2) * 64.0;
     const f64 y0 = static_cast<f64>(region / 2) * 64.0;
     if (rstate[region] != 1) {
-      // Materialize any tracked state (ephemeris polynomial evaluations or
-      // synthesized collapsed states) at the boundary tick first.
       for (std::size_t i = 0; i < bodies.size(); ++i) {
         if (body_region[i] == region && blevel[i] != 1) {
           bodies[i] = state_at(i, t);
@@ -726,12 +785,24 @@ struct GravityWorld {
       collapsed[region] = GCollapsed{};
     }
     GCollapsed c;
+    std::vector<std::size_t> members;
     for (std::size_t i = 0; i < bodies.size(); ++i) {
-      if (bodies[i].x >= x0 && bodies[i].x < x0 + 64.0 && bodies[i].y >= y0 &&
-          bodies[i].y < y0 + 64.0) {
-        c.members.push_back(i);
+      if (blevel[i] == 2) {
+        continue;
+      }
+      const GBody b = state_at(i, t);
+      if (b.x >= x0 && b.x < x0 + 64.0 && b.y >= y0 && b.y < y0 + 64.0) {
+        members.push_back(i);
       }
     }
+    for (std::size_t i : members) {
+      if (blevel[i] == 0) {
+        bodies[i] = state_at(i, t);
+        body_region[i] = G_UNMANAGED;
+        blevel[i] = 1;
+      }
+    }
+    c.members = members;
     c.n = c.members.size();
     f64 sum_mx = 0.0;
     f64 sum_my = 0.0;
@@ -780,6 +851,31 @@ struct GravityWorld {
     }
     c.mp = mp_enabled;
     c.radial = radial_enabled;
+    c.shells = shells_enabled;
+    if (c.n > 0) {
+      // Section 25 rank shells of the materialized layout about com;
+      // per-shell intra-shell bindings freeze alongside the total.
+      std::vector<f64> radii(c.members.size());
+      for (std::size_t a = 0; a < c.members.size(); ++a) {
+        const f64 dx = bodies[c.members[a]].x - c.com_x;
+        const f64 dy = bodies[c.members[a]].y - c.com_y;
+        radii[a] = std::sqrt(dx * dx + dy * dy);
+      }
+      const std::vector<int> shells = g_shell_assignment(radii);
+      for (std::size_t a = 0; a < c.members.size(); ++a) {
+        for (std::size_t b = a + 1; b < c.members.size(); ++b) {
+          if (shells[a] != shells[b]) {
+            continue;
+          }
+          const GBody &ba = bodies[c.members[a]];
+          const GBody &bb = bodies[c.members[b]];
+          const f64 dx = bb.x - ba.x;
+          const f64 dy = bb.y - ba.y;
+          const f64 s2 = dx * dx + dy * dy + G_EPS2;
+          c.shell_b[shells[a]] += ba.mass * bb.mass / std::sqrt(s2);
+        }
+      }
+    }
     SplitMix64 jitter(seed ^ (static_cast<u64>(region) * 0x9E3779B97F4A7C15ULL));
     for (std::size_t i : c.members) {
       const u64 ux = jitter.draw();
@@ -865,6 +961,123 @@ struct GravityWorld {
     return f(lam);
   }
 
+  // Section 25 per-shell radial synthesis: one global scale closes the
+  // recorded total binding (the section 23 bisection), then per-shell
+  // corrections in pinned shell order close each shell's intra-shell
+  // binding, then the section 23 recenter. Returns F_total over the final
+  // displacements (the sigma solve's binding input).
+  f64 shell_scale(std::vector<std::pair<f64, f64>> &base, const GCollapsed &c) {
+    const std::size_t n = c.members.size();
+    if (n < 2) {
+      return 0.0;
+    }
+    const auto solve = [](const std::vector<std::pair<f64, f64>> &pairs, f64 target) {
+      const auto f = [&pairs](f64 lam) {
+        f64 total = 0.0;
+        for (const auto &p : pairs) {
+          total += p.first / std::sqrt(lam * lam * p.second + 1.0);
+        }
+        return total;
+      };
+      if (target >= f(0.0)) {
+        return 0.0;
+      }
+      f64 hi = 1.0;
+      int doublings = 0;
+      while (f(hi) > target && doublings < 64) {
+        hi *= 2.0;
+        ++doublings;
+      }
+      f64 lo = 0.0;
+      for (int it = 0; it < 128; ++it) {
+        const f64 mid = (lo + hi) * 0.5;
+        if (f(mid) >= target) {
+          lo = mid;
+        } else {
+          hi = mid;
+        }
+      }
+      return (lo + hi) * 0.5;
+    };
+    std::vector<std::pair<f64, f64>> all_pairs;
+    for (std::size_t a = 0; a < n; ++a) {
+      for (std::size_t b = a + 1; b < n; ++b) {
+        const f64 w = bodies[c.members[a]].mass * bodies[c.members[b]].mass;
+        const f64 dx = base[b].first - base[a].first;
+        const f64 dy = base[b].second - base[a].second;
+        all_pairs.emplace_back(w, dx * dx + dy * dy);
+      }
+    }
+    const f64 lam = solve(all_pairs, c.binding);
+    for (auto &b : base) {
+      b.first *= lam;
+      b.second *= lam;
+    }
+    f64 swx = 0.0;
+    f64 swy = 0.0;
+    for (std::size_t a = 0; a < n; ++a) {
+      const f64 m = bodies[c.members[a]].mass;
+      swx += m * base[a].first;
+      swy += m * base[a].second;
+    }
+    const f64 cx = swx / c.mass;
+    const f64 cy = swy / c.mass;
+    std::vector<f64> radii(n);
+    for (std::size_t a = 0; a < n; ++a) {
+      const f64 dx = base[a].first - cx;
+      const f64 dy = base[a].second - cy;
+      radii[a] = std::sqrt(dx * dx + dy * dy);
+    }
+    const std::vector<int> shells = g_shell_assignment(radii);
+    const int s = g_shell_count(n);
+    std::vector<std::vector<std::pair<f64, f64>>> pairs(s);
+    for (std::size_t a = 0; a < n; ++a) {
+      for (std::size_t b = a + 1; b < n; ++b) {
+        if (shells[a] != shells[b]) {
+          continue;
+        }
+        const f64 w = bodies[c.members[a]].mass * bodies[c.members[b]].mass;
+        const f64 dx = base[b].first - base[a].first;
+        const f64 dy = base[b].second - base[a].second;
+        pairs[shells[a]].emplace_back(w, dx * dx + dy * dy);
+      }
+    }
+    f64 mus[4] = {1.0, 1.0, 1.0, 1.0};
+    for (int k = 0; k < s; ++k) {
+      if (pairs[k].empty() || c.shell_b[k] <= 0.0) {
+        continue;
+      }
+      mus[k] = solve(pairs[k], c.shell_b[k]);
+    }
+    for (std::size_t a = 0; a < n; ++a) {
+      base[a].first *= mus[shells[a]];
+      base[a].second *= mus[shells[a]];
+    }
+    swx = 0.0;
+    swy = 0.0;
+    for (std::size_t a = 0; a < n; ++a) {
+      const f64 m = bodies[c.members[a]].mass;
+      swx += m * base[a].first;
+      swy += m * base[a].second;
+    }
+    const f64 wx = swx / c.mass;
+    const f64 wy = swy / c.mass;
+    for (auto &b : base) {
+      b.first -= wx;
+      b.second -= wy;
+    }
+    f64 ft = 0.0;
+    for (std::size_t a = 0; a < n; ++a) {
+      for (std::size_t b = a + 1; b < n; ++b) {
+        const f64 w = bodies[c.members[a]].mass * bodies[c.members[b]].mass;
+        const f64 dx = base[b].first - base[a].first;
+        const f64 dy = base[b].second - base[a].second;
+        ft += w / std::sqrt(dx * dx + dy * dy + 1.0);
+      }
+    }
+    return ft;
+  }
+
   void expand(int region) {
     GCollapsed &c = collapsed[region];
     f64 sigma = 1.0;
@@ -925,6 +1138,9 @@ struct GravityWorld {
       if (c.radial) {
         fl = radial_scale(base, c);
       }
+      if (c.shells) {
+        fl = shell_scale(base, c);
+      }
       f64 sum_mx = 0.0;
       f64 sum_my = 0.0;
       for (std::size_t a = 0; a + 1 < c.members.size(); ++a) {
@@ -939,9 +1155,11 @@ struct GravityWorld {
         bodies[last].x = (c.mx - sum_mx) / bodies[last].mass;
         bodies[last].y = (c.my - sum_my) / bodies[last].mass;
       }
-      if (c.radial) {
-        // Section 23 spread-scale: close the synthesized kinetic energy on
-        // the recorded total via the three-point parabola through ke(sigma).
+      if (c.radial || c.shells) {
+        // Section 23/25 spread-scale: close the synthesized kinetic energy
+        // on the recorded total via the three-point parabola through
+        // ke(sigma); shells feed the binding input F_total from the
+        // per-shell-scaled displacements.
         std::vector<std::pair<f64, f64>> spread(c.members.size());
         SplitMix64 sj(c.jitter_state);
         for (std::size_t a = 0; a < c.members.size(); ++a) {
@@ -1656,11 +1874,18 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count,
     int region;
     f64 binding;
   };
+  struct PendingShells {
+    u64 t;
+    int region;
+    f64 binding;
+    f64 b[4];
+  };
   std::vector<Pending> pending;
   std::vector<PendingCollapse> pending_collapsed;
   std::vector<PendingMultipole> pending_multipole;
   std::vector<PendingContact> pending_contact;
   std::vector<PendingRadial> pending_radial;
+  std::vector<PendingShells> pending_shells;
   std::vector<PendingContact> all_contacts;
   f64 region_collapse_mass[4] = {0.0, 0.0, 0.0, 0.0};
   u64 ticks_seen = 0;
@@ -1692,6 +1917,7 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count,
         // the world's frozen totals bit-for-bit.
         world.mp_enabled = !pending_multipole.empty();
         world.radial_enabled = world.radial_enabled || !pending_radial.empty();
+        world.shells_enabled = world.shells_enabled || !pending_shells.empty();
         // Section 21: contact mode is sticky from the first Contact record.
         if (!pending_contact.empty()) {
           world.contacts_on = true;
@@ -1756,6 +1982,22 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count,
           }
         }
         pending_radial.clear();
+        for (const PendingShells &ps : pending_shells) {
+          const GCollapsed &c = world.collapsed[ps.region];
+          bool ok = c.active && c.shells && ps.t == world.tick + 1 &&
+                    f64_bits_eq(ps.binding, c.binding);
+          for (int k = 0; ok && k < 4; ++k) {
+            ok = f64_bits_eq(ps.b[k], c.shell_b[k]);
+          }
+          if (!ok) {
+            std::fprintf(stderr,
+                         "MISMATCH: RegionShells tick=%" PRIu64 " region=%d"
+                         " binding=%.17g computed=%.17g b0=%.17g/%.17g\n",
+                         ps.t, ps.region, ps.binding, c.binding, ps.b[0], c.shell_b[0]);
+            return 1;
+          }
+        }
+        pending_shells.clear();
         world.step();
         reference.step();
         // Section 21: contact records validate against this tick's own
@@ -2047,6 +2289,36 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count,
           return 2;
         }
         pending_radial.push_back({t, static_cast<int>(ry) * 2 + static_cast<int>(rx), binding});
+      } break;
+      case 13: {
+        // Section 25 RegionShells: parsed here, validated bit-for-bit at
+        // the tick boundary.
+        u64 t = 0;
+        u32 rx = 0;
+        u32 ry = 0;
+        f64 binding = 0, b0 = 0, b1 = 0, b2 = 0, b3 = 0;
+        if (!take_u64(data, off, t) || !take_u32(data, off, rx) || !take_u32(data, off, ry) ||
+            !take_f64(data, off, binding) || !take_f64(data, off, b0) ||
+            !take_f64(data, off, b1) || !take_f64(data, off, b2) ||
+            !take_f64(data, off, b3)) {
+          std::fprintf(stderr, "error: truncated RegionShells at offset %zu\n", rec_start);
+          return 2;
+        }
+        if (rx > 1 || ry > 1) {
+          std::fprintf(stderr,
+                       "error: bad RegionShells region (%" PRIu32 ",%" PRIu32 ") at offset %zu\n",
+                       rx, ry, rec_start);
+          return 2;
+        }
+        PendingShells ps;
+        ps.t = t;
+        ps.region = static_cast<int>(ry) * 2 + static_cast<int>(rx);
+        ps.binding = binding;
+        ps.b[0] = b0;
+        ps.b[1] = b1;
+        ps.b[2] = b2;
+        ps.b[3] = b3;
+        pending_shells.push_back(ps);
       } break;
       case 12: {
         // Section 24 ContactParams: at most one, before the first tick.

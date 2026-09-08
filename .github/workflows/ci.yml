@@ -72,6 +72,8 @@ jobs:
           /tmp/ontos_stream_dump simval/examples/ontos_gravity/collapse/ontos.stream 11
           /tmp/ontos_stream_dump simval/examples/ontos_gravity/multipole/ontos.stream 17
           /tmp/ontos_stream_dump simval/examples/ontos_gravity/radial/ontos.stream 17
+          /tmp/ontos_stream_dump simval/examples/ontos_gravity/shells/ontos.stream 17
+          /tmp/ontos_stream_dump simval/examples/ontos_gravity/coarse_collapse/ontos.stream 23
           /tmp/ontos_stream_dump simval/examples/ontos_contact/contact/ontos.stream 11 --wav /tmp/cpp.wav
           cmp /tmp/cpp.wav simval/examples/ontos_contact/contact/ontos.wav
           /tmp/ontos_stream_dump simval/examples/ontos_contact/contact_collapse/ontos.stream 11 --wav /tmp/cpp2.wav
