@@ -308,6 +308,12 @@ Stream parse_stream(const std::filesystem::path& path) {
                     }
                     off += 72;
                 } break;
+                case 9: {
+                    if (data.size - off < 56) {
+                        stream_error("truncated RegionMultipole", rec_start);
+                    }
+                    off += 56;
+                } break;
                 default: {
                     std::ostringstream message;
                     message << "unknown record tag " << tag << " at offset " << rec_start;
