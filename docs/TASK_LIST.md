@@ -1,6 +1,6 @@
 # Task List
 
-Last updated: 2026-09-07
+Last updated: 2026-09-08
 
 ## Completed
 
@@ -80,6 +80,13 @@ Last updated: 2026-09-07
 ## Traversal (deferred)
 
 - [ ] parallel GPU traversal (BFS-per-level or workgroup-DFS) to replace the retained-but-not-dispatched serial compute_select.comp; worth building only after profiling proves CPU selection is actually the bottleneck for some class of scene
+
+## Ontos Viewer Bridge
+
+- [x] ontos_view accepts spec-20 RegionMultipole records (tag 9, 2026-09-08)
+- [x] spec 21-22 contact + modal audio (2026-09-08): dump tool re-simulates the contact pass and resynthesizes the audio bit-exactly (`--wav`, FNV hash on the OK line); ontos_view parses tag 10 and renders the WAV offline (`--wav`); CI cross-verifies both against the committed simval corpora on ubuntu + macos
+- [ ] realtime audio device output in ontos_view (offline deterministic WAV is the v1 path, chosen for testability; no new dependencies)
+- [ ] contact-event visualization in ontos_view (flash rings at Contact midpoints)
 
 ## Later
 

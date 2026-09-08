@@ -7,6 +7,7 @@
 #include <vector>
 
 using u8 = std::uint8_t;
+using u16 = std::uint16_t;
 using u32 = std::uint32_t;
 using u64 = std::uint64_t;
 using f64 = double;
@@ -23,6 +24,11 @@ static void put_u64le(u8 *dst, u64 v) {
 
 static void put_u32le(u8 *dst, u32 v) {
   for (int i = 0; i < 4; ++i) dst[i] = static_cast<u8>(v >> (8 * i));
+}
+
+static void put_u16le(u8 *dst, u16 v) {
+  dst[0] = static_cast<u8>(v & 0xff);
+  dst[1] = static_cast<u8>(v >> 8);
 }
 
 static u64 fnv1a64(const u8 *data, std::size_t len) {
@@ -321,6 +327,7 @@ static const int G_DEG = 8;
 static const int G_SAMPLES = 33;
 static const u8 G_UNMANAGED = 255;
 static const f64 G_TWO_POW_NEG64 = 0x1p-64;
+static const f64 C_CONTACT_R = 2.0;
 
 struct SplitMix64 {
   u64 state;
@@ -357,6 +364,14 @@ struct GCollapsed {
   f64 mx = 0, my = 0, qxx = 0, qxy = 0, qyy = 0;
   u64 jitter_state = 0;
   std::vector<std::size_t> members;
+};
+
+// Section 21 contact event; vn_after is verification-only state (the record
+// payload is tick, a, b, jn, cx, cy).
+struct GContact {
+  u64 tick = 0;
+  u32 a = 0, b = 0;
+  f64 jn = 0, cx = 0, cy = 0, vn_after = 0;
 };
 
 static int g_region_at(f64 x, f64 y) {
@@ -468,6 +483,11 @@ struct GravityWorld {
   GCollapsed collapsed[4];
   // Frozen section 19 jitter offsets per body (valid while blevel == 2).
   std::vector<f64> body_jx, body_jy;
+  // Section 21 contact mode: sticky from the first Contact record; the
+  // touching set is replay state (pairs overlapping at the previous pass).
+  bool contacts_on = false;
+  std::vector<std::pair<u32, u32>> touching;
+  std::vector<GContact> last_contacts;
 
   explicit GravityWorld(u64 s, u32 count) : seed(s) {
     SplitMix64 rng(s);
@@ -916,6 +936,86 @@ struct GravityWorld {
     }
   }
 
+  // Section 21 contact pass: single pinned lexicographic impulse sweep over
+  // fine pairs, applied immediately, after the second fc kick.
+  void contact_pass(u64 entering, const std::vector<u8> &flags) {
+    const std::size_t n = bodies.size();
+    std::vector<f64> radii(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      radii[i] = C_CONTACT_R * std::sqrt(bodies[i].mass);
+    }
+    std::vector<std::pair<u32, u32>> nxt;
+    std::vector<GContact> events;
+    for (std::size_t i = 0; i < n; ++i) {
+      if (flags[i] != 1) {
+        continue;
+      }
+      for (std::size_t j = i + 1; j < n; ++j) {
+        if (flags[j] != 1) {
+          continue;
+        }
+        const f64 dx = bodies[j].x - bodies[i].x;
+        const f64 dy = bodies[j].y - bodies[i].y;
+        const f64 rs = radii[i] + radii[j];
+        const f64 d2 = dx * dx + dy * dy;
+        if (d2 >= rs * rs) {
+          continue;
+        }
+        const std::pair<u32, u32> pair(static_cast<u32>(i), static_cast<u32>(j));
+        nxt.push_back(pair);
+        f64 nx = 1.0;
+        f64 ny = 0.0;
+        if (d2 != 0.0) {
+          const f64 dist = std::sqrt(d2);
+          nx = dx / dist;
+          ny = dy / dist;
+        }
+        const f64 vrx = bodies[j].vx - bodies[i].vx;
+        const f64 vry = bodies[j].vy - bodies[i].vy;
+        const f64 vn = vrx * nx + vry * ny;
+        if (vn >= 0.0) {
+          continue;
+        }
+        const f64 mi = bodies[i].mass;
+        const f64 mj = bodies[j].mass;
+        const f64 cx = (bodies[i].x + bodies[j].x) * 0.5;
+        const f64 cy = (bodies[i].y + bodies[j].y) * 0.5;
+        const f64 inv = 1.0 / (mi + mj);
+        const f64 t = vn * inv;
+        const f64 fi = t * mj;
+        const f64 fj = t * mi;
+        bodies[i].vx += fi * nx;
+        bodies[i].vy += fi * ny;
+        bodies[j].vx -= fj * nx;
+        bodies[j].vy -= fj * ny;
+        bool was = false;
+        for (const auto &p : touching) {
+          if (p == pair) {
+            was = true;
+            break;
+          }
+        }
+        if (was) {
+          continue;
+        }
+        const f64 vn_after =
+            (bodies[j].vx - bodies[i].vx) * nx + (bodies[j].vy - bodies[i].vy) * ny;
+        const f64 mu = (mi * mj) / (mi + mj);
+        GContact c;
+        c.tick = entering;
+        c.a = static_cast<u32>(i);
+        c.b = static_cast<u32>(j);
+        c.jn = -vn * mu;
+        c.cx = cx;
+        c.cy = cy;
+        c.vn_after = vn_after;
+        events.push_back(c);
+      }
+    }
+    touching = std::move(nxt);
+    last_contacts.insert(last_contacts.end(), events.begin(), events.end());
+  }
+
   void step() {
     const u64 entering = tick + 1;
     for (int region = 0; region < 4; ++region) {
@@ -982,6 +1082,9 @@ struct GravityWorld {
         px += bodies[i].mass * (ax_fc[i] * half);
         py += bodies[i].mass * (ay_fc[i] * half);
       }
+    }
+    if (contacts_on) {
+      contact_pass(entering, cflag);
     }
     tick = entering;
   }
@@ -1104,7 +1207,8 @@ static bool f64_bits_eq(f64 a, f64 b) {
   return ba == bb;
 }
 
-static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count) {
+static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count,
+                       const char *wav_out) {
   GravityWorld world(seed, body_count);
   GravityWorld reference(seed, body_count);
   struct Pending {
@@ -1122,15 +1226,23 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count) {
     int region;
     f64 mx, my, qxx, qxy, qyy;
   };
+  struct PendingContact {
+    u64 t;
+    u32 a, b;
+    f64 jn, cx, cy;
+  };
   std::vector<Pending> pending;
   std::vector<PendingCollapse> pending_collapsed;
   std::vector<PendingMultipole> pending_multipole;
+  std::vector<PendingContact> pending_contact;
+  std::vector<PendingContact> all_contacts;
   u64 ticks_seen = 0;
   u64 totals_seen = 0;
   u64 states_seen = 0;
   u64 bodies_seen = 0;
   u64 collapses_seen = 0;
   f64 max_pos_dev = 0.0;
+  f64 worst_vn_after = 0.0;
   u64 last_tick = 0;
   std::size_t off = 20;
 
@@ -1150,6 +1262,10 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count) {
         // boundary, in stream order — level 2 collapses validate against
         // the world's frozen totals bit-for-bit.
         world.mp_enabled = !pending_multipole.empty();
+        // Section 21: contact mode is sticky from the first Contact record.
+        if (!pending_contact.empty()) {
+          world.contacts_on = true;
+        }
         for (const Pending &p : pending) {
           if (p.level == 0) {
             // Demote on a collapsed region is a no-op (section 19).
@@ -1200,6 +1316,38 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count) {
         pending_multipole.clear();
         world.step();
         reference.step();
+        // Section 21: contact records validate against this tick's own
+        // pass (the pass runs at the end of the step), in stream order.
+        {
+          const std::vector<GContact> local = world.last_contacts;
+          world.last_contacts.clear();
+          if (local.size() != pending_contact.size()) {
+            std::fprintf(stderr,
+                         "MISMATCH: tick %" PRIu64 " contact count stream=%zu computed=%zu\n",
+                         t, pending_contact.size(), local.size());
+            return 1;
+          }
+          for (std::size_t k = 0; k < local.size(); ++k) {
+            const PendingContact &pc = pending_contact[k];
+            const GContact &lc = local[k];
+            if (pc.t != lc.tick || pc.a != lc.a || pc.b != lc.b ||
+                !f64_bits_eq(pc.jn, lc.jn) || !f64_bits_eq(pc.cx, lc.cx) ||
+                !f64_bits_eq(pc.cy, lc.cy)) {
+              std::fprintf(stderr,
+                           "MISMATCH: Contact tick=%" PRIu64 " pair=(%" PRIu32 ",%" PRIu32
+                           ") stream=(jn=%.17g c=(%.17g,%.17g)) computed=(jn=%.17g"
+                           " c=(%.17g,%.17g))\n",
+                           pc.t, pc.a, pc.b, pc.jn, pc.cx, pc.cy, lc.jn, lc.cx, lc.cy);
+              return 1;
+            }
+            const f64 abs_vn = lc.vn_after > 0 ? lc.vn_after : -lc.vn_after;
+            if (abs_vn > worst_vn_after) {
+              worst_vn_after = abs_vn;
+            }
+            all_contacts.push_back(pc);
+          }
+          pending_contact.clear();
+        }
         if (t != world.tick) {
           std::fprintf(stderr,
                        "MISMATCH: TickHeader record tick=%" PRIu64 " re-simulated tick=%" PRIu64
@@ -1414,6 +1562,27 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count) {
         pending_multipole.push_back(
             {t, static_cast<int>(ry) * 2 + static_cast<int>(rx), mx, my, qxx, qxy, qyy});
       } break;
+      case 10: {
+        // Section 21 Contact: parsed here, validated bit-for-bit at the tick
+        // boundary (see case 1).
+        u64 t = 0;
+        u32 a = 0;
+        u32 b = 0;
+        f64 jn = 0, cx = 0, cy = 0;
+        if (!take_u64(data, off, t) || !take_u32(data, off, a) || !take_u32(data, off, b) ||
+            !take_f64(data, off, jn) || !take_f64(data, off, cx) || !take_f64(data, off, cy)) {
+          std::fprintf(stderr, "error: truncated Contact at offset %zu\n", rec_start);
+          return 2;
+        }
+        if (a >= b || b >= body_count || t == 0) {
+          std::fprintf(stderr,
+                       "error: bad Contact (tick=%" PRIu64 " pair=(%" PRIu32 ",%" PRIu32
+                       ")) at offset %zu\n",
+                       t, a, b, rec_start);
+          return 2;
+        }
+        pending_contact.push_back({t, a, b, jn, cx, cy});
+      } break;
       default:
         std::fprintf(stderr, "error: unknown record tag %u at offset %zu\n", tag, rec_start);
         return 2;
@@ -1437,12 +1606,87 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count) {
   const f64 e_drift =
       ((w_e - r_e0 > r_e0 - w_e ? w_e - r_e0 : r_e0 - w_e)) /
       ((r_e0 > 0 ? r_e0 : -r_e0) > 1e-30 ? (r_e0 > 0 ? r_e0 : -r_e0) : 1e-30);
+  // Spec section 22: modal audio as a pure function of the (verified)
+  // stream — contact records excite damped resonators; the whole path
+  // stays in the +,-,*,/ closure so it is bit-identical with the Rust
+  // and Python implementations.
+  static const u64 A_SPT = 64;
+  static const int A_RING = 16384;
+  static const u64 A_TAIL = 260;
+  static const f64 A_OMEGA0 = 0.0004448824124529259;
+  static const f64 A_PARTIAL[3] = {1.0, 4.0, 9.0};
+  static const f64 A_RHO[3] = {0.9990, 0.9985, 0.9980};
+  static const f64 A_AMP[3] = {0.5, 0.3, 0.2};
+  const std::size_t n_samples =
+      static_cast<std::size_t>((last_tick + A_TAIL) * A_SPT);
+  std::vector<f64> abuf(n_samples, 0.0);
+  for (const PendingContact &pc : all_contacts) {
+    const std::size_t e = static_cast<std::size_t>((pc.t + 1) * A_SPT);
+    const f64 ma = world.bodies[pc.a].mass;
+    const f64 mb = world.bodies[pc.b].mass;
+    const f64 mu = (ma * mb) / (ma + mb);
+    for (int k = 0; k < 3; ++k) {
+      const f64 omega = A_OMEGA0 * A_PARTIAL[k] / mu;
+      const f64 a = (2.0 - omega) * A_RHO[k];
+      const f64 b = A_RHO[k] * A_RHO[k];
+      const f64 s0 = A_AMP[k] * pc.jn;
+      f64 s_prev = s0;
+      f64 s_prev2 = 0.0;
+      for (int i = 0; i < A_RING; ++i) {
+        const f64 s = i == 0 ? s0 : (i == 1 ? a * s0 : a * s_prev - b * s_prev2);
+        abuf[e + static_cast<std::size_t>(i)] += s;
+        s_prev2 = s_prev;
+        s_prev = s;
+      }
+    }
+  }
+  std::vector<u8> pcm(n_samples * 2);
+  for (std::size_t i = 0; i < n_samples; ++i) {
+    f64 v = abuf[i];
+    if (v < -1.0) {
+      v = -1.0;
+    } else if (v > 1.0) {
+      v = 1.0;
+    }
+    const f64 q = std::floor(v * 32767.0 + 0.5);
+    short sample = static_cast<short>(q);
+    pcm[i * 2] = static_cast<u8>(static_cast<u16>(sample) & 0xff);
+    pcm[i * 2 + 1] = static_cast<u8>((static_cast<u16>(sample) >> 8) & 0xff);
+  }
+  const u64 audio_digest = fnv1a64(pcm.data(), pcm.size());
+  if (wav_out != nullptr) {
+    std::FILE *wf = std::fopen(wav_out, "wb");
+    if (!wf) {
+      std::fprintf(stderr, "error: cannot open '%s' for writing\n", wav_out);
+      return 3;
+    }
+    const u32 data_size = static_cast<u32>(pcm.size());
+    u8 header[44];
+    std::memcpy(header, "RIFF", 4);
+    put_u32le(header + 4, 36 + data_size);
+    std::memcpy(header + 8, "WAVE", 4);
+    std::memcpy(header + 12, "fmt ", 4);
+    put_u32le(header + 16, 16);
+    put_u16le(header + 20, 1);   // PCM
+    put_u16le(header + 22, 1);   // mono
+    put_u32le(header + 24, 65536);
+    put_u32le(header + 28, 131072);
+    put_u16le(header + 32, 2);   // block align
+    put_u16le(header + 34, 16);  // bits per sample
+    std::memcpy(header + 36, "data", 4);
+    put_u32le(header + 40, data_size);
+    std::fwrite(header, 1, sizeof header, wf);
+    std::fwrite(pcm.data(), 1, pcm.size(), wf);
+    std::fclose(wf);
+  }
   std::printf(
       "OK: ticks=%" PRIu64 " totals=%" PRIu64 " region_states=%" PRIu64 " bodies=%" PRIu64
-      " collapses=%" PRIu64 " fine=%" PRIu64 " coarse=%" PRIu64
-      " final_world_hash=%016" PRIx64 " max_pos_dev=%.3e mom_drift=%.3e energy_drift=%.3e\n",
-      ticks_seen, totals_seen, states_seen, bodies_seen, collapses_seen, w_fine, w_cn,
-      world.world_hash(), max_pos_dev, mom_drift, e_drift);
+      " collapses=%" PRIu64 " contacts=%zu fine=%" PRIu64 " coarse=%" PRIu64
+      " final_world_hash=%016" PRIx64 " audio=%016" PRIx64
+      " max_pos_dev=%.3e mom_drift=%.3e energy_drift=%.3e worst_post_vn=%.3e\n",
+      ticks_seen, totals_seen, states_seen, bodies_seen, collapses_seen, all_contacts.size(),
+      w_fine, w_cn, world.world_hash(), audio_digest, max_pos_dev, mom_drift, e_drift,
+      worst_vn_after);
   return 0;
 }
 
@@ -1452,8 +1696,11 @@ int main(int argc, char **argv) {
     std::fprintf(stderr, "error: FNV-1a64 self-check failed\n");
     return 3;
   }
-  if (argc != 3) {
-    std::fprintf(stderr, "usage: ontos_stream_dump <stream-file> <seed>\n");
+  const char *wav_out = nullptr;
+  if (argc == 5 && std::strcmp(argv[3], "--wav") == 0) {
+    wav_out = argv[4];
+  } else if (argc != 3) {
+    std::fprintf(stderr, "usage: ontos_stream_dump <stream-file> <seed> [--wav out.wav]\n");
     return 3;
   }
 
@@ -1515,7 +1762,7 @@ int main(int argc, char **argv) {
       std::fprintf(stderr, "error: implausible body count %" PRIu32 "\n", body_count);
       return 2;
     }
-    return run_gravity(data, seed, body_count);
+    return run_gravity(data, seed, body_count, wav_out);
   }
 
   World world;

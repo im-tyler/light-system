@@ -40,6 +40,7 @@
 #endif
 
 using u8 = std::uint8_t;
+using u16 = std::uint16_t;
 using u32 = std::uint32_t;
 using u64 = std::uint64_t;
 using f64 = double;
@@ -53,12 +54,19 @@ struct StreamBody {
     f64 x = 0, y = 0, vx = 0, vy = 0, mass = 0;
 };
 
+struct StreamContact {
+    u64 tick = 0;
+    u32 a = 0, b = 0;
+    f64 jn = 0, cx = 0, cy = 0;
+};
+
 struct StreamFrame {
     u64 tick = 0;
     u64 fine = 0;
     u64 coarse = 0;
     u8 region_level[4] = {1, 1, 1, 1};
     std::vector<StreamBody> bodies;
+    std::vector<StreamContact> contacts;
 };
 
 struct Stream {
@@ -180,6 +188,7 @@ Stream parse_stream(const std::filesystem::path& path) {
     u8 region_level[4] = {1, 1, 1, 1};
     bool has_snapshot = false;
     u64 snapshot_population = 0;
+    std::vector<StreamContact> pending_contacts;
     std::size_t off = 20;
 
     try {
@@ -196,6 +205,11 @@ Stream parse_stream(const std::filesystem::path& path) {
                     }
                     StreamFrame frame;
                     frame.tick = t;
+                    for (StreamContact& c : pending_contacts) {
+                        if (c.tick != t) stream_error("Contact tick mismatch", rec_start);
+                        frame.contacts.push_back(c);
+                    }
+                    pending_contacts.clear();
                     stream.frames.push_back(std::move(frame));
                     has_snapshot = false;
                     snapshot_population = 0;
@@ -313,6 +327,18 @@ Stream parse_stream(const std::filesystem::path& path) {
                         stream_error("truncated RegionMultipole", rec_start);
                     }
                     off += 56;
+                } break;
+                case 10: {
+                    StreamContact c;
+                    if (!take_u64(data, off, c.tick) || !take_u32(data, off, c.a) ||
+                        !take_u32(data, off, c.b) || !take_f64(data, off, c.jn) ||
+                        !take_f64(data, off, c.cx) || !take_f64(data, off, c.cy)) {
+                        stream_error("truncated Contact", rec_start);
+                    }
+                    if (c.a >= c.b || c.b >= body_count || c.tick == 0) {
+                        stream_error("bad Contact", rec_start);
+                    }
+                    pending_contacts.push_back(c);
                 } break;
                 default: {
                     std::ostringstream message;
@@ -1039,12 +1065,118 @@ ViewPush compute_view_push(const Camera2D& camera, VkExtent2D extent, float z) {
     return push;
 }
 
+// Spec section 22 (normative: ontos docs/STREAM_SPEC.md): modal audio as a
+// pure function of the stream. Offline deterministic render — the v1 audio
+// output path; realtime device output is a later concern.
+struct AudioSpec {
+    static constexpr u64 kSamplesPerTick = 64;
+    static constexpr int kRing = 16384;
+    static constexpr u64 kTailBlocks = 260;
+    static constexpr f64 kOmega0 = 0.0004448824124529259;
+    static constexpr f64 kPartial[3] = {1.0, 4.0, 9.0};
+    static constexpr f64 kRho[3] = {0.9990, 0.9985, 0.9980};
+    static constexpr f64 kAmp[3] = {0.5, 0.3, 0.2};
+};
+
+u64 fnv1a64_bytes(const u8* data, std::size_t len) {
+    u64 h = 0xcbf29ce484222325ULL;
+    for (std::size_t i = 0; i < len; ++i) {
+        h = (h ^ data[i]) * 0x100000001b3ULL;
+    }
+    return h;
+}
+
+u64 render_contact_audio(const Stream& stream, const char* wav_path, bool write_file) {
+    const u64 final_tick = stream.frames.back().tick;
+    const std::size_t n = static_cast<std::size_t>((final_tick + AudioSpec::kTailBlocks) *
+                                                   AudioSpec::kSamplesPerTick);
+    std::vector<f64> buf(n, 0.0);
+    const StreamFrame& last = stream.frames.back();
+    for (const StreamFrame& frame : stream.frames) {
+        for (const StreamContact& c : frame.contacts) {
+            const std::size_t e =
+                static_cast<std::size_t>((c.tick + 1) * AudioSpec::kSamplesPerTick);
+            const f64 ma = last.bodies[c.a].mass;
+            const f64 mb = last.bodies[c.b].mass;
+            const f64 mu = (ma * mb) / (ma + mb);
+            for (int k = 0; k < 3; ++k) {
+                const f64 omega = AudioSpec::kOmega0 * AudioSpec::kPartial[k] / mu;
+                const f64 a = (2.0 - omega) * AudioSpec::kRho[k];
+                const f64 b = AudioSpec::kRho[k] * AudioSpec::kRho[k];
+                const f64 s0 = AudioSpec::kAmp[k] * c.jn;
+                f64 s_prev = s0;
+                f64 s_prev2 = 0.0;
+                for (int i = 0; i < AudioSpec::kRing; ++i) {
+                    const f64 s = i == 0 ? s0 : (i == 1 ? a * s0 : a * s_prev - b * s_prev2);
+                    buf[e + static_cast<std::size_t>(i)] += s;
+                    s_prev2 = s_prev;
+                    s_prev = s;
+                }
+            }
+        }
+    }
+    std::vector<u8> pcm(n * 2);
+    for (std::size_t i = 0; i < n; ++i) {
+        f64 v = buf[i];
+        if (v < -1.0) {
+            v = -1.0;
+        } else if (v > 1.0) {
+            v = 1.0;
+        }
+        const short sample = static_cast<short>(std::floor(v * 32767.0 + 0.5));
+        const u16 bits = static_cast<u16>(sample);
+        pcm[i * 2] = static_cast<u8>(bits & 0xff);
+        pcm[i * 2 + 1] = static_cast<u8>(bits >> 8);
+    }
+    if (write_file) {
+        std::ofstream out(wav_path, std::ios::binary | std::ios::trunc);
+        if (!out.is_open()) {
+            throw std::runtime_error(std::string("cannot write wav: ") + wav_path);
+        }
+        const auto put_u32 = [](std::vector<u8>& v, u32 x) {
+            v.push_back(static_cast<u8>(x & 0xff));
+            v.push_back(static_cast<u8>((x >> 8) & 0xff));
+            v.push_back(static_cast<u8>((x >> 16) & 0xff));
+            v.push_back(static_cast<u8>((x >> 24) & 0xff));
+        };
+        const auto put_u16 = [](std::vector<u8>& v, u16 x) {
+            v.push_back(static_cast<u8>(x & 0xff));
+            v.push_back(static_cast<u8>(x >> 8));
+        };
+        std::vector<u8> wav;
+        wav.reserve(44 + pcm.size());
+        wav.insert(wav.end(), {'R', 'I', 'F', 'F'});
+        put_u32(wav, 36 + static_cast<u32>(pcm.size()));
+        wav.insert(wav.end(), {'W', 'A', 'V', 'E'});
+        wav.insert(wav.end(), {'f', 'm', 't', ' '});
+        put_u32(wav, 16);
+        put_u16(wav, 1);  // PCM
+        put_u16(wav, 1);  // mono
+        put_u32(wav, 65536);
+        put_u32(wav, 131072);
+        put_u16(wav, 2);  // block align
+        put_u16(wav, 16);
+        wav.insert(wav.end(), {'d', 'a', 't', 'a'});
+        put_u32(wav, static_cast<u32>(pcm.size()));
+        wav.insert(wav.end(), pcm.begin(), pcm.end());
+        out.write(reinterpret_cast<const char*>(wav.data()),
+                  static_cast<std::streamsize>(wav.size()));
+        out.flush();
+        if (!out) {
+            throw std::runtime_error(std::string("wav write failed: ") + wav_path);
+        }
+    }
+    return fnv1a64_bytes(pcm.data(), pcm.size());
+}
+
 void print_usage() {
     std::fprintf(stderr,
-                 "usage: ontos_view <stream-file> [--validate] [--frames N]\n"
+                 "usage: ontos_view <stream-file> [--validate] [--frames N] [--wav FILE]\n"
                  "  --validate   enable Vulkan validation layers\n"
                  "  --frames N   non-interactive: render N frames (one tick per frame),\n"
                  "               print per-tick body counts, exit 0\n"
+                 "  --wav FILE   render the spec-22 modal audio offline (deterministic\n"
+                 "               WAV + FNV hash; no realtime audio device)\n"
                  "  keys: SPACE pause  +/- rate  R restart  ESC quit  drag pan  wheel zoom"
                  "  WASD pan\n");
 }
@@ -1058,6 +1190,7 @@ int main(int argc, char** argv) {
     bool validate = false;
     bool frames_requested = false;
     uint32_t frame_limit = 0;
+    const char* wav_path = nullptr;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--validate") {
@@ -1065,6 +1198,8 @@ int main(int argc, char** argv) {
         } else if (arg == "--frames" && i + 1 < argc) {
             frame_limit = static_cast<uint32_t>(std::atoi(argv[++i]));
             frames_requested = true;
+        } else if (arg == "--wav" && i + 1 < argc) {
+            wav_path = argv[++i];
         } else if (!arg.empty() && arg[0] != '-') {
             if (stream_path.empty()) {
                 stream_path = argv[i];
@@ -1087,6 +1222,16 @@ int main(int argc, char** argv) {
     GLFWwindow* window = nullptr;
     try {
         const Stream stream = parse_stream(stream_path);
+
+        u64 total_contacts = 0;
+        for (const StreamFrame& frame : stream.frames) {
+            total_contacts += frame.contacts.size();
+        }
+        if (wav_path != nullptr) {
+            const u64 digest = render_contact_audio(stream, wav_path, true);
+            std::printf("audio: contacts=%" PRIu64 " wav=%s hash=%016" PRIx64 "\n",
+                        total_contacts, wav_path, digest);
+        }
 
         configure_macos_moltenvk_environment();
 
@@ -1768,9 +1913,9 @@ int main(int argc, char** argv) {
         const double avg_ms = timed_frames > 0 ? time_sum / timed_frames : 0.0;
         const StreamFrame& last_frame = stream.frames[tick_index];
         std::printf("OK ticks=%" PRIu64 " bodies=%zu fine=%" PRIu64 " coarse=%" PRIu64
-                    " frames=%u avg_ms=%.3f\n",
+                    " contacts=%" PRIu64 " frames=%u avg_ms=%.3f\n",
                     ticks_shown, last_frame.bodies.size(), last_frame.fine, last_frame.coarse,
-                    timed_frames, avg_ms);
+                    total_contacts, timed_frames, avg_ms);
 
         vkDeviceWaitIdle(v.device);
         v.destroy();

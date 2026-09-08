@@ -30,3 +30,30 @@ jobs:
           ./prototype/build/meridian_trace --manifest benchmarks/scenes/benchmark_terrace_manifest.txt --error-threshold 0.03
           ./prototype/build/meridian_replay --manifest benchmarks/scenes/benchmark_terrace_manifest.txt --script benchmarks/replays/terrace_streaming_replay.txt
           ./prototype/build/meridian_replay --manifest benchmarks/scenes/benchmark_uv_seam_gltf_manifest.txt --script benchmarks/replays/uv_seam_gltf_replay.txt
+
+  ontos-tools:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    name: ontos stream dump (third spec implementation)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: im-tyler/simval
+          path: simval
+      - name: Build + verify committed ontos corpora bit-for-bit
+        run: |
+          set -e
+          clang++ -std=c++17 -O2 -ffp-contract=off -Wall -Wextra -o /tmp/ontos_stream_dump tools/ontos/ontos_stream_dump.cpp
+          /tmp/ontos_stream_dump simval/examples/ontos/r_pentomino/ontos.stream 42
+          /tmp/ontos_stream_dump simval/examples/ontos_gravity/window/ontos.stream 42
+          /tmp/ontos_stream_dump simval/examples/ontos_gravity/collapse/ontos.stream 11
+          /tmp/ontos_stream_dump simval/examples/ontos_gravity/multipole/ontos.stream 17
+          /tmp/ontos_stream_dump simval/examples/ontos_contact/contact/ontos.stream 11 --wav /tmp/cpp.wav
+          cmp /tmp/cpp.wav simval/examples/ontos_contact/contact/ontos.wav
+          /tmp/ontos_stream_dump simval/examples/ontos_contact/contact_collapse/ontos.stream 11 --wav /tmp/cpp2.wav
+          cmp /tmp/cpp2.wav simval/examples/ontos_contact/contact_collapse/ontos.wav
+          echo "ontos_stream_dump + section-22 audio bit-identical on ${{ matrix.os }}"

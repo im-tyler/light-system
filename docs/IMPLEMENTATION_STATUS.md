@@ -12,7 +12,7 @@ Last updated: 2026-09-08
 - dual payload domains (base clusters + LOD clusters) with page table
 - adjacent replacement-level page dependency hints for streaming prefetch
 - `meridian_dump`, `meridian_trace`, `meridian_residency`, `meridian_replay` CLI tools
-- `ontos_stream_dump` (tools/ontos, standalone C++17 no-deps): third independent implementation of the ontos stream spec (after ontos's Rust and simval's Python); verifies streams bit-for-bit. Spike toward the ontos Phase 3 viewer bridge (JoltViewer thin-consumer pattern, zero coupling to the renderer core).
+- `ontos_stream_dump` (tools/ontos, standalone C++17 no-deps): third independent implementation of the ontos stream spec (after ontos's Rust and simval's Python); verifies streams bit-for-bit, including spec-21 contact dynamics (re-simulated impulse pass) and spec-22 modal audio (bit-exact WAV + FNV hash, `--wav`). Spike toward the ontos Phase 3 viewer bridge (JoltViewer thin-consumer pattern, zero coupling to the renderer core). CI cross-verifies it against the committed simval corpora on every push (ubuntu + macos).
 - validated on synthetic benchmarks + external pirate.glb + Stanford Dragon (871K triangles) + generated 1M-triangle city
 
 ## Phase 2: Standalone Vulkan Renderer (In Progress)
@@ -89,7 +89,7 @@ Per-frame CPU (emitted every 60 frames as `MERIDIAN_CPU: ...`, measured post-CSM
 - **Normal-cone cull FIXED 2026-09-08 (schema v5)**: culls per meshopt's canonical test (dot >= cutoff*len + radius) with bounding-sphere center+radius threaded through cluster records, CPU selection, and compute shaders. The old test was inverted — it culled front-facing tight cones and kept back-facing ones; the documented past 'culling gains' were the wrong half. uv_seam now renders (0 -> 69K visible px); dragon 4101->4002 draws, city 20.9->19.3ms; subset property holds on all scenes.
 - (fixed 2026-09-08) screenshot acquire path validated clean.
 - Godot comparison harness exists (benchmarks/godot/); results honestly unfavorable — stock Forward+ is faster today (benchmarks/godot/RESULTS.md).
-- ontos_view (2026-09-08): plays back ontos v2 gravity streams including spec-19 collapse (tag 8, level 2) — billboard bodies colored by region/level, region grid, playback controls, `--frames` headless smoke; depth attachment, MSAA, double-buffered instances, mmap'd stream parsing. Spec coverage matches the golden set. No trails.
+- ontos_view (2026-09-08): plays back ontos v2 gravity streams including spec-19 collapse (tag 8, level 2), spec-20 multipole (tag 9) and spec-21 contacts (tag 10) — billboard bodies colored by region/level, region grid, playback controls, `--frames` headless smoke; depth attachment, MSAA, double-buffered instances, mmap'd stream parsing. Spec coverage matches the golden set. `--wav FILE` renders the spec-22 modal audio offline (deterministic WAV + FNV hash, bit-identical with ontos and simval; realtime device output is deliberately deferred — the offline render is the testable v1 path). No trails.
 - Compressed geometry payloads
 - Deeper Godot runtime integration
 - Parallel GPU traversal (BFS-per-level or workgroup-DFS) to replace the retained-but-not-dispatched serial compute_select.comp
