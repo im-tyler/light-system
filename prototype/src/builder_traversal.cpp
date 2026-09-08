@@ -1,4 +1,8 @@
 #include "builder_internal.h"
+#include "parallel_exec.h"
+
+#include <atomic>
+#include <functional>
 
 namespace meridian::detail {
 
@@ -11,6 +15,30 @@ bool collect_group_pages(const VGeoResource& resource, const LodGroupRecord& gro
 struct CoverageMask {
     std::vector<uint8_t>& marks;
     bool has_any = false;
+};
+
+// Per-task traversal state: the dedup mark vectors plus the outputs they
+// filter. The marks only suppress duplicate OUTPUT pushes (page/node
+// dedup) -- they never influence traversal decisions -- so a task can run
+// with fresh zeroed marks against a private copy of the coverage set and
+// have its outputs merged afterwards in tree order to reproduce the serial
+// output bit-for-bit.
+struct TraversalScratch {
+    std::vector<uint8_t> missing_marks;
+    std::vector<uint8_t> prefetch_marks;
+    std::vector<uint8_t> node_marks;
+    std::vector<uint8_t> selected_page_marks;
+    TraversalSelection selection;
+};
+
+// Fork-join control for parallel subtree traversal. tokens bounds the
+// number of scheduled child tasks per traversal (oversubscription cap);
+// it is a heuristic guard only and never affects output.
+struct ForkControl {
+    ParallelExecutor* exec = nullptr;
+    std::atomic<uint32_t>* tokens = nullptr;
+    uint32_t token_budget = 0;
+    uint32_t min_child_clusters = 0;
 };
 
 bool cluster_covered(const CoverageMask& cov, uint32_t cluster_index) {
@@ -93,8 +121,7 @@ bool node_span_fully_covered(const HierarchyNode& node, const CoverageMask& cov)
 
 bool covered_span_resident(const VGeoResource& resource, const HierarchyNode& node,
                            const CoverageMask& cov, const std::vector<uint8_t>& resident_pages,
-                           std::vector<uint8_t>& missing_marks,
-                           TraversalSelection& selection) {
+                           TraversalScratch& scratch) {
     bool resident = true;
     for (uint32_t cluster_index = node.first_cluster_index;
          cluster_index < node.first_cluster_index + node.cluster_count; ++cluster_index) {
@@ -104,9 +131,9 @@ bool covered_span_resident(const VGeoResource& resource, const HierarchyNode& no
         const uint32_t page_index = resource.clusters[cluster_index].page_index;
         if (!resident_pages[page_index]) {
             resident = false;
-            if (!missing_marks[page_index]) {
-                missing_marks[page_index] = 1;
-                selection.missing_page_indices.push_back(page_index);
+            if (!scratch.missing_marks[page_index]) {
+                scratch.missing_marks[page_index] = 1;
+                scratch.selection.missing_page_indices.push_back(page_index);
             }
         }
     }
@@ -115,57 +142,50 @@ bool covered_span_resident(const VGeoResource& resource, const HierarchyNode& no
 
 void collect_prefetch_pages(const VGeoResource& resource, uint32_t missing_page_index,
                             const std::vector<uint8_t>& resident_pages,
-                            std::vector<uint8_t>& prefetch_marks,
-                            TraversalSelection& selection) {
+                            TraversalScratch& scratch) {
     const PageRecord& page = resource.pages[missing_page_index];
     const uint32_t dependency_end = page.dependency_page_start + page.dependency_page_count;
     for (uint32_t dependency_index = page.dependency_page_start; dependency_index < dependency_end;
          ++dependency_index) {
         const uint32_t dependency_page_index = resource.page_dependencies[dependency_index];
-        if (!resident_pages[dependency_page_index] && !prefetch_marks[dependency_page_index]) {
-            prefetch_marks[dependency_page_index] = 1;
-            selection.prefetch_page_indices.push_back(dependency_page_index);
+        if (!resident_pages[dependency_page_index] &&
+            !scratch.prefetch_marks[dependency_page_index]) {
+            scratch.prefetch_marks[dependency_page_index] = 1;
+            scratch.selection.prefetch_page_indices.push_back(dependency_page_index);
         }
     }
 }
 
-void record_selected_node(uint32_t node_index, std::vector<uint8_t>& node_marks,
-                          TraversalSelection& selection) {
-    if (!node_marks[node_index]) {
-        node_marks[node_index] = 1;
-        selection.selected_node_indices.push_back(node_index);
+void record_selected_node(uint32_t node_index, TraversalScratch& scratch) {
+    if (!scratch.node_marks[node_index]) {
+        scratch.node_marks[node_index] = 1;
+        scratch.selection.selected_node_indices.push_back(node_index);
     }
 }
 
-void record_selected_page(uint32_t page_index, std::vector<uint8_t>& selected_page_marks,
-                          TraversalSelection& selection) {
-    if (!selected_page_marks[page_index]) {
-        selected_page_marks[page_index] = 1;
-        selection.selected_page_indices.push_back(page_index);
+void record_selected_page(uint32_t page_index, TraversalScratch& scratch) {
+    if (!scratch.selected_page_marks[page_index]) {
+        scratch.selected_page_marks[page_index] = 1;
+        scratch.selection.selected_page_indices.push_back(page_index);
     }
 }
 
 void select_base_span(const HierarchyNode& node, const CoverageMask& cov,
-                      TraversalSelection& selection) {
+                      TraversalScratch& scratch) {
     for (uint32_t cluster_index = node.first_cluster_index;
          cluster_index < node.first_cluster_index + node.cluster_count; ++cluster_index) {
         if (cluster_covered(cov, cluster_index)) {
             continue;
         }
-        selection.selected_cluster_indices.push_back(cluster_index);
+        scratch.selection.selected_cluster_indices.push_back(cluster_index);
     }
 }
 
 // Emit an LOD group's clusters, assuming pages are already confirmed resident.
 // Pages are checked against the group's LOD cluster set.
 bool try_select_lod_group(const VGeoResource& resource, uint32_t group_index,
-                          const std::vector<uint8_t>& resident_pages,
-                          std::vector<uint8_t>& missing_marks,
-                          std::vector<uint8_t>& prefetch_marks,
-                          std::vector<uint8_t>& node_marks,
-                          std::vector<uint8_t>& selected_page_marks,
-                          uint32_t node_index,
-                          TraversalSelection& selection) {
+                          const std::vector<uint8_t>& resident_pages, uint32_t node_index,
+                          TraversalScratch& scratch) {
     const LodGroupRecord& group = resource.lod_groups[group_index];
     std::vector<uint32_t> group_pages;
     collect_group_pages(resource, group, group_pages);
@@ -174,11 +194,10 @@ bool try_select_lod_group(const VGeoResource& resource, uint32_t group_index,
     for (uint32_t page_index : group_pages) {
         if (!resident_pages[page_index]) {
             resident = false;
-            if (!missing_marks[page_index]) {
-                missing_marks[page_index] = 1;
-                selection.missing_page_indices.push_back(page_index);
-                collect_prefetch_pages(resource, page_index, resident_pages, prefetch_marks,
-                                      selection);
+            if (!scratch.missing_marks[page_index]) {
+                scratch.missing_marks[page_index] = 1;
+                scratch.selection.missing_page_indices.push_back(page_index);
+                collect_prefetch_pages(resource, page_index, resident_pages, scratch);
             }
         }
     }
@@ -186,15 +205,126 @@ bool try_select_lod_group(const VGeoResource& resource, uint32_t group_index,
         return false;
     }
 
-    record_selected_node(node_index, node_marks, selection);
-    selection.selected_lod_group_indices.push_back(group_index);
+    record_selected_node(node_index, scratch);
+    scratch.selection.selected_lod_group_indices.push_back(group_index);
     for (uint32_t cluster_index = group.first_lod_cluster_index;
          cluster_index < group.first_lod_cluster_index + group.lod_cluster_count; ++cluster_index) {
-        selection.selected_lod_cluster_indices.push_back(cluster_index);
-        record_selected_page(resource.lod_clusters[cluster_index].page_index, selected_page_marks,
-                             selection);
+        scratch.selection.selected_lod_cluster_indices.push_back(cluster_index);
+        record_selected_page(resource.lod_clusters[cluster_index].page_index, scratch);
     }
     return true;
+}
+
+// Merge a child task's outputs into the parent's, in child order. Lists the
+// serial traversal deduplicates through shared marks (nodes, pages) are
+// re-deduplicated here against the accumulated marks, so the merged order is
+// the serial first-encounter order. Cluster and LOD-group lists have no
+// dedup in the serial path and are appended as-is.
+void merge_child_scratch(TraversalScratch& dst, TraversalScratch& child) {
+    for (uint32_t node_index : child.selection.selected_node_indices) {
+        if (!dst.node_marks[node_index]) {
+            dst.node_marks[node_index] = 1;
+            dst.selection.selected_node_indices.push_back(node_index);
+        }
+    }
+    for (uint32_t page_index : child.selection.selected_page_indices) {
+        if (!dst.selected_page_marks[page_index]) {
+            dst.selected_page_marks[page_index] = 1;
+            dst.selection.selected_page_indices.push_back(page_index);
+        }
+    }
+    for (uint32_t page_index : child.selection.missing_page_indices) {
+        if (!dst.missing_marks[page_index]) {
+            dst.missing_marks[page_index] = 1;
+            dst.selection.missing_page_indices.push_back(page_index);
+        }
+    }
+    for (uint32_t page_index : child.selection.prefetch_page_indices) {
+        if (!dst.prefetch_marks[page_index]) {
+            dst.prefetch_marks[page_index] = 1;
+            dst.selection.prefetch_page_indices.push_back(page_index);
+        }
+    }
+    dst.selection.selected_cluster_indices.insert(
+        dst.selection.selected_cluster_indices.end(),
+        child.selection.selected_cluster_indices.begin(),
+        child.selection.selected_cluster_indices.end());
+    dst.selection.selected_lod_group_indices.insert(
+        dst.selection.selected_lod_group_indices.end(),
+        child.selection.selected_lod_group_indices.begin(),
+        child.selection.selected_lod_group_indices.end());
+    dst.selection.selected_lod_cluster_indices.insert(
+        dst.selection.selected_lod_cluster_indices.end(),
+        child.selection.selected_lod_cluster_indices.begin(),
+        child.selection.selected_lod_cluster_indices.end());
+}
+
+void traverse_node_selection(const VGeoResource& resource, uint32_t node_index,
+                             float error_threshold, CoverageMask& coverage,
+                             const std::vector<uint8_t>& resident_pages,
+                             TraversalScratch& scratch, const ForkControl& fork);
+
+// Descend into a node's children. Sibling subtrees are independent under the
+// coverage set: the serial traversal marks ancestor coverage before the
+// sibling loop and unmarks only after ALL siblings completed, so every child
+// executes against exactly this coverage state. When forking, each child
+// task gets a byte-copy of the coverage marks plus fresh output marks; the
+// ordered merge afterwards reproduces the serial output bit-for-bit.
+void traverse_children(const VGeoResource& resource, const HierarchyNode& node,
+                       float error_threshold, CoverageMask& coverage,
+                       const std::vector<uint8_t>& resident_pages, TraversalScratch& scratch,
+                       const ForkControl& fork) {
+    if (node.child_count == 0) {
+        return;
+    }
+    bool use_parallel = false;
+    if (fork.exec != nullptr && node.child_count >= 2 &&
+        fork.tokens->load(std::memory_order_relaxed) < fork.token_budget) {
+        for (uint32_t child_offset = 0; child_offset < node.child_count; ++child_offset) {
+            if (resource.hierarchy_nodes[node.first_child_index + child_offset].cluster_count >=
+                fork.min_child_clusters) {
+                use_parallel = true;
+                break;
+            }
+        }
+    }
+    if (!use_parallel) {
+        for (uint32_t child_offset = 0; child_offset < node.child_count; ++child_offset) {
+            traverse_node_selection(resource, node.first_child_index + child_offset,
+                                    error_threshold, coverage, resident_pages, scratch, fork);
+        }
+        return;
+    }
+    fork.tokens->fetch_add(node.child_count, std::memory_order_relaxed);
+    std::vector<TraversalScratch> child_scratch(node.child_count);
+    for (uint32_t child_offset = 0; child_offset < node.child_count; ++child_offset) {
+        child_scratch[child_offset].missing_marks.assign(resource.pages.size(), 0);
+        child_scratch[child_offset].prefetch_marks.assign(resource.pages.size(), 0);
+        child_scratch[child_offset].node_marks.assign(resource.hierarchy_nodes.size(), 0);
+        child_scratch[child_offset].selected_page_marks.assign(resource.pages.size(), 0);
+    }
+    std::vector<std::vector<uint8_t>> child_marks(node.child_count);
+    std::vector<CoverageMask> child_coverage;
+    child_coverage.reserve(node.child_count);
+    for (uint32_t child_offset = 0; child_offset < node.child_count; ++child_offset) {
+        child_marks[child_offset].assign(coverage.marks.begin(), coverage.marks.end());
+        child_coverage.push_back(CoverageMask{child_marks[child_offset], coverage.has_any});
+    }
+    std::vector<std::function<void()>> jobs;
+    jobs.reserve(node.child_count);
+    for (uint32_t child_offset = 0; child_offset < node.child_count; ++child_offset) {
+        const uint32_t child_index = node.first_child_index + child_offset;
+        jobs.emplace_back([=, &resource, &child_coverage, &child_scratch, &resident_pages,
+                           &fork]() {
+            traverse_node_selection(resource, child_index, error_threshold,
+                                    child_coverage[child_offset], resident_pages,
+                                    child_scratch[child_offset], fork);
+        });
+    }
+    fork.exec->run(jobs);
+    for (uint32_t child_offset = 0; child_offset < node.child_count; ++child_offset) {
+        merge_child_scratch(scratch, child_scratch[child_offset]);
+    }
 }
 
 // Traverse a node under an ancestor-provided coverage set. When a node's
@@ -204,11 +334,7 @@ bool try_select_lod_group(const VGeoResource& resource, uint32_t group_index,
 void traverse_node_selection(const VGeoResource& resource, uint32_t node_index, float error_threshold,
                              CoverageMask& coverage,
                              const std::vector<uint8_t>& resident_pages,
-                             std::vector<uint8_t>& missing_marks,
-                             std::vector<uint8_t>& prefetch_marks,
-                             std::vector<uint8_t>& node_marks,
-                             std::vector<uint8_t>& selected_page_marks,
-                             TraversalSelection& selection) {
+                             TraversalScratch& scratch, const ForkControl& fork) {
     const HierarchyNode& node = resource.hierarchy_nodes[node_index];
 
     if (coverage.has_any && node_span_fully_covered(node, coverage)) {
@@ -235,9 +361,8 @@ void traverse_node_selection(const VGeoResource& resource, uint32_t node_index, 
 
     if (selected_link_index != 0xffffffffu) {
         const NodeLodLink& link = resource.node_lod_links[selected_link_index];
-        if (try_select_lod_group(resource, link.lod_group_index, resident_pages, missing_marks,
-                                 prefetch_marks, node_marks, selected_page_marks, node_index,
-                                 selection)) {
+        if (try_select_lod_group(resource, link.lod_group_index, resident_pages, node_index,
+                                 scratch)) {
             const LodGroupRecord& group = resource.lod_groups[link.lod_group_index];
             if (group_covers_whole_node(resource, group, node)) {
                 return;
@@ -245,11 +370,8 @@ void traverse_node_selection(const VGeoResource& resource, uint32_t node_index, 
             std::vector<uint32_t> marked_indices;
             marked_indices.reserve(group.base_run_count * 4);
             mark_group_coverage(resource, group, coverage, marked_indices);
-            for (uint32_t child_offset = 0; child_offset < node.child_count; ++child_offset) {
-                traverse_node_selection(resource, node.first_child_index + child_offset,
-                                        error_threshold, coverage, resident_pages, missing_marks,
-                                        prefetch_marks, node_marks, selected_page_marks, selection);
-            }
+            traverse_children(resource, node, error_threshold, coverage, resident_pages, scratch,
+                              fork);
             unmark_coverage(coverage, marked_indices);
             // has_any may still be true if ancestor coverage remains; recompute
             // lazily: if no marks remain set after unmark, flip has_any off.
@@ -262,54 +384,56 @@ void traverse_node_selection(const VGeoResource& resource, uint32_t node_index, 
     }
 
     if (node.geometric_error <= error_threshold || node.child_count == 0) {
-        if (covered_span_resident(resource, node, coverage, resident_pages, missing_marks,
-                                  selection)) {
-            record_selected_node(node_index, node_marks, selection);
-            select_base_span(node, coverage, selection);
+        if (covered_span_resident(resource, node, coverage, resident_pages, scratch)) {
+            record_selected_node(node_index, scratch);
+            select_base_span(node, coverage, scratch);
             for (uint32_t cluster_index = node.first_cluster_index;
                  cluster_index < node.first_cluster_index + node.cluster_count; ++cluster_index) {
                 if (cluster_covered(coverage, cluster_index)) {
                     continue;
                 }
-                record_selected_page(resource.clusters[cluster_index].page_index, selected_page_marks,
-                                     selection);
+                record_selected_page(resource.clusters[cluster_index].page_index, scratch);
             }
         } else {
             for (uint32_t page_index = node.min_resident_page; page_index <= node.max_resident_page;
                  ++page_index) {
-                if (page_index < resource.pages.size() && missing_marks[page_index]) {
-                    collect_prefetch_pages(resource, page_index, resident_pages, prefetch_marks,
-                                          selection);
+                if (page_index < resource.pages.size() && scratch.missing_marks[page_index]) {
+                    collect_prefetch_pages(resource, page_index, resident_pages, scratch);
                 }
             }
         }
         return;
     }
 
-    for (uint32_t child_offset = 0; child_offset < node.child_count; ++child_offset) {
-        traverse_node_selection(resource, node.first_child_index + child_offset, error_threshold,
-                                coverage, resident_pages, missing_marks, prefetch_marks, node_marks,
-                                selected_page_marks, selection);
-    }
+    traverse_children(resource, node, error_threshold, coverage, resident_pages, scratch, fork);
 }
 
 TraversalSelection simulate_traversal(const VGeoResource& resource, float error_threshold,
-                                      const std::vector<uint8_t>& resident_pages) {
+                                      const std::vector<uint8_t>& resident_pages,
+                                      ParallelExecutor* executor) {
     if (resident_pages.size() != resource.pages.size()) {
         throw BuilderError("resident page mask size must match resource page count");
     }
 
-    TraversalSelection selection;
-    std::vector<uint8_t> missing_marks(resource.pages.size(), 0);
-    std::vector<uint8_t> prefetch_marks(resource.pages.size(), 0);
-    std::vector<uint8_t> node_marks(resource.hierarchy_nodes.size(), 0);
-    std::vector<uint8_t> selected_page_marks(resource.pages.size(), 0);
+    TraversalScratch scratch;
+    scratch.missing_marks.assign(resource.pages.size(), 0);
+    scratch.prefetch_marks.assign(resource.pages.size(), 0);
+    scratch.node_marks.assign(resource.hierarchy_nodes.size(), 0);
+    scratch.selected_page_marks.assign(resource.pages.size(), 0);
     std::vector<uint8_t> coverage_marks(resource.clusters.size(), 0);
     CoverageMask coverage{coverage_marks, false};
+
+    ForkControl fork;
+    std::atomic<uint32_t> tokens(0);
+    if (executor != nullptr && executor->total_threads() > 1) {
+        fork.exec = executor;
+        fork.tokens = &tokens;
+        fork.token_budget = 2 * executor->total_threads();
+        fork.min_child_clusters = 512;
+    }
     traverse_node_selection(resource, resource.metadata.root_hierarchy_node_index, error_threshold,
-                            coverage, resident_pages, missing_marks, prefetch_marks, node_marks,
-                            selected_page_marks, selection);
-    return selection;
+                            coverage, resident_pages, scratch, fork);
+    return std::move(scratch.selection);
 }
 
 }  // namespace meridian::detail

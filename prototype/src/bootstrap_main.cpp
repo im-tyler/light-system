@@ -9,13 +9,16 @@
 namespace {
 
 void print_usage() {
-    std::cerr << "Usage: meridian_vk_bootstrap --manifest <path> [--interactive] [--screenshot <path>] [--budget <pages>] [--demand-streaming] [--error-threshold <value>] [--shadow-error-scale <value>] [--validate]\n"
+    std::cerr << "Usage: meridian_vk_bootstrap --manifest <path> [--interactive] [--screenshot <path>] [--budget <pages>] [--demand-streaming] [--error-threshold <value>] [--shadow-error-scale <value>] [--threads <count>] [--validate]\n"
                  "  --screenshot writes a raw PPM image (extension forced to .ppm)\n"
                  "  --error-threshold sets the LOD selection threshold (default: auto =\n"
                  "  max(0.001, 8.9x the scene's median LOD-group geometric error), so\n"
                  "  scene-scale ladders activate instead of selecting full detail)\n"
                  "  --shadow-error-scale multiplies the LOD threshold for shadow casters\n"
-                 "  (default 8.0; <= 1 shares the main-pass selection)\n";
+                 "  (default 8.0; <= 1 shares the main-pass selection)\n"
+                 "  --threads sets the total worker threads for traversal and draw-list\n"
+                 "  build (default: auto = min(hardware_concurrency, 8); 1 = serial;\n"
+                 "  output is bit-identical at any count)\n";
 }
 
 }  // namespace
@@ -26,6 +29,7 @@ int main(int argc, char** argv) {
     uint32_t resident_budget = 0xffffffffu;
     float error_threshold = -1.0f;  // negative = auto (scene-scaled)
     float shadow_error_scale = 8.0f;
+    uint32_t worker_threads = 0;
     bool validate = false;
     bool interactive = false;
     bool demand_streaming = false;
@@ -41,6 +45,8 @@ int main(int argc, char** argv) {
             error_threshold = std::atof(argv[++i]);
         } else if (arg == "--shadow-error-scale" && i + 1 < argc) {
             shadow_error_scale = std::atof(argv[++i]);
+        } else if (arg == "--threads" && i + 1 < argc) {
+            worker_threads = static_cast<uint32_t>(std::atoi(argv[++i]));
         } else if (arg == "--validate") {
             validate = true;
         } else if (arg == "--interactive") {
@@ -74,6 +80,7 @@ int main(int argc, char** argv) {
         config.shadow_error_scale = shadow_error_scale;
         config.enable_validation = validate;
         config.demand_streaming = demand_streaming;
+        config.worker_threads = worker_threads;
         config.persisted_vgeo_path = manifest.output_path.string();
         const meridian::VkBootstrapReport report =
             meridian::build_vk_bootstrap_report(resource, config);
@@ -165,6 +172,7 @@ int main(int argc, char** argv) {
         std::cout << "visibility_example_word0=" << example.word0 << '\n';
         std::cout << "visibility_example_word1=" << example.word1 << '\n';
         std::cout << "physical_devices=" << report.physical_devices.size() << '\n';
+        std::cout << "worker_threads=" << report.worker_threads << '\n';
         for (size_t device_index = 0; device_index < report.physical_devices.size(); ++device_index) {
             std::cout << "physical_device[" << device_index << "]="
                       << report.physical_devices[device_index] << '\n';

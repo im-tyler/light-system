@@ -3,6 +3,79 @@
 First automated comparison captured with `run_bench.sh` (see
 [README.md](./README.md) for method and caveats).
 
+## 2026-09-07 23:15 local: parallel CPU traversal + draw build — city traverse+build 5.8 -> 3.7 ms paired, output bit-identical
+
+Same machine/os as below; the machine stayed loaded the whole session
+(load average ~17-31: the iOS-simulator game + companion from the
+17:34 section plus concurrent agent workloads). All A/B pairs are
+minutes apart under that load; draw counts / encode counts /
+parallel-vs-serial vector equality are trace-deterministic
+(load-independent). The idle-machine rerun remains pending for the
+whole 2026-09-07 evening series.
+
+One change: the per-frame CPU work now runs on a small fork-join
+thread pool (`--threads N`, default auto = min(hardware_concurrency,
+8); 1 = the previous serial path). Two levels of parallelism: (a) the
+main and shadow-caster `simulate_traversal` DFS run concurrently,
+(b) each DFS forks subtree tasks at hierarchy nodes whose children all
+span >= 512 base clusters (capped at 2x-threads tasks per traversal),
+and (c) the selection -> GpuDrawEntry conversion is chunked (~1536
+selection indices per job) across the same pool. Determinism argument:
+the coverage marks the DFS mutates are scoped to ancestor descents
+(set before the sibling loop, cleared after), so every sibling subtree
+sees exactly the incoming coverage state — a forking child gets a
+byte-copy plus fresh output marks, and an ordered merge in child order
+reproduces the serial first-encounter order of every deduplicated
+list (the marks only suppress duplicate output pushes, never traversal
+decisions). Build chunks write chunk-local `first_instance` that the
+ordered concat fixes up with global offsets. Nothing else (fold,
+residency merge, uploads) changed. `meridian_trace --parallel <t>`
+now runs both paths and asserts vector equality.
+
+| scene | metric (CPU sections, ms/frame) | serial (`--threads 1`) | parallel (8 threads) |
+| --- | --- | --- | --- |
+| massive_city | traverse (2 DFS + fork) | 3.88 | 2.39 |
+| massive_city | build (chunks + fold) | 1.94 | 1.30 |
+| massive_city | traverse+build total | 5.82 | 3.69 (-37%) |
+| stanford_dragon | traverse+build total | ~1.35 | ~1.28 |
+
+Thread sweep on city under the same load: 1 -> 3.88/1.94, 4 ->
+2.55/1.46, 6 -> 2.67/1.34, 8 -> 2.39/1.30. The first cut used 4x-thread
+task budgets and a 256-cluster fork floor; under external load that
+produced too many small wakeups and *regressed* 8-thread traverse to
+4.17 ms — fewer, bigger tasks (2x budget, 512 floor) is what the table
+above reports.
+
+Frame-time medians under a load spike to ~31 during the interleaved
+REPEAT=2 baseline-binary vs parallel-binary runs were a wash (city
+8.58/8.52 vs 8.52/8.61; dragon 8.39/8.53 vs 8.38/8.35): at that load
+the frame is fence/submit-bound and the CPU-section saving mostly
+lands inside stolen cycles. p99 inflated on some parallel runs
+(city r1 21.5 ms) — wakeup latency under load spikes; not observed
+at load ~20 or below.
+
+Verification: dragon AND city screenshots pixel-identical to the
+pre-change build (0/921600 pixels differ >10 on both — the ordered
+merge reproduces the exact entry order, so not even the previous
+0.047% city depth-flip class reappears); `parallel_match=true` from
+`meridian_trace --parallel 8` on terrace, uv_seam, textured_uv_seam,
+dragon (t 0.001 and 0.008) and city (t 0.8965 and 7.172), repeated x3;
+ThreadSanitizer clean on dragon + city traversals; draws unchanged
+(city main:20732 shadow:3239, dragon main:4002 shadow:800; encodes
+2+2 / 4+4); `replay_runtime_parity=true` and
+`visibility_selection_subset=true` on both scenes including
+`--validate` runs (only the preexisting MoltenVK blend-state warning);
+builder smoke set (4 manifests), meridian_dump, terrace + uv_seam
+replays, and `--demand-streaming --budget 96` dragon (residency
+pinned 96/3617, subset holds) all pass; clean
+`-Wall -Wextra -Wpedantic` rebuild (0 warnings).
+
+Remaining city gap, in order: (a) MoltenVK fixed submit cost
+~1.5-2 ms beyond draws (follow-up work), (b) main-pass GPU 1.3-1.8 ms,
+(c) CPU traverse+build now ~3.7 ms under load — expected to shrink
+further on an idle machine where the pool gets real cores (idle rerun
+pending; dragon is already ~1.3 ms total and effectively done).
+
 ## 2026-09-07 20:35 local: instance-folded draw submission — city gap ~2.9x -> ~1.6-2.1x
 
 Same machine/os/godot as below; the machine was loaded the whole session

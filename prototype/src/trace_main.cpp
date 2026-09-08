@@ -1,3 +1,4 @@
+#include "parallel_exec.h"
 #include "vgeo_builder.h"
 
 #include <algorithm>
@@ -11,7 +12,10 @@
 namespace {
 
 void print_usage() {
-    std::cerr << "Usage: meridian_trace --manifest <path> --error-threshold <value> [--resident-pages all|base-only|lod-only] [--detail counts|verbose]\n";
+    std::cerr << "Usage: meridian_trace --manifest <path> --error-threshold <value> [--resident-pages all|base-only|lod-only] [--detail counts|verbose] [--parallel <threads>]\n"
+                 "  --parallel also runs the fork-join traversal with the given total\n"
+                 "  thread count and reports parallel_match=true|false (bit-identical\n"
+                 "  selection vectors vs the serial path; nonzero exit on mismatch)\n";
 }
 
 bool page_is_lod(const meridian::PageRecord& page) {
@@ -67,6 +71,7 @@ int main(int argc, char** argv) {
     float error_threshold = 0.0f;
     std::string resident_mode = "all";
     std::string detail_mode = "counts";
+    uint32_t parallel_threads = 0;
 
     for (int i = 1; i < argc; i += 2) {
         const std::string_view flag = argv[i];
@@ -83,6 +88,8 @@ int main(int argc, char** argv) {
             resident_mode = argv[i + 1];
         } else if (flag == "--detail") {
             detail_mode = argv[i + 1];
+        } else if (flag == "--parallel") {
+            parallel_threads = static_cast<uint32_t>(std::stoul(argv[i + 1]));
         } else {
             print_usage();
             return 1;
@@ -133,6 +140,29 @@ int main(int argc, char** argv) {
             print_indices("prefetch_page_list", selection.prefetch_page_indices);
         } else if (detail_mode != "counts") {
             throw meridian::BuilderError("invalid detail mode: " + detail_mode);
+        }
+        if (parallel_threads > 0) {
+            // Determinism check: the fork-join traversal must produce the
+            // exact serial selection (same vectors, same order).
+            meridian::ParallelExecutor executor(parallel_threads);
+            const meridian::TraversalSelection parallel_selection =
+                meridian::simulate_traversal(resource, error_threshold, resident_pages,
+                                             &executor);
+            const bool parallel_match =
+                selection.selected_node_indices == parallel_selection.selected_node_indices &&
+                selection.selected_page_indices == parallel_selection.selected_page_indices &&
+                selection.selected_cluster_indices == parallel_selection.selected_cluster_indices &&
+                selection.selected_lod_group_indices ==
+                    parallel_selection.selected_lod_group_indices &&
+                selection.selected_lod_cluster_indices ==
+                    parallel_selection.selected_lod_cluster_indices &&
+                selection.missing_page_indices == parallel_selection.missing_page_indices &&
+                selection.prefetch_page_indices == parallel_selection.prefetch_page_indices;
+            std::cout << "parallel_threads=" << parallel_threads << '\n';
+            std::cout << "parallel_match=" << (parallel_match ? "true" : "false") << '\n';
+            if (!parallel_match) {
+                return 4;
+            }
         }
         return 0;
     } catch (const meridian::BuilderError& error) {

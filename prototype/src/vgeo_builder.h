@@ -225,8 +225,10 @@ VGeoResource create_stub_resource(const BuildManifest& manifest);
 VGeoResource build_resource(const BuildManifest& manifest);
 void validate_resource(const VGeoResource& resource);
 ResourceSummary read_resource_summary(const std::filesystem::path& input_path);
+class ParallelExecutor;
 TraversalSelection simulate_traversal(const VGeoResource& resource, float error_threshold,
-                                      const std::vector<uint8_t>& resident_pages);
+                                      const std::vector<uint8_t>& resident_pages,
+                                      ParallelExecutor* executor = nullptr);
 void write_resource(const VGeoResource& resource, const std::filesystem::path& output_path);
 void write_summary(const VGeoResource& resource, const std::filesystem::path& output_path);
 

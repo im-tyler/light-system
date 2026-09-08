@@ -25,6 +25,10 @@
 #include <string_view>
 #include <unordered_map>
 
+namespace meridian {
+class ParallelExecutor;
+}
+
 namespace meridian::detail {
 
 constexpr std::array<char, 4> kMagic = {'V', 'G', 'E', 'O'};
@@ -360,7 +364,8 @@ void build_page_dependencies(VGeoResource& resource);
 
 void validate_resource(const VGeoResource& resource);
 TraversalSelection simulate_traversal(const VGeoResource& resource, float error_threshold,
-                                      const std::vector<uint8_t>& resident_pages);
+                                       const std::vector<uint8_t>& resident_pages,
+                                       ParallelExecutor* executor = nullptr);
 
 ResourceSummary read_resource_summary(const std::filesystem::path& input_path);
 void write_resource(const VGeoResource& resource, const std::filesystem::path& output_path);

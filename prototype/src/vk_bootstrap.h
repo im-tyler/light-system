@@ -35,6 +35,10 @@ struct VkBootstrapConfig {
     // demand-streaming path mmaps it directly instead of writing a temp
     // copy. Empty or stale files fall back to the temp-write path.
     std::string persisted_vgeo_path;
+    // Total threads (including the submitter) for the parallel LOD
+    // traversal and draw-list build. 0 = auto (min of hardware_concurrency
+    // and 8). 1 forces the serial path. Output is bit-identical either way.
+    uint32_t worker_threads = 0;
 };
 
 struct VkBootstrapReport {
@@ -90,6 +94,7 @@ struct VkBootstrapReport {
     uint32_t presented_frame_count = 0;
     uint32_t swapchain_width = 0;
     uint32_t swapchain_height = 0;
+    uint32_t worker_threads = 1;
     std::vector<std::string> physical_devices;
     UploadableScene uploadable_scene;
 };

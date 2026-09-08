@@ -239,8 +239,9 @@ ResourceSummary read_resource_summary(const std::filesystem::path& input_path) {
 }
 
 TraversalSelection simulate_traversal(const VGeoResource& resource, float error_threshold,
-                                      const std::vector<uint8_t>& resident_pages) {
-    return detail::simulate_traversal(resource, error_threshold, resident_pages);
+                                      const std::vector<uint8_t>& resident_pages,
+                                      ParallelExecutor* executor) {
+    return detail::simulate_traversal(resource, error_threshold, resident_pages, executor);
 }
 
 void write_resource(const VGeoResource& resource, const std::filesystem::path& output_path) {

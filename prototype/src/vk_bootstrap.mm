@@ -5,6 +5,7 @@
 #include "math_utils.h"
 #include "async_reader.h"
 #include "builder_internal.h"
+#include "parallel_exec.h"
 #include "runtime_model.h"
 #include "shader_loader.h"
 #include "streaming_scheduler.h"
@@ -46,12 +47,14 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <numeric>
 #include <set>
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if defined(__APPLE__)
@@ -2036,6 +2039,17 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
     uint32_t gpu_draw_count = 0;
     bool has_draw_indirect_count = false;
     GpuProfiler gpu_profiler;
+    // Deterministic fork-join pool for the per-frame traversals and the
+    // draw-list build. Splits never change output order (ordered merges),
+    // so --threads 1 and --threads N are bit-identical.
+    const unsigned int resolved_worker_threads =
+        config.worker_threads == 0
+            ? std::min(std::thread::hardware_concurrency(), 8u)
+            : config.worker_threads;
+    report.worker_threads = resolved_worker_threads;
+    ParallelExecutor worker_pool(resolved_worker_threads);
+    ParallelExecutor* traversal_executor =
+        resolved_worker_threads > 1 ? &worker_pool : nullptr;
 
     const auto cleanup = [&]() {
         if (!temp_vgeo_path.empty()) {
@@ -2895,21 +2909,45 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             using clock_t = std::chrono::steady_clock;
             auto t_traverse_start = clock_t::now();
             const std::vector<uint8_t> resident_pages = build_resident_page_mask(residency_model);
-            const TraversalSelection selection_for_frame =
-                simulate_traversal(resource, error_threshold, resident_pages);
             // Shadow caster LOD: casters come from a second traversal at a
             // coarser error threshold. Shadow maps are depth-only and filtered
-            // (2048px cascades + 8-tap PCF), so silhouette detail far below
-            // the texel footprint cannot survive into the shaded result.
+            // (2048px cascades + 8-tap PCF), so silhouette detail far below the
+            // texel footprint cannot survive into the shaded result.
             // Scale <= 1 falls back to sharing the main-pass selection.
+            // The main and shadow-caster traversals are independent reads of
+            // (resource, resident_pages); they run concurrently on the pool,
+            // and each additionally forks subtree tasks (ordered merges keep
+            // the selection bit-identical to the serial path).
+            TraversalSelection selection_for_frame_storage;
             TraversalSelection shadow_selection_storage;
-            const TraversalSelection* shadow_selection = &selection_for_frame;
-            if (config.shadow_error_scale > 1.0f) {
-                shadow_selection_storage =
-                    simulate_traversal(resource, error_threshold * config.shadow_error_scale,
-                                       resident_pages);
-                shadow_selection = &shadow_selection_storage;
+            const bool separate_shadow_selection = config.shadow_error_scale > 1.0f;
+            if (separate_shadow_selection && traversal_executor != nullptr) {
+                const float shadow_threshold = error_threshold * config.shadow_error_scale;
+                std::vector<std::function<void()>> traverse_jobs;
+                traverse_jobs.push_back([&] {
+                    selection_for_frame_storage =
+                        simulate_traversal(resource, error_threshold, resident_pages,
+                                           traversal_executor);
+                });
+                traverse_jobs.push_back([&] {
+                    shadow_selection_storage =
+                        simulate_traversal(resource, shadow_threshold, resident_pages,
+                                           traversal_executor);
+                });
+                worker_pool.run(traverse_jobs);
+            } else {
+                selection_for_frame_storage =
+                    simulate_traversal(resource, error_threshold, resident_pages,
+                                       traversal_executor);
+                if (separate_shadow_selection) {
+                    shadow_selection_storage =
+                        simulate_traversal(resource, error_threshold * config.shadow_error_scale,
+                                           resident_pages, traversal_executor);
+                }
             }
+            const TraversalSelection& selection_for_frame = selection_for_frame_storage;
+            const TraversalSelection* shadow_selection =
+                separate_shadow_selection ? &shadow_selection_storage : &selection_for_frame;
             auto t_traverse_end = clock_t::now();
             static double acc_traverse_ms = 0.0;
             static double acc_build_ms = 0.0;
@@ -3255,116 +3293,231 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                 shadow_draws.reserve(shadow_selection->selected_cluster_indices.size() +
                                      shadow_selection->selected_lod_cluster_indices.size());
                 const Vec3f cam = camera_frame.camera_position;
-                // Compute the cluster's cascade overlap mask and append a
-                // merged shadow entry when at least one cascade sees it. The
-                // entry draws one instance per overlapping cascade; instance
-                // slots are strided by kShadowInstanceStride so shadow.vert
-                // can recover the entry index from gl_InstanceIndex.
-                auto push_to_shadow_list = [&](GpuDrawEntry& entry,
-                                                const float bmin[4], const float bmax[4]) {
-                    uint32_t mask = 0;
-                    for (uint32_t c = 0; c < kShadowCascadeCount; ++c) {
-                        if (aabb_outside_planes(cascade_frusta[c], bmin, bmax)) continue;
-                        mask |= 1u << c;
+                // Chunked selection -> GpuDrawEntry conversion. Each chunk
+                // job appends to its own output with chunk-local
+                // first_instance; the ordered concat afterwards fixes
+                // first_instance up with the global entry offsets, so the
+                // assembled lists are byte-identical to the serial
+                // single-vector path at any thread count.
+                const size_t kBuildChunkIndices = 1536;
+                std::vector<std::vector<GpuDrawEntry>> main_base_chunks;
+                std::vector<std::vector<GpuDrawEntry>> main_lod_chunks;
+                std::vector<std::vector<GpuDrawEntry>> shadow_base_chunks;
+                std::vector<std::vector<GpuDrawEntry>> shadow_lod_chunks;
+                std::vector<std::function<void()>> build_jobs;
+                auto schedule_main_chunks = [&](const std::vector<uint32_t>& selection_list,
+                                                bool is_lod_domain,
+                                                std::vector<std::vector<GpuDrawEntry>>&
+                                                    chunk_outputs) {
+                    const size_t chunk_count = std::max<size_t>(
+                        1, (selection_list.size() + kBuildChunkIndices - 1) / kBuildChunkIndices);
+                    chunk_outputs.resize(chunk_count);
+                    for (size_t chunk = 0; chunk < chunk_count; ++chunk) {
+                        const size_t begin = chunk * kBuildChunkIndices;
+                        const size_t end =
+                            std::min(selection_list.size(), begin + kBuildChunkIndices);
+                        build_jobs.emplace_back([&, is_lod_domain, begin, end, chunk]() {
+                            std::vector<GpuDrawEntry>& out = chunk_outputs[chunk];
+                            out.reserve(end - begin);
+                            for (size_t i = begin; i < end; ++i) {
+                                const uint32_t ci = selection_list[i];
+                                // Main-pass entry has camera-frustum +
+                                // normal-cone culls.
+                                // Normal-cone backface cull (mirrors
+                                // is_base_cluster_backfacing). Cone packing:
+                                // xyz = cone axis, w = cone cutoff. Cutoff >= 1.0
+                                // means meshoptimizer could not compute a useful
+                                // cone; do not cull. Radius-compensated test
+                                // (meshopt canonical, sphere formulation): reject
+                                // when dot(center - cam, axis) >= cutoff *
+                                // |center - cam| + radius, with the cluster's
+                                // bounding sphere. Without the radius term, tight
+                                // front-facing cones get wrongly culled.
+                                if (is_lod_domain) {
+                                    const GpuLodClusterRecord& c =
+                                        report.uploadable_scene.lod_clusters[ci];
+                                    if (aabb_outside_frustum(c.bounds_min.data(),
+                                                             c.bounds_max.data())) {
+                                        continue;
+                                    }
+                                    const float cone_cutoff = c.normal_cone[3];
+                                    if (cone_cutoff < 1.0f) {
+                                        const float vx = c.cull_sphere[0] - cam.x;
+                                        const float vy = c.cull_sphere[1] - cam.y;
+                                        const float vz = c.cull_sphere[2] - cam.z;
+                                        const float len =
+                                            std::sqrt(vx * vx + vy * vy + vz * vz);
+                                        const float d = vx * c.normal_cone[0] +
+                                                        vy * c.normal_cone[1] +
+                                                        vz * c.normal_cone[2];
+                                        if (d >= cone_cutoff * len + c.cull_sphere[3]) {
+                                            continue;
+                                        }
+                                    }
+                                    GpuDrawEntry e{};
+                                    e.draw_vertex_count = c.local_triangle_count * 3u;
+                                    e.draw_instance_count = 1u;
+                                    e.draw_first_vertex = 0u;
+                                    e.cluster_index = ci;
+                                    e.geometry_kind =
+                                        1u | ((c.flags & kClusterFlagHasUv) != 0
+                                                  ? kGeometryKindHasUv
+                                                  : 0u);
+                                    e.payload_offset = c.payload_offset;
+                                    e.local_vertex_count = c.local_vertex_count;
+                                    e.draw_first_instance = static_cast<uint32_t>(out.size());
+                                    out.push_back(e);
+                                } else {
+                                    const GpuClusterRecord& c =
+                                        report.uploadable_scene.clusters[ci];
+                                    if (aabb_outside_frustum(c.bounds_min.data(),
+                                                             c.bounds_max.data())) {
+                                        continue;
+                                    }
+                                    const float cone_cutoff = c.normal_cone[3];
+                                    if (cone_cutoff < 1.0f) {
+                                        const float vx = c.cull_sphere[0] - cam.x;
+                                        const float vy = c.cull_sphere[1] - cam.y;
+                                        const float vz = c.cull_sphere[2] - cam.z;
+                                        const float len =
+                                            std::sqrt(vx * vx + vy * vy + vz * vz);
+                                        const float d = vx * c.normal_cone[0] +
+                                                        vy * c.normal_cone[1] +
+                                                        vz * c.normal_cone[2];
+                                        if (d >= cone_cutoff * len + c.cull_sphere[3]) {
+                                            continue;
+                                        }
+                                    }
+                                    GpuDrawEntry e{};
+                                    e.draw_vertex_count = c.local_triangle_count * 3u;
+                                    e.draw_instance_count = 1u;
+                                    e.draw_first_vertex = 0u;
+                                    e.cluster_index = ci;
+                                    e.geometry_kind =
+                                        0u | ((c.flags & kClusterFlagHasUv) != 0
+                                                  ? kGeometryKindHasUv
+                                                  : 0u);
+                                    e.payload_offset = c.payload_offset;
+                                    e.local_vertex_count = c.local_vertex_count;
+                                    e.draw_first_instance = static_cast<uint32_t>(out.size());
+                                    out.push_back(e);
+                                }
+                            }
+                        });
                     }
-                    if (mask == 0) return;
-                    entry.geometry_kind |= mask << kGeometryKindCascadeMaskShift;
-                    entry.draw_instance_count =
-                        (mask & 1u) + ((mask >> 1) & 1u) + ((mask >> 2) & 1u);
-                    entry.draw_first_instance =
-                        static_cast<uint32_t>(shadow_draws.size()) * kShadowInstanceStride;
-                    shadow_draws.push_back(entry);
                 };
-                for (const uint32_t ci : selection_for_frame.selected_cluster_indices) {
-                    const GpuClusterRecord& c = report.uploadable_scene.clusters[ci];
-                    // Main-pass entry has camera-frustum + normal-cone culls.
-                    if (aabb_outside_frustum(c.bounds_min.data(), c.bounds_max.data())) continue;
-                    // Normal-cone backface cull (mirrors is_base_cluster_backfacing).
-                    // Cone packing: xyz = cone axis, w = cone cutoff. Cutoff >= 1.0 means
-                    // meshoptimizer could not compute a useful cone; do not cull.
-                    // Radius-compensated test (meshopt canonical, sphere formulation):
-                    // reject when dot(center - cam, axis) >= cutoff * |center - cam| + radius,
-                    // with the cluster's bounding sphere. Without the radius term, tight
-                    // front-facing cones get wrongly culled.
-                    const float cone_cutoff = c.normal_cone[3];
-                    if (cone_cutoff < 1.0f) {
-                        const float vx = c.cull_sphere[0] - cam.x;
-                        const float vy = c.cull_sphere[1] - cam.y;
-                        const float vz = c.cull_sphere[2] - cam.z;
-                        const float len = std::sqrt(vx * vx + vy * vy + vz * vz);
-                        const float d = vx * c.normal_cone[0] +
-                                        vy * c.normal_cone[1] +
-                                        vz * c.normal_cone[2];
-                        if (d >= cone_cutoff * len + c.cull_sphere[3]) continue;
-                    }
-                    GpuDrawEntry e{};
-                    e.draw_vertex_count = c.local_triangle_count * 3u;
-                    e.draw_instance_count = 1u;
-                    e.draw_first_vertex = 0u;
-                    e.cluster_index = ci;
-                    e.geometry_kind =
-                        0u | ((c.flags & kClusterFlagHasUv) != 0 ? kGeometryKindHasUv : 0u);
-                    e.payload_offset = c.payload_offset;
-                    e.local_vertex_count = c.local_vertex_count;
-                    e.draw_first_instance = static_cast<uint32_t>(cpu_draws.size());
-                    cpu_draws.push_back(e);
-                }
-                for (const uint32_t ci : selection_for_frame.selected_lod_cluster_indices) {
-                    const GpuLodClusterRecord& c = report.uploadable_scene.lod_clusters[ci];
-                    if (aabb_outside_frustum(c.bounds_min.data(), c.bounds_max.data())) continue;
-                    // Normal-cone backface cull, same radius-compensated test as
-                    // the base-cluster path (cull_sphere + cutoff * length).
-                    const float cone_cutoff = c.normal_cone[3];
-                    if (cone_cutoff < 1.0f) {
-                        const float vx = c.cull_sphere[0] - cam.x;
-                        const float vy = c.cull_sphere[1] - cam.y;
-                        const float vz = c.cull_sphere[2] - cam.z;
-                        const float len = std::sqrt(vx * vx + vy * vy + vz * vz);
-                        const float d = vx * c.normal_cone[0] +
-                                        vy * c.normal_cone[1] +
-                                        vz * c.normal_cone[2];
-                        if (d >= cone_cutoff * len + c.cull_sphere[3]) continue;
-                    }
-                    GpuDrawEntry e{};
-                    e.draw_vertex_count = c.local_triangle_count * 3u;
-                    e.draw_instance_count = 1u;
-                    e.draw_first_vertex = 0u;
-                    e.cluster_index = ci;
-                    e.geometry_kind =
-                        1u | ((c.flags & kClusterFlagHasUv) != 0 ? kGeometryKindHasUv : 0u);
-                    e.payload_offset = c.payload_offset;
-                    e.local_vertex_count = c.local_vertex_count;
-                    e.draw_first_instance = static_cast<uint32_t>(cpu_draws.size());
-                    cpu_draws.push_back(e);
-                }
                 // Caster list: clusters from the shadow selection, tested only
                 // against the cascade volumes. Backface culling against the
-                // camera doesn't apply to shadow casters.
-                for (const uint32_t ci : shadow_selection->selected_cluster_indices) {
-                    const GpuClusterRecord& c = report.uploadable_scene.clusters[ci];
-                    GpuDrawEntry cascade_entry{};
-                    cascade_entry.draw_vertex_count = c.local_triangle_count * 3u;
-                    cascade_entry.draw_instance_count = 1u;
-                    cascade_entry.draw_first_vertex = 0u;
-                    cascade_entry.cluster_index = ci;
-                    cascade_entry.geometry_kind =
-                        0u | ((c.flags & kClusterFlagHasUv) != 0 ? kGeometryKindHasUv : 0u);
-                    cascade_entry.payload_offset = c.payload_offset;
-                    cascade_entry.local_vertex_count = c.local_vertex_count;
-                    push_to_shadow_list(cascade_entry, c.bounds_min.data(), c.bounds_max.data());
+                // camera doesn't apply to shadow casters. Each surviving entry
+                // carries its cascade overlap mask (geometry_kind bits) and
+                // draws one instance per overlapping cascade; instance slots
+                // are strided by kShadowInstanceStride so shadow.vert can
+                // recover the entry index from gl_InstanceIndex.
+                auto schedule_shadow_chunks = [&](const std::vector<uint32_t>& selection_list,
+                                                  bool is_lod_domain,
+                                                  std::vector<std::vector<GpuDrawEntry>>&
+                                                      chunk_outputs) {
+                    const size_t chunk_count = std::max<size_t>(
+                        1, (selection_list.size() + kBuildChunkIndices - 1) / kBuildChunkIndices);
+                    chunk_outputs.resize(chunk_count);
+                    for (size_t chunk = 0; chunk < chunk_count; ++chunk) {
+                        const size_t begin = chunk * kBuildChunkIndices;
+                        const size_t end =
+                            std::min(selection_list.size(), begin + kBuildChunkIndices);
+                        build_jobs.emplace_back([&, is_lod_domain, begin, end, chunk]() {
+                            std::vector<GpuDrawEntry>& out = chunk_outputs[chunk];
+                            out.reserve(end - begin);
+                            for (size_t i = begin; i < end; ++i) {
+                                const uint32_t ci = selection_list[i];
+                                GpuDrawEntry cascade_entry{};
+                                if (is_lod_domain) {
+                                    const GpuLodClusterRecord& c =
+                                        report.uploadable_scene.lod_clusters[ci];
+                                    cascade_entry.draw_vertex_count =
+                                        c.local_triangle_count * 3u;
+                                    cascade_entry.draw_instance_count = 1u;
+                                    cascade_entry.draw_first_vertex = 0u;
+                                    cascade_entry.cluster_index = ci;
+                                    cascade_entry.geometry_kind =
+                                        1u | ((c.flags & kClusterFlagHasUv) != 0
+                                                  ? kGeometryKindHasUv
+                                                  : 0u);
+                                    cascade_entry.payload_offset = c.payload_offset;
+                                    cascade_entry.local_vertex_count = c.local_vertex_count;
+                                } else {
+                                    const GpuClusterRecord& c =
+                                        report.uploadable_scene.clusters[ci];
+                                    cascade_entry.draw_vertex_count =
+                                        c.local_triangle_count * 3u;
+                                    cascade_entry.draw_instance_count = 1u;
+                                    cascade_entry.draw_first_vertex = 0u;
+                                    cascade_entry.cluster_index = ci;
+                                    cascade_entry.geometry_kind =
+                                        0u | ((c.flags & kClusterFlagHasUv) != 0
+                                                  ? kGeometryKindHasUv
+                                                  : 0u);
+                                    cascade_entry.payload_offset = c.payload_offset;
+                                    cascade_entry.local_vertex_count = c.local_vertex_count;
+                                }
+                                const float* bmin;
+                                const float* bmax;
+                                if (is_lod_domain) {
+                                    const GpuLodClusterRecord& c =
+                                        report.uploadable_scene.lod_clusters[ci];
+                                    bmin = c.bounds_min.data();
+                                    bmax = c.bounds_max.data();
+                                } else {
+                                    const GpuClusterRecord& c =
+                                        report.uploadable_scene.clusters[ci];
+                                    bmin = c.bounds_min.data();
+                                    bmax = c.bounds_max.data();
+                                }
+                                uint32_t mask = 0;
+                                for (uint32_t c = 0; c < kShadowCascadeCount; ++c) {
+                                    if (aabb_outside_planes(cascade_frusta[c], bmin, bmax)) {
+                                        continue;
+                                    }
+                                    mask |= 1u << c;
+                                }
+                                if (mask == 0) continue;
+                                cascade_entry.geometry_kind |= mask << kGeometryKindCascadeMaskShift;
+                                cascade_entry.draw_instance_count =
+                                    (mask & 1u) + ((mask >> 1) & 1u) + ((mask >> 2) & 1u);
+                                cascade_entry.draw_first_instance =
+                                    static_cast<uint32_t>(out.size()) * kShadowInstanceStride;
+                                out.push_back(cascade_entry);
+                            }
+                        });
+                    }
+                };
+                schedule_main_chunks(selection_for_frame.selected_cluster_indices, false,
+                                     main_base_chunks);
+                schedule_main_chunks(selection_for_frame.selected_lod_cluster_indices, true,
+                                     main_lod_chunks);
+                schedule_shadow_chunks(shadow_selection->selected_cluster_indices, false,
+                                       shadow_base_chunks);
+                schedule_shadow_chunks(shadow_selection->selected_lod_cluster_indices, true,
+                                       shadow_lod_chunks);
+                worker_pool.run(build_jobs);
+                uint32_t main_entry_offset = 0;
+                for (const auto* chunk_list : {&main_base_chunks, &main_lod_chunks}) {
+                    for (const std::vector<GpuDrawEntry>& chunk : *chunk_list) {
+                        for (GpuDrawEntry e : chunk) {
+                            e.draw_first_instance += main_entry_offset;
+                            cpu_draws.push_back(e);
+                        }
+                        main_entry_offset += static_cast<uint32_t>(chunk.size());
+                    }
                 }
-                for (const uint32_t ci : shadow_selection->selected_lod_cluster_indices) {
-                    const GpuLodClusterRecord& c = report.uploadable_scene.lod_clusters[ci];
-                    GpuDrawEntry cascade_entry{};
-                    cascade_entry.draw_vertex_count = c.local_triangle_count * 3u;
-                    cascade_entry.draw_instance_count = 1u;
-                    cascade_entry.draw_first_vertex = 0u;
-                    cascade_entry.cluster_index = ci;
-                    cascade_entry.geometry_kind =
-                        1u | ((c.flags & kClusterFlagHasUv) != 0 ? kGeometryKindHasUv : 0u);
-                    cascade_entry.payload_offset = c.payload_offset;
-                    cascade_entry.local_vertex_count = c.local_vertex_count;
-                    push_to_shadow_list(cascade_entry, c.bounds_min.data(), c.bounds_max.data());
+                uint32_t shadow_entry_offset = 0;
+                for (const auto* chunk_list : {&shadow_base_chunks, &shadow_lod_chunks}) {
+                    for (const std::vector<GpuDrawEntry>& chunk : *chunk_list) {
+                        for (GpuDrawEntry e : chunk) {
+                            e.draw_first_instance += shadow_entry_offset * kShadowInstanceStride;
+                            shadow_draws.push_back(e);
+                        }
+                        shadow_entry_offset += static_cast<uint32_t>(chunk.size());
+                    }
                 }
                 cpu_draw_count = static_cast<uint32_t>(cpu_draws.size());
                 shadow_draw_count = static_cast<uint32_t>(shadow_draws.size());
@@ -3462,7 +3615,8 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             cpu_prof_samples++;
             if (cpu_prof_samples % 60 == 0) {
                 std::fprintf(stderr,
-                    "MERIDIAN_CPU: traverse=%.2f residency=%.2f build=%.2f upload=%.2f cmdrec=%.2f submit=%.2f fence=%.2f present=%.2f draws=main:%u shadow:%u encodes main:%u shadow:%u (ms/frame, n=%u)\n",
+                    "MERIDIAN_CPU: threads=%u traverse=%.2f residency=%.2f build=%.2f upload=%.2f cmdrec=%.2f submit=%.2f fence=%.2f present=%.2f draws=main:%u shadow:%u encodes main:%u shadow:%u (ms/frame, n=%u)\n",
+                    resolved_worker_threads,
                     acc_traverse_ms / cpu_prof_samples,
                     acc_residency_ms / cpu_prof_samples,
                     acc_build_ms / cpu_prof_samples,
