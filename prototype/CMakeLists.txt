@@ -157,6 +157,13 @@ add_executable(ontos_view
     src/ontos_view.mm
 )
 
+# The viewer's .mm is pure C++ outside the __APPLE__ guards (Cocoa and
+# AudioToolbox imports only); compile it as C++ on linux so it needs no
+# Objective-C++ runtime linkage.
+if(NOT APPLE)
+    set_source_files_properties(src/ontos_view.mm PROPERTIES LANGUAGE CXX)
+endif()
+
 target_compile_options(ontos_view PRIVATE
     $<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:
         -Wall -Wextra -Wpedantic -Wno-unused-parameter
@@ -182,4 +189,11 @@ if(APPLE)
     find_library(QUARTZCORE_FRAMEWORK QuartzCore REQUIRED)
     find_library(AUDIOTOOLBOX_FRAMEWORK AudioToolbox REQUIRED)
     target_link_libraries(ontos_view PRIVATE ${OBJC_LIBRARY} ${COCOA_FRAMEWORK} ${QUARTZCORE_FRAMEWORK} ${AUDIOTOOLBOX_FRAMEWORK})
+endif()
+
+# Linux realtime audio backend (system ALSA, mirrors the macOS AudioToolbox
+# framework precedent; no third-party audio dependencies).
+if(NOT APPLE)
+    pkg_check_modules(ALSA REQUIRED IMPORTED_TARGET alsa)
+    target_link_libraries(ontos_view PRIVATE PkgConfig::ALSA)
 endif()

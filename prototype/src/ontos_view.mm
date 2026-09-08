@@ -31,14 +31,30 @@
 #include <vulkan/vulkan_metal.h>
 #endif
 #include <GLFW/glfw3.h>
+#if defined(__APPLE__)
 #define GLFW_EXPOSE_NATIVE_COCOA
 #include <GLFW/glfw3native.h>
+#endif
 #include <shaderc/shaderc.hpp>
 
 #if defined(__APPLE__)
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/CAMetalLayer.h>
 #include <AudioToolbox/AudioToolbox.h>
+#endif
+
+#if defined(__linux__)
+#include <alsa/asoundlib.h>
+#include <atomic>
+#include <thread>
+#endif
+
+// Realtime contact audio exists on macOS (CoreAudio AudioQueue) and Linux
+// (ALSA); other platforms compile the viewer silent.
+#if defined(__APPLE__) || defined(__linux__)
+#define ONTOS_VIEW_REALTIME_AUDIO 1
+#else
+#define ONTOS_VIEW_REALTIME_AUDIO 0
 #endif
 
 using u8 = std::uint8_t;
@@ -1178,7 +1194,7 @@ u64 render_contact_audio(const Stream& stream, const char* wav_path, bool write_
     return fnv1a64_bytes(pcm.data(), pcm.size());
 }
 
-#if defined(__APPLE__)
+#if ONTOS_VIEW_REALTIME_AUDIO
 
 // Realtime companion to the offline --wav render: the same spec-22 resonator
 // samples, scheduled live. Each contact spawns a voice when playback crosses
@@ -1186,7 +1202,10 @@ u64 render_contact_audio(const Stream& stream, const char* wav_path, bool write_
 // constants, same operands, same coefficient math — voices are constructed
 // from the final-frame masses like the offline mix) and sums active voices
 // into a stereo stream. Sample content stays a pure function of the stream;
-// wall-clock only decides when a ring starts.
+// wall-clock only decides when a ring starts. VoiceBank is the shared,
+// platform-neutral pool+mixer; the per-platform RealtimeAudio backends only
+// differ in how they pull mixed frames out (AudioQueue callback vs ALSA
+// write thread).
 struct ContactVoice {
     bool active = false;
     u64 emitted = 0;
@@ -1198,15 +1217,98 @@ struct ContactVoice {
     f64 gl = 1.0, gr = 1.0;
 };
 
-struct RealtimeAudio {
+struct VoiceBank {
     static constexpr int kVoiceCount = 48;
-    static constexpr u32 kBufferFrames = 2048;
-    static constexpr int kBufferCount = 4;
 
     std::mutex mutex;
     ContactVoice voices[kVoiceCount] = {};
+
+    // Advances every active voice exactly one spec-rate sample and sums,
+    // clamps into one stereo frame. Caller must hold the mutex.
+    void mix_frame(f64& out_l, f64& out_r) {
+        f64 left = 0.0;
+        f64 right = 0.0;
+        for (ContactVoice& voice : voices) {
+            if (!voice.active) continue;
+            f64 mono = 0.0;
+            for (int k = 0; k < 3; ++k) {
+                f64 s = 0.0;
+                if (voice.emitted == 0) {
+                    s = voice.s0[k];
+                } else if (voice.emitted == 1) {
+                    s = voice.a[k] * voice.s0[k];
+                } else {
+                    s = voice.a[k] * voice.s_prev[k] - voice.b[k] * voice.s_prev2[k];
+                }
+                voice.s_prev2[k] = voice.s_prev[k];
+                voice.s_prev[k] = s;
+                mono += s;
+            }
+            ++voice.emitted;
+            if (voice.emitted >= static_cast<u64>(AudioSpec::kRing)) voice.active = false;
+            left += mono * voice.gl;
+            right += mono * voice.gr;
+        }
+        if (left < -1.0) {
+            left = -1.0;
+        } else if (left > 1.0) {
+            left = 1.0;
+        }
+        if (right < -1.0) {
+            right = -1.0;
+        } else if (right > 1.0) {
+            right = 1.0;
+        }
+        out_l = left;
+        out_r = right;
+    }
+
+    void reset() {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (ContactVoice& voice : voices) voice.active = false;
+    }
+
+    void spawn_contact(const StreamContact& contact, f64 mass_a, f64 mass_b, f64 gl, f64 gr) {
+        ContactVoice voice;
+        const f64 mu = (mass_a * mass_b) / (mass_a + mass_b);
+        for (int k = 0; k < 3; ++k) {
+            const f64 omega = AudioSpec::kOmega0 * AudioSpec::kPartial[k] / mu;
+            voice.a[k] = (2.0 - omega) * AudioSpec::kRho[k];
+            voice.b[k] = AudioSpec::kRho[k] * AudioSpec::kRho[k];
+            voice.s0[k] = AudioSpec::kAmp[k] * contact.jn;
+        }
+        voice.gl = gl;
+        voice.gr = gr;
+        std::lock_guard<std::mutex> lock(mutex);
+        ContactVoice* slot = nullptr;
+        u64 most_emitted = 0;
+        for (ContactVoice& candidate : voices) {
+            if (!candidate.active) {
+                slot = &candidate;
+                break;
+            }
+            if (slot == nullptr || candidate.emitted > most_emitted) {
+                slot = &candidate;
+                most_emitted = candidate.emitted;
+            }
+        }
+        *slot = voice;
+    }
+};
+
+#if defined(__APPLE__)
+
+// macOS backend: AudioQueue output at the spec-native rate; the queue
+// callback pulls VoiceBank frames directly (no resampling).
+struct RealtimeAudio {
+    static constexpr int kVoiceCount = VoiceBank::kVoiceCount;
+    static constexpr u32 kBufferFrames = 2048;
+    static constexpr int kBufferCount = 4;
+
+    VoiceBank bank;
     AudioQueueRef queue = nullptr;
     bool failed = false;
+    u32 output_rate = 65536;
 
     ~RealtimeAudio() { stop(); }
 
@@ -1219,41 +1321,11 @@ struct RealtimeAudio {
         float* out = static_cast<float*>(buffer->mAudioData);
         const u32 frames =
             static_cast<u32>(buffer->mAudioDataByteSize / (sizeof(float) * 2));
-        std::lock_guard<std::mutex> lock(self->mutex);
+        std::lock_guard<std::mutex> lock(self->bank.mutex);
         for (u32 i = 0; i < frames; ++i) {
             f64 left = 0.0;
             f64 right = 0.0;
-            for (ContactVoice& voice : self->voices) {
-                if (!voice.active) continue;
-                f64 mono = 0.0;
-                for (int k = 0; k < 3; ++k) {
-                    f64 s = 0.0;
-                    if (voice.emitted == 0) {
-                        s = voice.s0[k];
-                    } else if (voice.emitted == 1) {
-                        s = voice.a[k] * voice.s0[k];
-                    } else {
-                        s = voice.a[k] * voice.s_prev[k] - voice.b[k] * voice.s_prev2[k];
-                    }
-                    voice.s_prev2[k] = voice.s_prev[k];
-                    voice.s_prev[k] = s;
-                    mono += s;
-                }
-                ++voice.emitted;
-                if (voice.emitted >= static_cast<u64>(AudioSpec::kRing)) voice.active = false;
-                left += mono * voice.gl;
-                right += mono * voice.gr;
-            }
-            if (left < -1.0) {
-                left = -1.0;
-            } else if (left > 1.0) {
-                left = 1.0;
-            }
-            if (right < -1.0) {
-                right = -1.0;
-            } else if (right > 1.0) {
-                right = 1.0;
-            }
+            self->bank.mix_frame(left, right);
             out[i * 2] = static_cast<float>(left);
             out[i * 2 + 1] = static_cast<float>(right);
         }
@@ -1305,38 +1377,165 @@ struct RealtimeAudio {
         }
     }
 
-    void reset() {
-        std::lock_guard<std::mutex> lock(mutex);
-        for (ContactVoice& voice : voices) voice.active = false;
-    }
+    void reset() { bank.reset(); }
 
     void spawn_contact(const StreamContact& contact, f64 mass_a, f64 mass_b, f64 gl, f64 gr) {
-        ContactVoice voice;
-        const f64 mu = (mass_a * mass_b) / (mass_a + mass_b);
-        for (int k = 0; k < 3; ++k) {
-            const f64 omega = AudioSpec::kOmega0 * AudioSpec::kPartial[k] / mu;
-            voice.a[k] = (2.0 - omega) * AudioSpec::kRho[k];
-            voice.b[k] = AudioSpec::kRho[k] * AudioSpec::kRho[k];
-            voice.s0[k] = AudioSpec::kAmp[k] * contact.jn;
-        }
-        voice.gl = gl;
-        voice.gr = gr;
-        std::lock_guard<std::mutex> lock(mutex);
-        ContactVoice* slot = nullptr;
-        u64 most_emitted = 0;
-        for (ContactVoice& candidate : voices) {
-            if (!candidate.active) {
-                slot = &candidate;
-                break;
-            }
-            if (slot == nullptr || candidate.emitted > most_emitted) {
-                slot = &candidate;
-                most_emitted = candidate.emitted;
-            }
-        }
-        *slot = voice;
+        bank.spawn_contact(contact, mass_a, mass_b, gl, gr);
     }
 };
+
+#elif defined(__linux__)
+
+// Linux backend: ALSA push thread. The spec content is mixed at 65536 Hz by
+// the shared VoiceBank; when the device will not run at the spec rate
+// natively, each device frame is linearly interpolated between adjacent
+// spec-rate samples (deterministic; viewer-path only — the offline --wav
+// reference never resamples). Device format is float32 stereo, falling back
+// to s16 stereo when the device rejects float; the s16 conversion uses the
+// same rounding as the offline render.
+struct RealtimeAudio {
+    static constexpr int kVoiceCount = VoiceBank::kVoiceCount;
+    static constexpr u32 kPeriodFrames = 1024;
+    static constexpr int kPeriodsBuffered = 4;
+    static constexpr int kMaxUnderrunRecoveries = 8;
+
+    VoiceBank bank;
+    snd_pcm_t* pcm = nullptr;
+    std::thread thread;
+    std::atomic<bool> running{false};
+    bool use_s16 = false;
+    bool failed = false;
+    u32 output_rate = 65536;
+
+    ~RealtimeAudio() { stop(); }
+
+    RealtimeAudio() = default;
+    RealtimeAudio(const RealtimeAudio&) = delete;
+    RealtimeAudio& operator=(const RealtimeAudio&) = delete;
+
+    bool configure_device() {
+        snd_pcm_hw_params_t* params = nullptr;
+        if (snd_pcm_hw_params_malloc(&params) < 0) return false;
+        bool ok = snd_pcm_hw_params_any(pcm, params) >= 0 &&
+                  snd_pcm_hw_params_set_access(pcm, params, SND_PCM_ACCESS_RW_INTERLEAVED) >= 0 &&
+                  snd_pcm_hw_params_set_channels(pcm, params, 2) >= 0;
+        use_s16 = false;
+        if (ok && snd_pcm_hw_params_set_format(pcm, params, SND_PCM_FORMAT_FLOAT_LE) < 0) {
+            use_s16 = true;
+            ok = snd_pcm_hw_params_set_format(pcm, params, SND_PCM_FORMAT_S16_LE) >= 0;
+        }
+        unsigned rate = 65536;
+        if (ok) {
+            ok = snd_pcm_hw_params_set_rate_near(pcm, params, &rate, nullptr) >= 0 && rate > 0;
+        }
+        snd_pcm_uframes_t period = kPeriodFrames;
+        if (ok) ok = snd_pcm_hw_params_set_period_size_near(pcm, params, &period, nullptr) >= 0;
+        snd_pcm_uframes_t buffer = period * kPeriodsBuffered;
+        if (ok) ok = snd_pcm_hw_params_set_buffer_size_near(pcm, params, &buffer) >= 0;
+        if (ok) ok = snd_pcm_hw_params(pcm, params) >= 0;
+        snd_pcm_hw_params_free(params);
+        if (ok) output_rate = rate;
+        return ok;
+    }
+
+    void run() {
+        const double step = 65536.0 / static_cast<double>(output_rate);
+        std::vector<float> floats(kPeriodFrames * 2);
+        std::vector<short> shorts(use_s16 ? kPeriodFrames * 2 : 0);
+        f64 l0 = 0.0, r0 = 0.0, l1 = 0.0, r1 = 0.0;
+        {
+            std::lock_guard<std::mutex> lock(bank.mutex);
+            bank.mix_frame(l0, r0);
+            bank.mix_frame(l1, r1);
+        }
+        double pos = 0.0;
+        const u32 frame_bytes = use_s16 ? 4u : 8u;
+        while (running.load(std::memory_order_acquire)) {
+            for (u32 i = 0; i < kPeriodFrames; ++i) {
+                while (pos >= 1.0) {
+                    pos -= 1.0;
+                    l0 = l1;
+                    r0 = r1;
+                    std::lock_guard<std::mutex> lock(bank.mutex);
+                    bank.mix_frame(l1, r1);
+                }
+                floats[i * 2] = static_cast<float>(l0 + (l1 - l0) * pos);
+                floats[i * 2 + 1] = static_cast<float>(r0 + (r1 - r0) * pos);
+                pos += step;
+            }
+            const void* data = floats.data();
+            if (use_s16) {
+                for (u32 i = 0; i < kPeriodFrames * 2; ++i) {
+                    shorts[i] = static_cast<short>(std::floor(floats[i] * 32767.0 + 0.5));
+                }
+                data = shorts.data();
+            }
+            std::size_t written = 0;
+            int recoveries = 0;
+            while (written < kPeriodFrames) {
+                const snd_pcm_sframes_t n = snd_pcm_writei(
+                    pcm, static_cast<const u8*>(data) + written * frame_bytes,
+                    kPeriodFrames - written);
+                if (n < 0) {
+                    if (n == -EPIPE && recoveries < kMaxUnderrunRecoveries &&
+                        snd_pcm_prepare(pcm) >= 0) {
+                        ++recoveries;
+                        continue;
+                    }
+                    return;
+                }
+                written += static_cast<std::size_t>(n);
+                recoveries = 0;
+            }
+        }
+    }
+
+    bool start() {
+        if (failed || pcm != nullptr) return pcm != nullptr;
+        if (snd_pcm_open(&pcm, "default", SND_PCM_STREAM_PLAYBACK, 0) < 0 || pcm == nullptr) {
+            pcm = nullptr;
+            failed = true;
+            return false;
+        }
+        if (!configure_device()) {
+            snd_pcm_close(pcm);
+            pcm = nullptr;
+            failed = true;
+            return false;
+        }
+        running.store(true, std::memory_order_release);
+        try {
+            thread = std::thread([this] { run(); });
+        } catch (...) {
+            running.store(false, std::memory_order_release);
+            snd_pcm_close(pcm);
+            pcm = nullptr;
+            failed = true;
+            return false;
+        }
+        return true;
+    }
+
+    void stop() {
+        if (thread.joinable()) {
+            running.store(false, std::memory_order_release);
+            thread.join();
+        }
+        if (pcm != nullptr) {
+            snd_pcm_drop(pcm);
+            snd_pcm_close(pcm);
+            pcm = nullptr;
+        }
+    }
+
+    void reset() { bank.reset(); }
+
+    void spawn_contact(const StreamContact& contact, f64 mass_a, f64 mass_b, f64 gl, f64 gr) {
+        bank.spawn_contact(contact, mass_a, mass_b, gl, gr);
+    }
+};
+
+#endif
 
 // Viewer-side stereo placement for a contact: constant-power pan from the
 // contact's screen-x position plus inverse distance-squared-ish attenuation
@@ -1357,7 +1556,7 @@ void contact_gains(const Camera2D& camera, int fb_width, int fb_height, f64 cx, 
     out_r = std::sin(angle) * att;
 }
 
-#endif
+#endif  // ONTOS_VIEW_REALTIME_AUDIO
 
 // Contact visualization: a brief expanding ring billboard at the contact
 // midpoint, fading over kFlashTicks playback ticks (no trails).
@@ -1452,15 +1651,20 @@ int main(int argc, char** argv) {
                         total_contacts, wav_path, digest);
         }
 
-#if defined(__APPLE__)
+#if ONTOS_VIEW_REALTIME_AUDIO
         const StreamFrame& final_frame = stream.frames.back();
         RealtimeAudio audio;
         bool audio_running = false;
         if (!frames_requested && total_contacts > 0) {
             audio_running = audio.start();
             if (audio_running) {
-                std::printf("audio: realtime stereo output open (65536 Hz, %d voices)\n",
-                            RealtimeAudio::kVoiceCount);
+                char rate_note[64] = "";
+                if (audio.output_rate != 65536u) {
+                    std::snprintf(rate_note, sizeof rate_note,
+                                  " -> device %u Hz linear-resampled", audio.output_rate);
+                }
+                std::printf("audio: realtime stereo output open (65536 Hz%s, %d voices)\n",
+                            rate_note, RealtimeAudio::kVoiceCount);
             } else {
                 std::fprintf(stderr, "audio: realtime output unavailable; continuing silent\n");
             }
@@ -1468,7 +1672,8 @@ int main(int argc, char** argv) {
 #else
         if (!frames_requested && total_contacts > 0) {
             std::fprintf(stderr,
-                         "audio: realtime output requires macOS CoreAudio; continuing silent\n");
+                          "audio: realtime output requires macOS CoreAudio or Linux ALSA;"
+                          " continuing silent\n");
         }
 #endif
 
@@ -1936,7 +2141,7 @@ int main(int argc, char** argv) {
                     subframe = 0;
                     tick_changed = true;
                     flashes.clear();
-#if defined(__APPLE__)
+#if ONTOS_VIEW_REALTIME_AUDIO
                     audio.reset();
 #endif
                 }
@@ -2043,7 +2248,7 @@ int main(int argc, char** argv) {
                         1.4f;
                     if (flashes.size() >= kMaxFlashes) flashes.erase(flashes.begin());
                     flashes.push_back(flash);
-#if defined(__APPLE__)
+#if ONTOS_VIEW_REALTIME_AUDIO
                     if (audio_running) {
                         f64 gl = 1.0, gr = 1.0;
                         contact_gains(state.camera, state.fb_width, state.fb_height, c.cx, c.cy,
@@ -2203,7 +2408,7 @@ int main(int argc, char** argv) {
             }
         }
 
-#if defined(__APPLE__)
+#if ONTOS_VIEW_REALTIME_AUDIO
         audio.stop();
 #endif
 

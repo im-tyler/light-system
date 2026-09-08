@@ -31,6 +31,25 @@ jobs:
           ./prototype/build/meridian_replay --manifest benchmarks/scenes/benchmark_terrace_manifest.txt --script benchmarks/replays/terrace_streaming_replay.txt
           ./prototype/build/meridian_replay --manifest benchmarks/scenes/benchmark_uv_seam_gltf_manifest.txt --script benchmarks/replays/uv_seam_gltf_replay.txt
 
+  ontos-view-linux:
+    runs-on: ubuntu-latest
+    name: ontos_view linux build (ALSA realtime audio)
+    steps:
+      - uses: actions/checkout@v4
+      - name: Vendor dependencies
+        run: ./tools/vendor_thirdparty.sh
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config clang libvulkan-dev libglfw3-dev libshaderc-dev libasound2-dev
+      - name: Configure (clang suite; the .mm targets need an ObjC++ compiler on linux)
+        run: >-
+          cmake -S prototype -B prototype/build -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+          -DCMAKE_OBJCXX_COMPILER=clang++
+      - name: Build viewer (compile + link-checks the ALSA backend)
+        run: cmake --build prototype/build --target ontos_view -j
+
   ontos-tools:
     strategy:
       fail-fast: false

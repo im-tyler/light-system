@@ -86,6 +86,7 @@ Last updated: 2026-09-08
 - [x] ontos_view accepts spec-20 RegionMultipole records (tag 9, 2026-09-08)
 - [x] spec 21-22 contact + modal audio (2026-09-08): dump tool re-simulates the contact pass and resynthesizes the audio bit-exactly (`--wav`, FNV hash on the OK line); ontos_view parses tag 10 and renders the WAV offline (`--wav`); CI cross-verifies both against the committed simval corpora on ubuntu + macos
 - [x] realtime audio device output in ontos_view (2026-09-08): CoreAudio AudioQueue at 65536 Hz stereo — each contact spawns a voice at its tick crossing running the spec-22 recurrence unmodified, spatialized with camera-relative constant-power pan + distance attenuation (viewer-side gains only; the offline --wav mono reference is unchanged and still cmp-identical with the simval goldens)
+- [x] linux realtime audio path in ontos_view (2026-09-08): ALSA write thread pulling the same shared VoiceBank as CoreAudio (identical voice pool/mix semantics), spec content at 65536 Hz with deterministic linear resampling when the device lacks the native rate, float32 device format with s16 fallback, RAII drop-on-stop; new ubuntu CI job compile/link-checks the viewer with libasound (runtime device testing still manual); offline --wav renders cmp-identical from both macOS and linux builds
 - [x] contact-event visualization in ontos_view (2026-09-08): expanding flash rings at Contact midpoints — ring shape added to the ontos billboard shader, size from the colliding bodies, fade over 4 playback ticks
 
 ## Later
