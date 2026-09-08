@@ -1,7 +1,6 @@
 # Task List
 
 Last updated: 2026-09-08
-
 ## Completed
 
 ### Offline Builder
@@ -69,6 +68,7 @@ Last updated: 2026-09-08
 - [x] cascaded shadow maps for outdoor / large scenes (3-cascade, log/uniform split blend, manual depth compare to work around MoltenVK sampler2DArrayShadow limitation)
 - [x] per-cascade frustum culling to reduce 3x draw-submit cost (each cascade now pulls a CPU-filtered subset of the main draw list against its own orthographic frustum; shadow.cascade_draw_lists[3] + shadow.cascade_descriptor_sets[3])
 - [x] shadow caster LOD (2026-09-07): second simulate_traversal at 8x the main error threshold selects casters for the shadow pass (`--shadow-error-scale`, <= 1 disables); residency merges shadow-selection pages under --demand-streaming. City shadow draws 20746 -> 3239 / GPU shadow 3.2-3.9 -> 0.6-1.5ms, dragon 5532 -> 800 / ~4.5 -> 0.32ms; city 21.2 -> 12.1ms, dragon 11.1 -> 8.6ms paired under load (see benchmarks/godot/RESULTS.md)
+- [x] instance-folded draw submission (2026-09-07): MoltenVK encodes one Metal draw per indirect-draw entry, so both CPU draw lists now stable-partition into vertex-count buckets (quartile edges) and submit one instanced vkCmdDraw per nonempty bucket; vertex shaders collapse corners past a cluster's own triangle count (and unused shadow stride slots) to zero-area triangles. City main encodes 20732 -> 2, shadow 3239 -> 2; submit 6.6-6.9 -> 1.9-2.2ms; paired city 14.0 -> 8.5ms, dragon unchanged ~8.3ms; dragon pixel-identical, city 0.047% depth-equal order flips; draw selection unchanged, true-drawIndirectCount path unchanged (see benchmarks/godot/RESULTS.md)
 
 ## Streaming
 

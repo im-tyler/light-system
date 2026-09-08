@@ -3,6 +3,93 @@
 First automated comparison captured with `run_bench.sh` (see
 [README.md](./README.md) for method and caveats).
 
+## 2026-09-07 20:35 local: instance-folded draw submission — city gap ~2.9x -> ~1.6-2.1x
+
+Same machine/os/godot as below; the machine was loaded the whole session
+(load average ~20-40: two concurrent agent workloads in the repo). All
+renderer runs below are paired A/B minutes apart under that load; the
+encode counts are trace-deterministic (load-independent). A final
+idle-machine rerun happens after this session and should replace these
+wall times.
+
+One mechanism, two commits, measured one at a time. MoltenVK has no
+multi-draw indirect — every `vkCmdDrawIndirect` entry becomes one Metal
+draw encode at ~0.15 us, so both passes paid a per-cluster submit tax
+(city: 20.7K main + 3.2K shadow encodes per frame). The CPU draw lists
+are now instance-folded into vertex-count buckets (quartile edges via
+`nth_element`, one `vkCmdDraw` per nonempty bucket): the vertex shader
+already resolved its draw entry through `gl_InstanceIndex`, so the fold
+only (a) reorders entries bucket-major, (b) sets `firstInstance` to the
+entry's new global index (x4 stride for the layered shadow pass), and
+(c) collapses corners past a cluster's own triangle count to zero-area
+triangles (counts are triangle_count*3, so triangles never straddle a
+bucket boundary; the shadow shader also degenerates stride slots past
+each entry's cascade-overlap popcount). Caster selection, LOD policy,
+and the drawIndirectCount path (devices that truly support it) are
+unchanged.
+
+| scene | metric | before | after main-fold | after +shadow-fold |
+| --- | --- | --- | --- | --- |
+| massive_city | main encodes | 20732 | 2 | 2 |
+| massive_city | shadow encodes | 3239 | 3239 | 2 |
+| massive_city | vkQueueSubmit | 6.6-6.9 ms | 2.2-2.4 ms | 1.9-2.2 ms |
+| massive_city | median ms (paired) | 14.02 / 14.16 | 8.82 / 8.55 | 8.54 / 8.50 |
+| massive_city | GPU main / shadow | 1.7-3.4 / 0.6-1.5 ms | 1.3 / 0.7-2.1 ms | 1.8 / 0.67 ms |
+| stanford_dragon | main encodes | 4002 | 4 | 4 |
+| stanford_dragon | shadow encodes | 800 | 800 | 4 |
+| stanford_dragon | median ms (paired) | 8.39 / 8.55 | 8.37 / 8.29 | 8.36 / 8.34 |
+
+Draw selection is unchanged (city draws=main:20732 shadow:3239 all
+along; `meridian_trace` predicts the same 5417 base + 15329 LOD
+clusters at the auto threshold 0.8965). Dragon renders pixel-identical
+to the pre-change build (0/921600 pixels differ >10). City differs on
+430/921600 pixels (0.047%), all inside one contiguous screen region —
+the bucket-major reorder flips the depth-equal winner among coincident
+surfaces (same class of diff as the layered-shadow merge's documented
+PCF penumbra order effect, and smaller); visibility readback stats are
+identical before/after (94790 valid pixels, same unique base/LOD
+geometry counts, `visibility_selection_subset=true`).
+
+### Per-run results (2026-09-07 20:35, REPEAT=2, loaded machine)
+
+| engine | scene | run | median ms | avg ms | p99 ms | avg fps |
+| --- | --- | --- | --- | --- | --- | --- |
+| renderer | stanford_dragon | 1 | 8.34 | 8.34 | 10.55 | 119.9 |
+| renderer | stanford_dragon | 2 | 8.30 | 8.35 | 10.21 | 119.7 |
+| godot | stanford_dragon | 1 | 8.22 | 8.34 | 9.57 | 119.9 (unthrottled) |
+| godot | stanford_dragon | 2 | 7.70 | 11.73 | 21.82 | 85.3 (unthrottled) |
+| renderer | massive_city | 1 | 8.56 | 8.67 | 12.34 | 115.4 |
+| renderer | massive_city | 2 | 8.57 | 8.74 | 11.86 | 114.4 |
+| godot | massive_city | 1 | 5.26 | 5.93 | 17.24 | 168.5 (unthrottled) |
+| godot | massive_city | 2 | 16.78 | 16.65 | 23.44 | 60.0 (capped) |
+
+Under the same load, dragon is at parity with Godot (8.30 vs 7.70-8.22
+unthrottled); city is 8.56 vs Godot's best same-session unthrottled
+5.26 -> ~1.6x, or ~2.1x against the idle-machine Godot reference of
+4.12 ms (the renderer numbers are themselves load-inflated — the
+pre-change build measured 12.1 ms under a comparable load and 8.3-8.6
+ms here).
+
+Verification: clean `-Wall -Wextra -Wpedantic` rebuild (0 warnings);
+`--validate` clean on dragon + city (only the preexisting MoltenVK
+blend-state warning); `visibility_selection_subset=true` on dragon,
+city, terrace, uv_seam and textured_uv_seam; terrace + uv_seam replays
+and the builder smoke set (8 manifests) pass; `--demand-streaming
+--budget 96` dragon passes (2016 page uploads, residency pinned at the
+budget, subset holds).
+
+Steady-state city profile after: traverse 2.7-3.1 ms, build 1.3-1.5 ms,
+residency 0.2, upload 0.1-0.2, cmdrec 0.02, submit 1.9-2.2 ms (was
+6.6-6.9; the remainder is the fixed MoltenVK encode cost of the
+command stream — compute passes, barriers, HZB mips — no longer the
+draw lists), fence (GPU) 1.5-2.2 ms.
+
+Remaining city gap (~1.6-2.1x), in order: (a) CPU traverse+build
+~4.0-4.6 ms (two serial DFS traversals + draw-build; parallelizable),
+(b) fixed submit cost ~1.5-2 ms (MoltenVK command translation beyond
+draws), (c) main-pass GPU 1.3-1.8 ms. Draw/submit tax is no longer a
+top-2 item.
+
 ## 2026-09-07 17:34 local: shadow caster LOD — city gap 4.9x -> ~2.9x
 
 Same machine/os/godot as below, but the machine was heavily loaded the
