@@ -329,6 +329,8 @@ static const int G_SAMPLES = 33;
 static const u8 G_UNMANAGED = 255;
 static const f64 G_TWO_POW_NEG64 = 0x1p-64;
 static const f64 C_CONTACT_R = 2.0;
+static const u32 C_MONOPOLE_BASE = 0xFF000000u;
+static const u32 C_WALL_BASE = 0xFFFFFF00u;
 
 struct SplitMix64 {
   u64 state;
@@ -356,23 +358,28 @@ struct GFit {
 // and the splitmix64 state left after the jitter draws (the expansion spread
 // continues drawing from it). Jitter offsets live on the world (indexed by
 // body id). Section 20 multipole totals (mx, my and the second central
-// moments) freeze alongside; mp marks the cycle as section 20.
+// moments) freeze alongside; mp marks the cycle as section 20. Section 23
+// adds the binding statistic; radial marks the cycle.
 struct GCollapsed {
   bool active = false;
   bool mp = false;
+  bool radial = false;
   u64 n = 0;
   f64 mass = 0, com_x = 0, com_y = 0, pxt = 0, pyt = 0, vcx = 0, vcy = 0, energy = 0;
   f64 mx = 0, my = 0, qxx = 0, qxy = 0, qyy = 0;
+  f64 binding = 0;
   u64 jitter_state = 0;
   std::vector<std::size_t> members;
 };
 
-// Section 21 contact event; vn_after is verification-only state (the record
-// payload is tick, a, b, jn, cx, cy).
+// Section 21 contact event; vn is the pre-impulse approach speed, vn_after
+// the post-impulse one (verification-only state; the record payload is
+// tick, a, b, jn, cx, cy). mu feeds the section 22 audio rule (static
+// contactants use their own reduced-mass rule).
 struct GContact {
   u64 tick = 0;
   u32 a = 0, b = 0;
-  f64 jn = 0, cx = 0, cy = 0, vn_after = 0;
+  f64 jn = 0, cx = 0, cy = 0, vn = 0, vn_after = 0, mu = 0;
 };
 
 static int g_region_at(f64 x, f64 y) {
@@ -474,6 +481,12 @@ struct GravityWorld {
   u64 tick = 0;
   f64 px = 0, py = 0;
   bool mp_enabled = true;
+  bool radial_enabled = false;
+  // Section 24 extended contact parameters (from the ContactParams record).
+  bool contacts_params = false;
+  bool walls_on = false;
+  f64 restitution = 0.0;
+  f64 friction = 0.0;
   std::vector<GBody> bodies;
   std::vector<GFit> coarse;
   std::vector<u8> body_region;
@@ -678,6 +691,7 @@ struct GravityWorld {
       ke += 0.5 * b.mass * (b.vx * b.vx + b.vy * b.vy);
     }
     f64 pe = 0.0;
+    f64 binding = 0.0;
     for (std::size_t a = 0; a < c.members.size(); ++a) {
       for (std::size_t b = a + 1; b < c.members.size(); ++b) {
         const GBody &ba = bodies[c.members[a]];
@@ -686,9 +700,11 @@ struct GravityWorld {
         const f64 dy = bb.y - ba.y;
         const f64 s2 = dx * dx + dy * dy + G_EPS2;
         pe -= ba.mass * bb.mass / std::sqrt(s2);
+        binding += ba.mass * bb.mass / std::sqrt(s2);
       }
     }
     c.energy = ke + pe;
+    c.binding = binding;
     if (c.n > 0) {
       c.com_x = sum_mx / c.mass;
       c.com_y = sum_my / c.mass;
@@ -708,6 +724,7 @@ struct GravityWorld {
       c.qyy += b.mass * dy * dy;
     }
     c.mp = mp_enabled;
+    c.radial = radial_enabled;
     SplitMix64 jitter(seed ^ (static_cast<u64>(region) * 0x9E3779B97F4A7C15ULL));
     for (std::size_t i : c.members) {
       const u64 ux = jitter.draw();
@@ -726,12 +743,76 @@ struct GravityWorld {
     return c;
   }
 
-  // Section 19/20 expansion: positions per mode (section 20 synthesizes
-  // under dipole-exact + quadrupole-transform constraints; section 19 keeps
-  // com + raw jitter), velocities v_com + spread with the last body
+  // Section 19/20/23 expansion: positions per mode (section 20 synthesizes
+  // under dipole-exact + quadrupole-transform constraints; section 23 adds
+  // the binding-matched radial scale + spread-scale energy closure; section
+  // 19 keeps com + raw jitter), velocities v_com + spread with the last body
   // absorbing the exact momentum residual (bit-identical per the spec).
+  f64 radial_scale(std::vector<std::pair<f64, f64>> &base, const GCollapsed &c) {
+    if (c.members.size() < 2) {
+      return 0.0;
+    }
+    std::vector<std::pair<f64, f64>> pairs;
+    for (std::size_t a = 0; a < c.members.size(); ++a) {
+      for (std::size_t b = a + 1; b < c.members.size(); ++b) {
+        const f64 w = bodies[c.members[a]].mass * bodies[c.members[b]].mass;
+        const f64 dx = base[b].first - base[a].first;
+        const f64 dy = base[b].second - base[a].second;
+        pairs.emplace_back(w, dx * dx + dy * dy);
+      }
+    }
+    const auto f = [&](f64 lam) {
+      f64 total = 0.0;
+      for (const auto &p : pairs) {
+        total += p.first / std::sqrt(lam * lam * p.second + 1.0);
+      }
+      return total;
+    };
+    const f64 target = c.binding;
+    f64 lam;
+    if (target >= f(0.0)) {
+      lam = 0.0;
+    } else {
+      f64 hi = 1.0;
+      int doublings = 0;
+      while (f(hi) > target && doublings < 64) {
+        hi *= 2.0;
+        ++doublings;
+      }
+      f64 lo = 0.0;
+      for (int it = 0; it < 128; ++it) {
+        const f64 mid = (lo + hi) * 0.5;
+        if (f(mid) >= target) {
+          lo = mid;
+        } else {
+          hi = mid;
+        }
+      }
+      lam = (lo + hi) * 0.5;
+    }
+    for (auto &b : base) {
+      b.first *= lam;
+      b.second *= lam;
+    }
+    f64 swx = 0.0;
+    f64 swy = 0.0;
+    for (std::size_t a = 0; a < c.members.size(); ++a) {
+      const f64 m = bodies[c.members[a]].mass;
+      swx += m * base[a].first;
+      swy += m * base[a].second;
+    }
+    const f64 wx = swx / c.mass;
+    const f64 wy = swy / c.mass;
+    for (auto &b : base) {
+      b.first -= wx;
+      b.second -= wy;
+    }
+    return f(lam);
+  }
+
   void expand(int region) {
     GCollapsed &c = collapsed[region];
+    f64 sigma = 1.0;
     if (c.mp) {
       std::vector<std::pair<f64, f64>> base;
       base.reserve(c.members.size());
@@ -785,6 +866,10 @@ struct GravityWorld {
           }
         }
       }
+      f64 fl = 0.0;
+      if (c.radial) {
+        fl = radial_scale(base, c);
+      }
       f64 sum_mx = 0.0;
       f64 sum_my = 0.0;
       for (std::size_t a = 0; a + 1 < c.members.size(); ++a) {
@@ -798,6 +883,76 @@ struct GravityWorld {
         const std::size_t last = c.members.back();
         bodies[last].x = (c.mx - sum_mx) / bodies[last].mass;
         bodies[last].y = (c.my - sum_my) / bodies[last].mass;
+      }
+      if (c.radial) {
+        // Section 23 spread-scale: close the synthesized kinetic energy on
+        // the recorded total via the three-point parabola through ke(sigma).
+        std::vector<std::pair<f64, f64>> spread(c.members.size());
+        SplitMix64 sj(c.jitter_state);
+        for (std::size_t a = 0; a < c.members.size(); ++a) {
+          if (a + 1 < c.members.size()) {
+            const u64 ux = sj.draw();
+            const u64 uy = sj.draw();
+            spread[a] = {(static_cast<f64>(ux) * G_TWO_POW_NEG64 - 0.5) * 0.1,
+                         (static_cast<f64>(uy) * G_TWO_POW_NEG64 - 0.5) * 0.1};
+          }
+        }
+        const auto synth_velocities = [&](f64 s) {
+          std::vector<std::pair<f64, f64>> vs(c.members.size());
+          f64 smx = 0.0;
+          f64 smy = 0.0;
+          for (std::size_t a = 0; a < c.members.size(); ++a) {
+            const std::size_t i = c.members[a];
+            if (a + 1 < c.members.size()) {
+              const f64 vx = c.vcx + s * spread[a].first;
+              const f64 vy = c.vcy + s * spread[a].second;
+              smx += bodies[i].mass * vx;
+              smy += bodies[i].mass * vy;
+              vs[a] = {vx, vy};
+            } else {
+              vs[a] = {(c.pxt - smx) / bodies[i].mass, (c.pyt - smy) / bodies[i].mass};
+            }
+          }
+          return vs;
+        };
+        const auto synth_ke = [&](f64 s) {
+          const auto vs = synth_velocities(s);
+          f64 ke = 0.0;
+          for (std::size_t a = 0; a < c.members.size(); ++a) {
+            const f64 m = bodies[c.members[a]].mass;
+            ke += 0.5 * m * (vs[a].first * vs[a].first + vs[a].second * vs[a].second);
+          }
+          return ke;
+        };
+        const f64 c0 = synth_ke(0.0);
+        const f64 c1 = synth_ke(1.0);
+        const f64 cm = synth_ke(-1.0);
+        const f64 qa = ((c1 + cm) - (c0 + c0)) * 0.5;
+        const f64 qb = (c1 - cm) * 0.5;
+        const f64 k_target = c.energy + fl;
+        const f64 disc = qb * qb - 4.0 * qa * (c0 - k_target);
+        if (qa == 0.0) {
+          sigma = 0.0;
+        } else if (disc < 0.0) {
+          sigma = (0.0 - qb) / (2.0 * qa);
+        } else {
+          const f64 sq = std::sqrt(disc);
+          const f64 r1 = ((0.0 - qb) + sq) / (2.0 * qa);
+          const f64 r2 = ((0.0 - qb) - sq) / (2.0 * qa);
+          sigma = r1 * r1 <= r2 * r2 ? r1 : r2;
+        }
+        const auto vs = synth_velocities(sigma);
+        for (std::size_t a = 0; a < c.members.size(); ++a) {
+          bodies[c.members[a]].vx = vs[a].first;
+          bodies[c.members[a]].vy = vs[a].second;
+        }
+        for (std::size_t i : c.members) {
+          blevel[i] = 1;
+          body_region[i] = G_UNMANAGED;
+        }
+        c = GCollapsed{};
+        rstate[region] = 1;
+        return;
       }
     }
     SplitMix64 jitter(c.jitter_state);
@@ -937,14 +1092,52 @@ struct GravityWorld {
     }
   }
 
-  // Section 21 contact pass: single pinned lexicographic impulse sweep over
-  // fine pairs, applied immediately, after the second fc kick.
+  // Section 24 one-sided impulse vs a frozen contactant: only the fine body
+  // changes; the ledger books the intended impulse exactly (fc-kick rule).
+  std::pair<f64, f64> static_impulse(std::size_t i, f64 nx, f64 ny, f64 vrx, f64 vry) {
+    const f64 e = restitution;
+    const f64 fr = friction;
+    const f64 mi = bodies[i].mass;
+    const f64 vn = vrx * nx + vry * ny;
+    const f64 s = (1.0 + e) * vn;
+    bodies[i].vx += s * nx;
+    bodies[i].vy += s * ny;
+    px += mi * (s * nx);
+    py += mi * (s * ny);
+    const f64 jn = (0.0 - s) * mi;
+    if (fr > 0.0) {
+      const f64 vt = (0.0 - vrx) * ny + vry * nx;
+      f64 jt = vt * mi;
+      const f64 jt_max = fr * jn;
+      if (jt > jt_max) {
+        jt = jt_max;
+      }
+      if (jt < 0.0 - jt_max) {
+        jt = 0.0 - jt_max;
+      }
+      const f64 w = jt / mi;
+      bodies[i].vx += w * (0.0 - ny);
+      bodies[i].vy += w * nx;
+      px += jt * (0.0 - ny);
+      py += jt * nx;
+    }
+    return {vn, jn};
+  }
+
+  // Section 21 + 24 contact pass: single pinned lexicographic impulse sweep
+  // over fine pairs (fine x coarse static pairs included when the
+  // ContactParams record is present), then collapsed-region monopoles in
+  // region order, then walls in body order — applied immediately, after the
+  // second fc kick.
   void contact_pass(u64 entering, const std::vector<u8> &flags) {
     const std::size_t n = bodies.size();
     std::vector<f64> radii(n);
     for (std::size_t i = 0; i < n; ++i) {
       radii[i] = C_CONTACT_R * std::sqrt(bodies[i].mass);
     }
+    const f64 e = restitution;
+    const f64 fr = friction;
+    const bool extended = contacts_params;
     std::vector<std::pair<u32, u32>> nxt;
     std::vector<GContact> events;
     for (std::size_t i = 0; i < n; ++i) {
@@ -952,11 +1145,15 @@ struct GravityWorld {
         continue;
       }
       for (std::size_t j = i + 1; j < n; ++j) {
-        if (flags[j] != 1) {
+        if (flags[j] == 2) {
           continue;
         }
-        const f64 dx = bodies[j].x - bodies[i].x;
-        const f64 dy = bodies[j].y - bodies[i].y;
+        if (flags[j] == 0 && !extended) {
+          continue;
+        }
+        const GBody sj = state_at(j, entering);
+        const f64 dx = sj.x - bodies[i].x;
+        const f64 dy = sj.y - bodies[i].y;
         const f64 rs = radii[i] + radii[j];
         const f64 d2 = dx * dx + dy * dy;
         if (d2 >= rs * rs) {
@@ -971,24 +1168,52 @@ struct GravityWorld {
           nx = dx / dist;
           ny = dy / dist;
         }
-        const f64 vrx = bodies[j].vx - bodies[i].vx;
-        const f64 vry = bodies[j].vy - bodies[i].vy;
+        const f64 vrx = sj.vx - bodies[i].vx;
+        const f64 vry = sj.vy - bodies[i].vy;
         const f64 vn = vrx * nx + vry * ny;
         if (vn >= 0.0) {
           continue;
         }
         const f64 mi = bodies[i].mass;
         const f64 mj = bodies[j].mass;
-        const f64 cx = (bodies[i].x + bodies[j].x) * 0.5;
-        const f64 cy = (bodies[i].y + bodies[j].y) * 0.5;
-        const f64 inv = 1.0 / (mi + mj);
-        const f64 t = vn * inv;
-        const f64 fi = t * mj;
-        const f64 fj = t * mi;
-        bodies[i].vx += fi * nx;
-        bodies[i].vy += fi * ny;
-        bodies[j].vx -= fj * nx;
-        bodies[j].vy -= fj * ny;
+        const f64 cx = (bodies[i].x + sj.x) * 0.5;
+        const f64 cy = (bodies[i].y + sj.y) * 0.5;
+        f64 jn;
+        f64 mu;
+        if (flags[j] == 0) {
+          const std::pair<f64, f64> res = static_impulse(i, nx, ny, vrx, vry);
+          jn = res.second;
+          mu = mi;
+        } else {
+          const f64 inv = 1.0 / (mi + mj);
+          const f64 t = vn * inv;
+          const f64 s = (1.0 + e) * t;
+          const f64 fi = s * mj;
+          const f64 fj = s * mi;
+          bodies[i].vx += fi * nx;
+          bodies[i].vy += fi * ny;
+          bodies[j].vx -= fj * nx;
+          bodies[j].vy -= fj * ny;
+          mu = (mi * mj) / (mi + mj);
+          jn = ((0.0 - vn) * (1.0 + e)) * mu;
+          if (fr > 0.0) {
+            const f64 vt = (0.0 - vrx) * ny + vry * nx;
+            f64 q = vt * inv;
+            const f64 qmax = (fr * jn) * inv;
+            if (q > qmax) {
+              q = qmax;
+            }
+            if (q < 0.0 - qmax) {
+              q = 0.0 - qmax;
+            }
+            const f64 fti = q * mj;
+            const f64 ftj = q * mi;
+            bodies[i].vx += fti * (0.0 - ny);
+            bodies[i].vy += fti * nx;
+            bodies[j].vx -= ftj * (0.0 - ny);
+            bodies[j].vy -= ftj * nx;
+          }
+        }
         bool was = false;
         for (const auto &p : touching) {
           if (p == pair) {
@@ -999,18 +1224,152 @@ struct GravityWorld {
         if (was) {
           continue;
         }
-        const f64 vn_after =
-            (bodies[j].vx - bodies[i].vx) * nx + (bodies[j].vy - bodies[i].vy) * ny;
-        const f64 mu = (mi * mj) / (mi + mj);
         GContact c;
         c.tick = entering;
         c.a = static_cast<u32>(i);
         c.b = static_cast<u32>(j);
-        c.jn = -vn * mu;
+        c.jn = jn;
         c.cx = cx;
         c.cy = cy;
-        c.vn_after = vn_after;
+        c.vn = vn;
+        c.vn_after =
+            (bodies[j].vx - bodies[i].vx) * nx + (bodies[j].vy - bodies[i].vy) * ny;
+        c.mu = mu;
         events.push_back(c);
+      }
+    }
+    if (extended) {
+      for (int region = 0; region < 4; ++region) {
+        const GCollapsed &cc = collapsed[region];
+        if (!cc.active || cc.n == 0) {
+          continue;
+        }
+        const f64 big_r = C_CONTACT_R * std::sqrt(cc.mass);
+        for (std::size_t i = 0; i < n; ++i) {
+          if (flags[i] != 1) {
+            continue;
+          }
+          const f64 dx = cc.com_x - bodies[i].x;
+          const f64 dy = cc.com_y - bodies[i].y;
+          const f64 rs = radii[i] + big_r;
+          const f64 d2 = dx * dx + dy * dy;
+          if (d2 >= rs * rs) {
+            continue;
+          }
+          const std::pair<u32, u32> pair(static_cast<u32>(i), C_MONOPOLE_BASE + region);
+          nxt.push_back(pair);
+          f64 nx = 1.0;
+          f64 ny = 0.0;
+          if (d2 != 0.0) {
+            const f64 dist = std::sqrt(d2);
+            nx = dx / dist;
+            ny = dy / dist;
+          }
+          const f64 vrx = cc.vcx - bodies[i].vx;
+          const f64 vry = cc.vcy - bodies[i].vy;
+          const f64 vn = vrx * nx + vry * ny;
+          if (vn >= 0.0) {
+            continue;
+          }
+          const f64 mi = bodies[i].mass;
+          const f64 cx = (bodies[i].x + cc.com_x) * 0.5;
+          const f64 cy = (bodies[i].y + cc.com_y) * 0.5;
+          const std::pair<f64, f64> res = static_impulse(i, nx, ny, vrx, vry);
+          const f64 mu = (mi * cc.mass) / (mi + cc.mass);
+          bool was = false;
+          for (const auto &p : touching) {
+            if (p == pair) {
+              was = true;
+              break;
+            }
+          }
+          if (was) {
+            continue;
+          }
+          GContact c;
+          c.tick = entering;
+          c.a = static_cast<u32>(i);
+          c.b = C_MONOPOLE_BASE + region;
+          c.jn = res.second;
+          c.cx = cx;
+          c.cy = cy;
+          c.vn = vn;
+          c.vn_after = (cc.vcx - bodies[i].vx) * nx + (cc.vcy - bodies[i].vy) * ny;
+          c.mu = mu;
+          events.push_back(c);
+        }
+      }
+    }
+    if (walls_on) {
+      for (std::size_t i = 0; i < n; ++i) {
+        if (flags[i] != 1) {
+          continue;
+        }
+        for (u32 wall = 0; wall < 4; ++wall) {
+          f64 nx = 0.0;
+          f64 ny = 0.0;
+          f64 cx = 0.0;
+          f64 cy = 0.0;
+          if (wall == 0) {
+            if (!(bodies[i].x - radii[i] < 0.0 && bodies[i].vx < 0.0)) {
+              continue;
+            }
+            nx = 0.0 - 1.0;
+            cx = (bodies[i].x + 0.0) * 0.5;
+            cy = bodies[i].y;
+          } else if (wall == 1) {
+            if (!(bodies[i].x + radii[i] > 128.0 && bodies[i].vx > 0.0)) {
+              continue;
+            }
+            nx = 1.0;
+            cx = (bodies[i].x + 128.0) * 0.5;
+            cy = bodies[i].y;
+          } else if (wall == 2) {
+            if (!(bodies[i].y - radii[i] < 0.0 && bodies[i].vy < 0.0)) {
+              continue;
+            }
+            ny = 0.0 - 1.0;
+            cx = bodies[i].x;
+            cy = (bodies[i].y + 0.0) * 0.5;
+          } else {
+            if (!(bodies[i].y + radii[i] > 128.0 && bodies[i].vy > 0.0)) {
+              continue;
+            }
+            ny = 1.0;
+            cx = bodies[i].x;
+            cy = (bodies[i].y + 128.0) * 0.5;
+          }
+          const std::pair<u32, u32> pair(static_cast<u32>(i), C_WALL_BASE + wall);
+          nxt.push_back(pair);
+          const f64 vrx = 0.0 - bodies[i].vx;
+          const f64 vry = 0.0 - bodies[i].vy;
+          const f64 vn_pre = vrx * nx + vry * ny;
+          if (vn_pre >= 0.0) {
+            continue;
+          }
+          const std::pair<f64, f64> res = static_impulse(i, nx, ny, vrx, vry);
+          bool was = false;
+          for (const auto &p : touching) {
+            if (p == pair) {
+              was = true;
+              break;
+            }
+          }
+          if (was) {
+            continue;
+          }
+          GContact c;
+          c.tick = entering;
+          c.a = static_cast<u32>(i);
+          c.b = C_WALL_BASE + wall;
+          c.jn = res.second;
+          c.cx = cx;
+          c.cy = cy;
+          c.vn = res.first;
+          c.vn_after = (0.0 - bodies[i].vx) * nx + (0.0 - bodies[i].vy) * ny;
+          c.mu = bodies[i].mass;
+          events.push_back(c);
+        }
       }
     }
     touching = std::move(nxt);
@@ -1232,16 +1591,24 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count,
     u32 a, b;
     f64 jn, cx, cy;
   };
+  struct PendingRadial {
+    u64 t;
+    int region;
+    f64 binding;
+  };
   std::vector<Pending> pending;
   std::vector<PendingCollapse> pending_collapsed;
   std::vector<PendingMultipole> pending_multipole;
   std::vector<PendingContact> pending_contact;
+  std::vector<PendingRadial> pending_radial;
   std::vector<PendingContact> all_contacts;
+  f64 region_collapse_mass[4] = {0.0, 0.0, 0.0, 0.0};
   u64 ticks_seen = 0;
   u64 totals_seen = 0;
   u64 states_seen = 0;
   u64 bodies_seen = 0;
   u64 collapses_seen = 0;
+  bool params_seen = false;
   f64 max_pos_dev = 0.0;
   f64 worst_vn_after = 0.0;
   u64 last_tick = 0;
@@ -1259,10 +1626,12 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count,
         }
         // Collapse mode is selected per cycle by the presence of the
         // section 20 RegionMultipole record (section 19 streams carry
-        // none). RegionLevel records queue and apply here, at the tick
+        // none); radial mode per the section 23 RegionRadial record.
+        // RegionLevel records queue and apply here, at the tick
         // boundary, in stream order — level 2 collapses validate against
         // the world's frozen totals bit-for-bit.
         world.mp_enabled = !pending_multipole.empty();
+        world.radial_enabled = world.radial_enabled || !pending_radial.empty();
         // Section 21: contact mode is sticky from the first Contact record.
         if (!pending_contact.empty()) {
           world.contacts_on = true;
@@ -1315,6 +1684,18 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count,
           }
         }
         pending_multipole.clear();
+        for (const PendingRadial &pr : pending_radial) {
+          const GCollapsed &c = world.collapsed[pr.region];
+          if (!c.active || !c.radial || pr.t != world.tick + 1 ||
+              !f64_bits_eq(pr.binding, c.binding)) {
+            std::fprintf(stderr,
+                         "MISMATCH: RegionRadial tick=%" PRIu64 " region=%d binding=%.17g"
+                         " computed=%.17g\n",
+                         pr.t, pr.region, pr.binding, c.binding);
+            return 1;
+          }
+        }
+        pending_radial.clear();
         world.step();
         reference.step();
         // Section 21: contact records validate against this tick's own
@@ -1341,7 +1722,8 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count,
                            pc.t, pc.a, pc.b, pc.jn, pc.cx, pc.cy, lc.jn, lc.cx, lc.cy);
               return 1;
             }
-            const f64 abs_vn = lc.vn_after > 0 ? lc.vn_after : -lc.vn_after;
+            const f64 residual = lc.vn_after + world.restitution * lc.vn;
+            const f64 abs_vn = residual > 0 ? residual : -residual;
             if (abs_vn > worst_vn_after) {
               worst_vn_after = abs_vn;
             }
@@ -1535,6 +1917,7 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count,
                        rx, ry, rec_start);
           return 2;
         }
+        region_collapse_mass[ry * 2 + rx] = mass;
         pending_collapsed.push_back(
             {t, static_cast<int>(ry) * 2 + static_cast<int>(rx), n, mass, com_x, com_y, pxt, pyt,
              energy});
@@ -1575,7 +1958,8 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count,
           std::fprintf(stderr, "error: truncated Contact at offset %zu\n", rec_start);
           return 2;
         }
-        if (a >= b || b >= body_count || t == 0) {
+        const bool b_static = b >= C_MONOPOLE_BASE;
+        if (a >= b || (!b_static && b >= body_count) || t == 0) {
           std::fprintf(stderr,
                        "error: bad Contact (tick=%" PRIu64 " pair=(%" PRIu32 ",%" PRIu32
                        ")) at offset %zu\n",
@@ -1583,6 +1967,50 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count,
           return 2;
         }
         pending_contact.push_back({t, a, b, jn, cx, cy});
+      } break;
+      case 11: {
+        // Section 23 RegionRadial: parsed here, validated bit-for-bit at the
+        // tick boundary.
+        u64 t = 0;
+        u32 rx = 0;
+        u32 ry = 0;
+        f64 binding = 0;
+        if (!take_u64(data, off, t) || !take_u32(data, off, rx) || !take_u32(data, off, ry) ||
+            !take_f64(data, off, binding)) {
+          std::fprintf(stderr, "error: truncated RegionRadial at offset %zu\n", rec_start);
+          return 2;
+        }
+        if (rx > 1 || ry > 1) {
+          std::fprintf(stderr,
+                       "error: bad RegionRadial region (%" PRIu32 ",%" PRIu32 ") at offset %zu\n",
+                       rx, ry, rec_start);
+          return 2;
+        }
+        pending_radial.push_back({t, static_cast<int>(ry) * 2 + static_cast<int>(rx), binding});
+      } break;
+      case 12: {
+        // Section 24 ContactParams: at most one, before the first tick.
+        f64 restitution = 0;
+        f64 friction = 0;
+        if (!take_f64(data, off, restitution) || !take_f64(data, off, friction) ||
+            data.size() - off < 1) {
+          std::fprintf(stderr, "error: truncated ContactParams at offset %zu\n", rec_start);
+          return 2;
+        }
+        const u8 walls = data[off++];
+        if (params_seen || last_tick != 0 || walls > 1 || !(restitution >= 0.0 && restitution <= 1.0) ||
+            friction < 0.0) {
+          std::fprintf(stderr,
+                       "error: bad ContactParams (e=%.17g friction=%.17g walls=%" PRIu8
+                       ") at offset %zu\n",
+                       restitution, friction, walls, rec_start);
+          return 2;
+        }
+        params_seen = true;
+        world.contacts_params = true;
+        world.restitution = restitution;
+        world.friction = friction;
+        world.walls_on = walls == 1;
       } break;
       default:
         std::fprintf(stderr, "error: unknown record tag %u at offset %zu\n", tag, rec_start);
@@ -1624,8 +2052,16 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count,
   for (const PendingContact &pc : all_contacts) {
     const std::size_t e = static_cast<std::size_t>((pc.t + 1) * A_SPT);
     const f64 ma = world.bodies[pc.a].mass;
-    const f64 mb = world.bodies[pc.b].mass;
-    const f64 mu = (ma * mb) / (ma + mb);
+    f64 mu;
+    if (pc.b >= C_WALL_BASE) {
+      mu = ma;
+    } else if (pc.b >= C_MONOPOLE_BASE) {
+      const f64 m = region_collapse_mass[pc.b - C_MONOPOLE_BASE];
+      mu = (ma * m) / (ma + m);
+    } else {
+      const f64 mb = world.bodies[pc.b].mass;
+      mu = (ma * mb) / (ma + mb);
+    }
     for (int k = 0; k < 3; ++k) {
       const f64 omega = A_OMEGA0 * A_PARTIAL[k] / mu;
       const f64 a = (2.0 - omega) * A_RHO[k];

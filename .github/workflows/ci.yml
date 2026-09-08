@@ -52,8 +52,13 @@ jobs:
           /tmp/ontos_stream_dump simval/examples/ontos_gravity/window/ontos.stream 42
           /tmp/ontos_stream_dump simval/examples/ontos_gravity/collapse/ontos.stream 11
           /tmp/ontos_stream_dump simval/examples/ontos_gravity/multipole/ontos.stream 17
+          /tmp/ontos_stream_dump simval/examples/ontos_gravity/radial/ontos.stream 17
           /tmp/ontos_stream_dump simval/examples/ontos_contact/contact/ontos.stream 11 --wav /tmp/cpp.wav
           cmp /tmp/cpp.wav simval/examples/ontos_contact/contact/ontos.wav
           /tmp/ontos_stream_dump simval/examples/ontos_contact/contact_collapse/ontos.stream 11 --wav /tmp/cpp2.wav
           cmp /tmp/cpp2.wav simval/examples/ontos_contact/contact_collapse/ontos.wav
+          /tmp/ontos_stream_dump simval/examples/ontos_contact/walls/ontos.stream 22 --wav /tmp/cpp3.wav
+          cmp /tmp/cpp3.wav simval/examples/ontos_contact/walls/ontos.wav
+          /tmp/ontos_stream_dump simval/examples/ontos_contact/restitution/ontos.stream 11 --wav /tmp/cpp4.wav
+          cmp /tmp/cpp4.wav simval/examples/ontos_contact/restitution/ontos.wav
           echo "ontos_stream_dump + section-22 audio bit-identical on ${{ matrix.os }}"
