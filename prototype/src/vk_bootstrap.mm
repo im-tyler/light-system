@@ -1461,6 +1461,19 @@ void destroy_frame_context(VkDevice device, FrameContext& frame) {
 
 namespace {  // reopen anonymous namespace
 
+// Instance-folded main-pass draws (MoltenVK has no multi-draw indirect:
+// every vkCmdDrawIndirect entry becomes one Metal draw encode, so the
+// per-cluster list is folded into a few instanced draws grouped by
+// vertex-count bucket). The vertex shader reads the draw entry via
+// gl_InstanceIndex = bucket.first_instance + local instance and collapses
+// corners past the cluster's own count to degenerate triangles.
+struct MainDrawBucket {
+    uint32_t vertex_count = 0;
+    uint32_t instance_count = 0;
+    uint32_t first_instance = 0;
+};
+constexpr uint32_t kMainDrawBucketCount = 4;
+
 VkResult record_debug_command_buffer(FrameContext& frame, const DebugRenderContext& debug_render,
                                       const ComputeCullContext& compute_cull,
                                       const ComputeSelectionContext& compute_selection,
@@ -1473,12 +1486,12 @@ VkResult record_debug_command_buffer(FrameContext& frame, const DebugRenderConte
                                       float error_threshold,
                                       const TraversalSelection& selection,
                                       const UploadableScene& scene,
-                                      uint32_t frame_index,
-                                      uint32_t image_index,
-                                      bool has_draw_indirect_count,
-                                      uint32_t shadow_draw_count,
-                                      uint32_t main_draw_count,
-                                      const GpuProfiler& profiler) {
+                                       uint32_t frame_index,
+                                       uint32_t image_index,
+                                       bool has_draw_indirect_count,
+                                       uint32_t shadow_draw_count,
+                                       const MainDrawBucket* main_buckets,
+                                       const GpuProfiler& profiler) {
     VkCommandBufferBeginInfo begin_info{};
     begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     VkResult result = vkBeginCommandBuffer(frame.command_buffer, &begin_info);
@@ -1720,16 +1733,24 @@ VkResult record_debug_command_buffer(FrameContext& frame, const DebugRenderConte
                                        max_draws,
                                        sizeof(GpuDrawEntry));
             } else {
-                // No draw_indirect_count: draw the CPU-built list with this
-                // frame's exact count. The occlusion output cannot be used
-                // here (its count is GPU-written and its tail holds stale
-                // entries), and a capacity-sized count would encode one Metal
-                // draw per cluster slot, dominating vkQueueSubmit on MoltenVK.
-                const uint32_t count = std::min(main_draw_count, compute_selection.max_draws);
-                vkCmdDrawIndirect(frame.command_buffer,
-                                  compute_selection.draw_list.buffer, 0,
-                                  count,
-                                  sizeof(GpuDrawEntry));
+                // No draw_indirect_count: fold the CPU-built list into a few
+                // instanced draws by vertex-count bucket (one Metal encode
+                // each instead of one per cluster). The occlusion output
+                // cannot be used here (its count is GPU-written and its tail
+                // holds stale entries), and a capacity-sized indirect count
+                // would encode one Metal draw per cluster slot, dominating
+                // vkQueueSubmit on MoltenVK.
+                for (uint32_t b = 0; b < kMainDrawBucketCount; ++b) {
+                    if (main_buckets[b].instance_count == 0 ||
+                        main_buckets[b].vertex_count == 0) {
+                        continue;
+                    }
+                    vkCmdDraw(frame.command_buffer,
+                              main_buckets[b].vertex_count,
+                              main_buckets[b].instance_count,
+                              0,
+                              main_buckets[b].first_instance);
+                }
             }
         }
     }
@@ -3146,6 +3167,8 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             };
             uint32_t cpu_draw_count = 0;
             uint32_t shadow_draw_count = 0;
+            uint32_t main_encode_count = 0;
+            MainDrawBucket main_buckets[kMainDrawBucketCount] = {};
             {
                 auto t_build_start = clock_t::now();
                 std::vector<GpuDrawEntry> cpu_draws;
@@ -3268,6 +3291,65 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                 }
                 cpu_draw_count = static_cast<uint32_t>(cpu_draws.size());
                 shadow_draw_count = static_cast<uint32_t>(shadow_draws.size());
+                // Instance-fold bucketing of the main list: stable-partition
+                // the entries into vertex-count buckets (quartile edges via
+                // nth_element) so the main pass submits one instanced draw
+                // per nonempty bucket. Entry order changes (bucket-major),
+                // and each entry's draw_first_instance becomes its new
+                // global index -- the vertex shader already resolves entries
+                // through gl_InstanceIndex, so no other consumer cares about
+                // list order.
+                std::vector<GpuDrawEntry> folded_draws;
+                if (!cpu_draws.empty()) {
+                    std::vector<uint32_t> corner_counts;
+                    corner_counts.reserve(cpu_draws.size());
+                    for (const GpuDrawEntry& e : cpu_draws) {
+                        corner_counts.push_back(e.draw_vertex_count);
+                    }
+                    uint32_t bucket_edges[kMainDrawBucketCount - 1] = {};
+                    if (corner_counts.size() >= kMainDrawBucketCount) {
+                        for (uint32_t b = 1; b < kMainDrawBucketCount; ++b) {
+                            const size_t k = corner_counts.size() * b / kMainDrawBucketCount;
+                            std::nth_element(corner_counts.begin(),
+                                             corner_counts.begin() + static_cast<ptrdiff_t>(k),
+                                             corner_counts.end());
+                            bucket_edges[b - 1] = corner_counts[k];
+                        }
+                    }
+                    const auto bucket_of = [&](uint32_t corners) -> uint32_t {
+                        for (uint32_t b = 0; b < kMainDrawBucketCount - 1; ++b) {
+                            if (corners <= bucket_edges[b]) return b;
+                        }
+                        return kMainDrawBucketCount - 1;
+                    };
+                    uint32_t bucket_counts[kMainDrawBucketCount] = {};
+                    uint32_t bucket_max_corners[kMainDrawBucketCount] = {};
+                    for (const uint32_t corners : corner_counts) {
+                        const uint32_t b = bucket_of(corners);
+                        bucket_counts[b] += 1;
+                        bucket_max_corners[b] = std::max(bucket_max_corners[b], corners);
+                    }
+                    uint32_t bucket_starts[kMainDrawBucketCount] = {};
+                    for (uint32_t b = 1; b < kMainDrawBucketCount; ++b) {
+                        bucket_starts[b] = bucket_starts[b - 1] + bucket_counts[b - 1];
+                    }
+                    folded_draws.resize(cpu_draws.size());
+                    uint32_t write_cursors[kMainDrawBucketCount] = {};
+                    for (uint32_t b = 0; b < kMainDrawBucketCount; ++b) {
+                        write_cursors[b] = bucket_starts[b];
+                        main_buckets[b].vertex_count = bucket_max_corners[b];
+                        main_buckets[b].instance_count = bucket_counts[b];
+                        main_buckets[b].first_instance = bucket_starts[b];
+                        if (bucket_counts[b] > 0) main_encode_count += 1;
+                    }
+                    for (GpuDrawEntry& e : cpu_draws) {
+                        folded_draws[write_cursors[bucket_of(e.draw_vertex_count)]++] = e;
+                    }
+                    for (uint32_t i = 0; i < folded_draws.size(); ++i) {
+                        folded_draws[i].draw_first_instance = i;
+                    }
+                    cpu_draws.swap(folded_draws);
+                }
                 auto t_build_end = clock_t::now();
                 acc_build_ms +=
                     std::chrono::duration<double, std::milli>(t_build_end - t_build_start).count();
@@ -3318,7 +3400,7 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                                                  selection_for_frame, report.uploadable_scene,
                                                  frame_index, image_index,
                                                  has_draw_indirect_count, shadow_draw_count,
-                                                 cpu_draw_count, gpu_profiler);
+                                                 main_buckets, gpu_profiler);
             auto t_cmdrec_end = clock_t::now();
             acc_cmdrec_ms +=
                 std::chrono::duration<double, std::milli>(t_cmdrec_end - t_cmdrec_start).count();
@@ -3353,7 +3435,7 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             cpu_prof_samples++;
             if (cpu_prof_samples % 60 == 0) {
                 std::fprintf(stderr,
-                    "MERIDIAN_CPU: traverse=%.2f residency=%.2f build=%.2f upload=%.2f cmdrec=%.2f submit=%.2f fence=%.2f present=%.2f draws=main:%u shadow:%u (ms/frame, n=%u)\n",
+                    "MERIDIAN_CPU: traverse=%.2f residency=%.2f build=%.2f upload=%.2f cmdrec=%.2f submit=%.2f fence=%.2f present=%.2f draws=main:%u shadow:%u main_encodes:%u (ms/frame, n=%u)\n",
                     acc_traverse_ms / cpu_prof_samples,
                     acc_residency_ms / cpu_prof_samples,
                     acc_build_ms / cpu_prof_samples,
@@ -3364,6 +3446,7 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                     acc_present_ms / cpu_prof_samples,
                     cpu_draw_count,
                     shadow_draw_count,
+                    main_encode_count,
                     cpu_prof_samples);
             }
             if (result != VK_SUCCESS) {

@@ -54,6 +54,21 @@ vec2 read_vec2(uint base, uint index, uint domain) {
 
 void main() {
     DrawEntry entry = draws[gl_InstanceIndex];
+    // Instance-folded draws: vertexCount is the bucket maximum, so corners
+    // past this cluster's own count collapse to a shared point (counts are
+    // triangle_count * 3, so no triangle straddles the boundary) and the
+    // zero-area triangle is discarded by the rasterizer.
+    if (gl_VertexIndex >= entry.draw_vertex_count) {
+        gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
+        frag_normal = vec3(0.0);
+        frag_geometry_index = entry.cluster_index;
+        frag_geometry_kind = entry.geometry_kind & 0xffffu;
+        frag_world_pos = vec3(0.0);
+        frag_local_triangle = 0u;
+        frag_uv = vec2(0.0);
+        frag_has_uv = 0u;
+        return;
+    }
     uint domain = entry.geometry_kind & 0xffffu;
     bool has_uv = (entry.geometry_kind & 0x10000u) != 0u;
     uint pos_base = entry.payload_offset + 8u;
