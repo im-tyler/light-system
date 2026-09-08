@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -37,6 +38,7 @@
 #if defined(__APPLE__)
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/CAMetalLayer.h>
+#include <AudioToolbox/AudioToolbox.h>
 #endif
 
 using u8 = std::uint8_t;
@@ -631,6 +633,7 @@ struct Viewer {
     // Double-buffered so the CPU fills slot (frame + 1) & 1 while the GPU may
     // still be reading the other slot from the previous submit.
     GpuBuffer body_instance_buffers[2];
+    GpuBuffer contact_instance_buffers[2];
 
     void destroy_extent_resources() {
         if (device != VK_NULL_HANDLE) vkDeviceWaitIdle(device);
@@ -664,6 +667,8 @@ struct Viewer {
     void destroy() {
         if (device != VK_NULL_HANDLE) vkDeviceWaitIdle(device);
         destroy_swapchain_views();
+        destroy_buffer(device, contact_instance_buffers[0]);
+        destroy_buffer(device, contact_instance_buffers[1]);
         destroy_buffer(device, body_instance_buffers[0]);
         destroy_buffer(device, body_instance_buffers[1]);
         destroy_buffer(device, line_instance_buffer);
@@ -1025,6 +1030,11 @@ VkPipeline create_pipeline(Viewer& v, VkPrimitiveTopology topology, bool depth_w
     return pipeline;
 }
 
+float body_half_extent(f64 mass) {
+    const float log_size = 0.55f + 1.15f * static_cast<float>(std::log2(mass));
+    return std::clamp(log_size, 0.35f, 2.4f);
+}
+
 void fill_body_instances(const StreamFrame& frame, BodyInstance* instances) {
     static const float region_hue[4] = {0.62f, 0.08f, 0.33f, 0.78f};
     for (size_t i = 0; i < frame.bodies.size(); ++i) {
@@ -1043,8 +1053,7 @@ void fill_body_instances(const StreamFrame& frame, BodyInstance* instances) {
         }
         inst.x = static_cast<float>(body.x);
         inst.y = static_cast<float>(body.y);
-        const float log_size = 0.55f + 1.15f * static_cast<float>(std::log2(body.mass));
-        inst.half_extent = std::clamp(log_size, 0.35f, 2.4f);
+        inst.half_extent = body_half_extent(body.mass);
         inst.shape = 1.0f;
         inst.r = rgb[0];
         inst.g = rgb[1];
@@ -1169,6 +1178,214 @@ u64 render_contact_audio(const Stream& stream, const char* wav_path, bool write_
     return fnv1a64_bytes(pcm.data(), pcm.size());
 }
 
+#if defined(__APPLE__)
+
+// Realtime companion to the offline --wav render: the same spec-22 resonator
+// samples, scheduled live. Each contact spawns a voice when playback crosses
+// its tick; the device callback advances the identical recurrence (same
+// constants, same operands, same coefficient math — voices are constructed
+// from the final-frame masses like the offline mix) and sums active voices
+// into a stereo stream. Sample content stays a pure function of the stream;
+// wall-clock only decides when a ring starts.
+struct ContactVoice {
+    bool active = false;
+    u64 emitted = 0;
+    f64 s0[3] = {};
+    f64 s_prev[3] = {};
+    f64 s_prev2[3] = {};
+    f64 a[3] = {};
+    f64 b[3] = {};
+    f64 gl = 1.0, gr = 1.0;
+};
+
+struct RealtimeAudio {
+    static constexpr int kVoiceCount = 48;
+    static constexpr u32 kBufferFrames = 2048;
+    static constexpr int kBufferCount = 4;
+
+    std::mutex mutex;
+    ContactVoice voices[kVoiceCount] = {};
+    AudioQueueRef queue = nullptr;
+    bool failed = false;
+
+    ~RealtimeAudio() { stop(); }
+
+    RealtimeAudio() = default;
+    RealtimeAudio(const RealtimeAudio&) = delete;
+    RealtimeAudio& operator=(const RealtimeAudio&) = delete;
+
+    static void fill_buffer(void* user_data, AudioQueueRef queue, AudioQueueBufferRef buffer) {
+        auto* self = static_cast<RealtimeAudio*>(user_data);
+        float* out = static_cast<float*>(buffer->mAudioData);
+        const u32 frames =
+            static_cast<u32>(buffer->mAudioDataByteSize / (sizeof(float) * 2));
+        std::lock_guard<std::mutex> lock(self->mutex);
+        for (u32 i = 0; i < frames; ++i) {
+            f64 left = 0.0;
+            f64 right = 0.0;
+            for (ContactVoice& voice : self->voices) {
+                if (!voice.active) continue;
+                f64 mono = 0.0;
+                for (int k = 0; k < 3; ++k) {
+                    f64 s = 0.0;
+                    if (voice.emitted == 0) {
+                        s = voice.s0[k];
+                    } else if (voice.emitted == 1) {
+                        s = voice.a[k] * voice.s0[k];
+                    } else {
+                        s = voice.a[k] * voice.s_prev[k] - voice.b[k] * voice.s_prev2[k];
+                    }
+                    voice.s_prev2[k] = voice.s_prev[k];
+                    voice.s_prev[k] = s;
+                    mono += s;
+                }
+                ++voice.emitted;
+                if (voice.emitted >= static_cast<u64>(AudioSpec::kRing)) voice.active = false;
+                left += mono * voice.gl;
+                right += mono * voice.gr;
+            }
+            if (left < -1.0) {
+                left = -1.0;
+            } else if (left > 1.0) {
+                left = 1.0;
+            }
+            if (right < -1.0) {
+                right = -1.0;
+            } else if (right > 1.0) {
+                right = 1.0;
+            }
+            out[i * 2] = static_cast<float>(left);
+            out[i * 2 + 1] = static_cast<float>(right);
+        }
+        AudioQueueEnqueueBuffer(queue, buffer, 0, nullptr);
+    }
+
+    bool start() {
+        if (failed || queue != nullptr) return queue != nullptr;
+        AudioStreamBasicDescription format{};
+        format.mSampleRate = 65536.0;
+        format.mFormatID = kAudioFormatLinearPCM;
+        format.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
+        format.mBytesPerPacket = 8;
+        format.mFramesPerPacket = 1;
+        format.mBytesPerFrame = 8;
+        format.mChannelsPerFrame = 2;
+        format.mBitsPerChannel = 32;
+        if (AudioQueueNewOutput(&format, &RealtimeAudio::fill_buffer, this, nullptr, nullptr, 0,
+                                &queue) != noErr ||
+            queue == nullptr) {
+            queue = nullptr;
+            failed = true;
+            return false;
+        }
+        const u32 bytes = kBufferFrames * sizeof(float) * 2;
+        for (int i = 0; i < kBufferCount; ++i) {
+            AudioQueueBufferRef buffer = nullptr;
+            if (AudioQueueAllocateBuffer(queue, bytes, &buffer) != noErr || buffer == nullptr) {
+                stop();
+                failed = true;
+                return false;
+            }
+            buffer->mAudioDataByteSize = bytes;
+            fill_buffer(this, queue, buffer);
+        }
+        if (AudioQueueStart(queue, nullptr) != noErr) {
+            stop();
+            failed = true;
+            return false;
+        }
+        return true;
+    }
+
+    void stop() {
+        if (queue != nullptr) {
+            AudioQueueStop(queue, true);
+            AudioQueueDispose(queue, true);
+            queue = nullptr;
+        }
+    }
+
+    void reset() {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (ContactVoice& voice : voices) voice.active = false;
+    }
+
+    void spawn_contact(const StreamContact& contact, f64 mass_a, f64 mass_b, f64 gl, f64 gr) {
+        ContactVoice voice;
+        const f64 mu = (mass_a * mass_b) / (mass_a + mass_b);
+        for (int k = 0; k < 3; ++k) {
+            const f64 omega = AudioSpec::kOmega0 * AudioSpec::kPartial[k] / mu;
+            voice.a[k] = (2.0 - omega) * AudioSpec::kRho[k];
+            voice.b[k] = AudioSpec::kRho[k] * AudioSpec::kRho[k];
+            voice.s0[k] = AudioSpec::kAmp[k] * contact.jn;
+        }
+        voice.gl = gl;
+        voice.gr = gr;
+        std::lock_guard<std::mutex> lock(mutex);
+        ContactVoice* slot = nullptr;
+        u64 most_emitted = 0;
+        for (ContactVoice& candidate : voices) {
+            if (!candidate.active) {
+                slot = &candidate;
+                break;
+            }
+            if (slot == nullptr || candidate.emitted > most_emitted) {
+                slot = &candidate;
+                most_emitted = candidate.emitted;
+            }
+        }
+        *slot = voice;
+    }
+};
+
+// Viewer-side stereo placement for a contact: constant-power pan from the
+// contact's screen-x position plus inverse distance-squared-ish attenuation
+// referenced to the visible half-height (on-screen ~1, falling off outside
+// the view). Deterministic given the same stream + camera. These gains are a
+// render choice like the view matrix — the spec-22 ring waveform itself
+// contains no transcendentals.
+void contact_gains(const Camera2D& camera, int fb_width, int fb_height, f64 cx, f64 cy,
+                   f64& out_l, f64& out_r) {
+    constexpr f64 kQuarterPi = 0.7853981633974483;
+    const f64 ndc_x = (cx - camera.cx) * (2.0 * camera.zoom / std::max(1, fb_width));
+    const f64 pan = std::clamp(ndc_x, -1.0, 1.0) * 0.7;
+    const f64 angle = (pan + 1.0) * kQuarterPi;
+    const f64 d = std::hypot(cx - camera.cx, cy - camera.cy);
+    const f64 ref = std::max(1.0, static_cast<f64>(fb_height) / (2.0 * camera.zoom));
+    const f64 att = (ref * ref) / (d * d + ref * ref);
+    out_l = std::cos(angle) * att;
+    out_r = std::sin(angle) * att;
+}
+
+#endif
+
+// Contact visualization: a brief expanding ring billboard at the contact
+// midpoint, fading over kFlashTicks playback ticks (no trails).
+struct ContactFlash {
+    float x = 0.0f, y = 0.0f;
+    float half_extent = 1.0f;
+    float t = 0.0f;
+};
+
+constexpr float kFlashTicks = 4.0f;
+constexpr std::size_t kMaxFlashes = 64;
+
+void fill_flash_instances(const std::vector<ContactFlash>& flashes, BodyInstance* instances) {
+    for (std::size_t i = 0; i < flashes.size(); ++i) {
+        const ContactFlash& flash = flashes[i];
+        BodyInstance& inst = instances[i];
+        const float fade = 1.0f - flash.t;
+        inst.x = flash.x;
+        inst.y = flash.y;
+        inst.half_extent = flash.half_extent * (1.0f + 0.9f * flash.t);
+        inst.shape = 2.0f;
+        inst.r = 1.0f;
+        inst.g = 0.82f;
+        inst.b = 0.40f;
+        inst.a = 0.85f * fade * fade;
+    }
+}
+
 void print_usage() {
     std::fprintf(stderr,
                  "usage: ontos_view <stream-file> [--validate] [--frames N] [--wav FILE]\n"
@@ -1176,7 +1393,9 @@ void print_usage() {
                  "  --frames N   non-interactive: render N frames (one tick per frame),\n"
                  "               print per-tick body counts, exit 0\n"
                  "  --wav FILE   render the spec-22 modal audio offline (deterministic\n"
-                 "               WAV + FNV hash; no realtime audio device)\n"
+                 "               WAV + FNV hash; the mono spec-22 reference)\n"
+                 "  interactive playback also plays the contact rings through the audio\n"
+                 "  device live, stereo-panned and attenuated from the camera view\n"
                  "  keys: SPACE pause  +/- rate  R restart  ESC quit  drag pan  wheel zoom"
                  "  WASD pan\n");
 }
@@ -1232,6 +1451,26 @@ int main(int argc, char** argv) {
             std::printf("audio: contacts=%" PRIu64 " wav=%s hash=%016" PRIx64 "\n",
                         total_contacts, wav_path, digest);
         }
+
+#if defined(__APPLE__)
+        const StreamFrame& final_frame = stream.frames.back();
+        RealtimeAudio audio;
+        bool audio_running = false;
+        if (!frames_requested && total_contacts > 0) {
+            audio_running = audio.start();
+            if (audio_running) {
+                std::printf("audio: realtime stereo output open (65536 Hz, %d voices)\n",
+                            RealtimeAudio::kVoiceCount);
+            } else {
+                std::fprintf(stderr, "audio: realtime output unavailable; continuing silent\n");
+            }
+        }
+#else
+        if (!frames_requested && total_contacts > 0) {
+            std::fprintf(stderr,
+                         "audio: realtime output requires macOS CoreAudio; continuing silent\n");
+        }
+#endif
 
         configure_macos_moltenvk_environment();
 
@@ -1643,6 +1882,10 @@ int main(int argc, char** argv) {
                                        sizeof(BodyInstance),
                                    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, true,
                                    v.body_instance_buffers[slot]);
+                create_host_buffer(v.physical_device, v.device, nullptr,
+                                   static_cast<VkDeviceSize>(kMaxFlashes) * sizeof(BodyInstance),
+                                   VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, true,
+                                   v.contact_instance_buffers[slot]);
             }
         }
 
@@ -1671,6 +1914,7 @@ int main(int argc, char** argv) {
         double time_sum = 0.0;
         uint32_t timed_frames = 0;
         uint32_t frame_number = 0;
+        std::vector<ContactFlash> flashes;
 
         while (frames_requested ? (frame_number < frame_limit)
                                 : (glfwWindowShouldClose(window) != GLFW_TRUE)) {
@@ -1691,6 +1935,10 @@ int main(int argc, char** argv) {
                     tick_index = 0;
                     subframe = 0;
                     tick_changed = true;
+                    flashes.clear();
+#if defined(__APPLE__)
+                    audio.reset();
+#endif
                 }
                 r_was_down = r_down;
 
@@ -1737,6 +1985,18 @@ int main(int argc, char** argv) {
                 }
             }
 
+            if (!flashes.empty() && !paused) {
+                const float ticks_per_frame =
+                    frames_requested ? 1.0f : 1.0f / static_cast<float>(frames_per_tick);
+                const float decay = ticks_per_frame / kFlashTicks;
+                for (ContactFlash& flash : flashes) flash.t += decay;
+                flashes.erase(std::remove_if(flashes.begin(), flashes.end(),
+                                             [](const ContactFlash& flash) {
+                                                 return flash.t >= 1.0f;
+                                             }),
+                              flashes.end());
+            }
+
             const StreamFrame& frame = stream.frames[tick_index];
 
             if (state.resized) {
@@ -1767,8 +2027,32 @@ int main(int argc, char** argv) {
             // guarantees the frame-before-last retired, so this slot's bytes
             // are no longer in flight.
             GpuBuffer& instance_slot = v.body_instance_buffers[frame_number & 1];
+            GpuBuffer& flash_slot = v.contact_instance_buffers[frame_number & 1];
+            if (!flashes.empty()) {
+                fill_flash_instances(flashes, static_cast<BodyInstance*>(flash_slot.mapped));
+            }
             if (tick_changed) {
                 fill_body_instances(frame, static_cast<BodyInstance*>(instance_slot.mapped));
+                for (const StreamContact& c : frame.contacts) {
+                    ContactFlash flash;
+                    flash.x = static_cast<float>(c.cx);
+                    flash.y = static_cast<float>(c.cy);
+                    flash.half_extent =
+                        std::max(body_half_extent(frame.bodies[c.a].mass),
+                                 body_half_extent(frame.bodies[c.b].mass)) *
+                        1.4f;
+                    if (flashes.size() >= kMaxFlashes) flashes.erase(flashes.begin());
+                    flashes.push_back(flash);
+#if defined(__APPLE__)
+                    if (audio_running) {
+                        f64 gl = 1.0, gr = 1.0;
+                        contact_gains(state.camera, state.fb_width, state.fb_height, c.cx, c.cy,
+                                      gl, gr);
+                        audio.spawn_contact(c, final_frame.bodies[c.a].mass,
+                                            final_frame.bodies[c.b].mass, gl, gr);
+                    }
+#endif
+                }
                 ticks_shown += 1;
                 std::printf("tick %" PRIu64 " bodies=%zu fine=%" PRIu64 " coarse=%" PRIu64 "\n",
                             frame.tick, frame.bodies.size(), frame.fine, frame.coarse);
@@ -1851,6 +2135,15 @@ int main(int argc, char** argv) {
                                sizeof(ViewPush), &body_push);
             vkCmdDraw(v.command_buffer, 4, static_cast<uint32_t>(frame.bodies.size()), 0, 0);
 
+            if (!flashes.empty()) {
+                vkCmdBindVertexBuffers(v.command_buffer, 1, 1, &flash_slot.buffer, &offsets[1]);
+                const ViewPush flash_push = compute_view_push(state.camera, v.extent, 0.15f);
+                vkCmdPushConstants(v.command_buffer, v.pipeline_layout,
+                                   VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(ViewPush),
+                                   &flash_push);
+                vkCmdDraw(v.command_buffer, 4, static_cast<uint32_t>(flashes.size()), 0, 0);
+            }
+
             vkCmdEndRenderPass(v.command_buffer);
             result = vkEndCommandBuffer(v.command_buffer);
             if (result != VK_SUCCESS) throw std::runtime_error("vkEndCommandBuffer failed");
@@ -1909,6 +2202,10 @@ int main(int argc, char** argv) {
                 }
             }
         }
+
+#if defined(__APPLE__)
+        audio.stop();
+#endif
 
         const double avg_ms = timed_frames > 0 ? time_sum / timed_frames : 0.0;
         const StreamFrame& last_frame = stream.frames[tick_index];
