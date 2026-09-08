@@ -1,3 +1,4 @@
+#include <cerrno>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
