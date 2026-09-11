@@ -132,10 +132,7 @@ bool try_lod_group(uint gi) {
     return true;
 }
 
-void main() {
-    uint id = gl_GlobalInvocationID.x;
-    if (id >= cull_visible_count) return;
-
+void select_instance(uint id) {
     uint inst_idx = visible_indices[id];
     uint root = instance_data[inst_idx * INSTANCE_W + 25u];
 
@@ -195,5 +192,19 @@ void main() {
         for (uint c = 0u; c < child_count && sp < 2048; c++) {
             stack[sp++] = first_child + c;
         }
+    }
+}
+
+void main() {
+    // Serial instance loop: one invocation walks visible instances in order,
+    // so the atomicAdd draw slots are assigned in program order and the draw
+    // list is input-order-defined on every scheduler. (This shader is
+    // retained but not dispatched -- the CPU path feeds the draw list. If it
+    // is revived as a PARALLEL per-instance dispatch, the atomicAdd append
+    // must first become an ordered compaction -- visibility flags + prefix
+    // scan or slot-preserving tombstones -- or cross-instance interleaving
+    // makes equal-depth output scheduling-dependent.)
+    for (uint id = 0u; id < cull_visible_count; id++) {
+        select_instance(id);
     }
 }

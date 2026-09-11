@@ -24,7 +24,9 @@ layout(set = 0, binding = 2) readonly buffer ClusterData { uint cluster_data[]; 
 layout(set = 0, binding = 3) readonly buffer LodClusterData { uint lod_cluster_data[]; };
 layout(set = 0, binding = 4) uniform sampler2D hzb_texture;
 layout(set = 0, binding = 5) writeonly buffer OutputDraws { DrawEntry output_draws[]; };
-layout(set = 0, binding = 6) buffer OutputCount { uint output_count; };
+// Word 0 is the vkCmdDrawIndirectCount range (every input slot, tombstones
+// included); word 1 counts survivors for the diagnostic readback.
+layout(set = 0, binding = 6) buffer OutputCount { uint draw_total; uint survivor_count; };
 
 const uint CLUSTER_W = 28;
 const uint LOD_CLUSTER_W = 28;
@@ -36,6 +38,9 @@ vec4 project(vec3 p) {
 void main() {
     uint id = gl_GlobalInvocationID.x;
     if (id >= input_draw_count) return;
+    if (id == 0u) {
+        draw_total = input_draw_count;
+    }
 
     DrawEntry entry = input_draws[id];
 
@@ -79,8 +84,8 @@ void main() {
 
     // If any corner is behind camera, conservatively pass
     if (any_behind) {
-        uint slot = atomicAdd(output_count, 1u);
-        output_draws[slot] = entry;
+        output_draws[id] = entry;
+        atomicAdd(survivor_count, 1u);
         return;
     }
 
@@ -120,12 +125,23 @@ void main() {
         }
     }
 
-    // If cluster's nearest depth is behind the HZB depth, it's occluded
+    // Deterministic compaction-free emission: survivors stay at their INPUT
+    // slot (entry untouched -- draw_first_instance already equals that index,
+    // which the vertex shader resolves via gl_InstanceIndex), rejected
+    // entries become zero-vertex tombstones at their own slot. draw_total,
+    // not a compacted count, drives vkCmdDrawIndirectCount, so the draw
+    // sequence is input-order-defined regardless of invocation scheduling;
+    // the cost is one no-op zero-vertex draw per rejected entry. A compacted
+    // layout with the same guarantee needs a visibility-flags + prefix-scan
+    // pass; with LESS depth and geometry-id coloring, an atomicAdd append
+    // made equal-depth output scheduling-dependent.
     if (min_depth > hzb_depth) {
+        DrawEntry tombstone = entry;
+        tombstone.draw_vertex_count = 0u;
+        output_draws[id] = tombstone;
         return; // occluded
     }
 
-    // Passed -- emit to output
-    uint slot = atomicAdd(output_count, 1u);
-    output_draws[slot] = entry;
+    output_draws[id] = entry;
+    atomicAdd(survivor_count, 1u);
 }

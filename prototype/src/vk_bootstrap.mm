@@ -1616,7 +1616,7 @@ void record_occlusion_refine_pass(VkCommandBuffer cmd,
                                   const HzbContext& hzb,
                                   const ComputeSelectionContext& compute_selection,
                                   const CameraFrameData& camera_frame) {
-    vkCmdFillBuffer(cmd, occlusion_refine.output_count.buffer, 0, sizeof(uint32_t), 0);
+    vkCmdFillBuffer(cmd, occlusion_refine.output_count.buffer, 0, 2 * sizeof(uint32_t), 0);
 
     VkMemoryBarrier fill_bar{};
     fill_bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -1987,8 +1987,11 @@ VkResult record_debug_command_buffer(FrameContext& frame, const DebugRenderConte
             compute_selection.draw_count.buffer != VK_NULL_HANDLE) {
             if (has_draw_indirect_count) {
                 // With GPU-side draw counts the occlusion-refined list can be
-                // consumed directly; vkCmdDrawIndirectCount reads the survivor
-                // count from the buffer the compute pass wrote.
+                // consumed directly; vkCmdDrawIndirectCount reads word 0 of
+                // the count buffer (input count -- survivors keep their input
+                // slot and rejected entries are zero-vertex tombstones, so
+                // the draw order is input-order-defined and the extra draws
+                // are no-ops).
                 const bool use_occlusion_output = frame_index > 0 &&
                     occlusion_refine.output_draws.buffer != VK_NULL_HANDLE &&
                     occlusion_refine.output_count.buffer != VK_NULL_HANDLE;
@@ -3931,11 +3934,15 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
             }
         }
         if (occlusion_refine.output_count.buffer != VK_NULL_HANDLE) {
+            // [0] = draw range (input count, tombstones included), [1] = survivors.
+            uint32_t occ_counts[2] = {0, 0};
             void* mapped = nullptr;
-            if (vkMapMemory(device, occlusion_refine.output_count.memory, 0, sizeof(uint32_t), 0, &mapped) == VK_SUCCESS) {
-                report.compute_occlusion_surviving_draws = *static_cast<const uint32_t*>(mapped);
+            if (vkMapMemory(device, occlusion_refine.output_count.memory, 0,
+                            sizeof(occ_counts), 0, &mapped) == VK_SUCCESS) {
+                std::memcpy(occ_counts, mapped, sizeof(occ_counts));
                 vkUnmapMemory(device, occlusion_refine.output_count.memory);
             }
+            report.compute_occlusion_surviving_draws = occ_counts[1];
         }
         // Screenshot capture (raw PPM; extension is forced to .ppm so the
         // container always matches the bytes). The target image is acquired

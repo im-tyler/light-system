@@ -91,11 +91,14 @@ VkResult create_occlusion_refine_context(VkPhysicalDevice physical_device, VkDev
                                    context.output_draws);
     if (result != VK_SUCCESS) return result;
 
-    const uint32_t zero = 0;
-    result = create_uploaded_buffer(physical_device, device, &zero, sizeof(uint32_t),
-                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                                   VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
-                                   context.output_count);
+    // Two words: [0] = draw range for vkCmdDrawIndirectCount (input count;
+    // rejected slots are zero-vertex tombstones), [1] = survivor count for
+    // the diagnostic readback.
+    const uint32_t zeros[2] = {0, 0};
+    result = create_uploaded_buffer(physical_device, device, zeros, sizeof(zeros),
+                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+                                    context.output_count);
     if (result != VK_SUCCESS) return result;
 
     // Descriptor pool
