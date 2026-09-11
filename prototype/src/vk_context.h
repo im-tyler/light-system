@@ -188,6 +188,15 @@ struct OcclusionRefineContext {
     VkDescriptorSetLayout descriptor_set_layout = VK_NULL_HANDLE;
     VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
     VkImageView hzb_full_view = VK_NULL_HANDLE;
+    // Conservative fallback for frames where the previous frame's HZB does
+    // not match the current camera/scene (see the temporal validity check in
+    // the frame loop): a 1x1 image cleared to far depth. Sampling it never
+    // rejects, so binding it in place of the stale HZB keeps the refine pass
+    // correct (over-emits for one frame) with zero shader branches.
+    VkDescriptorSet fallback_descriptor_set = VK_NULL_HANDLE;
+    VkImageView fallback_hzb_view = VK_NULL_HANDLE;
+    VkImage fallback_hzb_image = VK_NULL_HANDLE;
+    VkDeviceMemory fallback_hzb_memory = VK_NULL_HANDLE;
     UploadedBuffer output_draws;
     UploadedBuffer output_count;
     uint32_t max_draws = 0;
@@ -257,6 +266,7 @@ VkResult create_occlusion_refine_context(VkPhysicalDevice physical_device, VkDev
                                           const UploadedSceneBuffers& scene_buffers,
                                           const HzbContext& hzb,
                                           uint32_t max_draws,
+                                          VkQueue init_queue, uint32_t init_queue_family,
                                           OcclusionRefineContext& context);
 
 VkResult create_shadow_context(VkPhysicalDevice physical_device, VkDevice device,

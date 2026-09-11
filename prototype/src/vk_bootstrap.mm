@@ -645,6 +645,9 @@ void destroy_occlusion_refine_context(VkDevice device, OcclusionRefineContext& c
     if (context.descriptor_pool != VK_NULL_HANDLE) vkDestroyDescriptorPool(device, context.descriptor_pool, nullptr);
     if (context.descriptor_set_layout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(device, context.descriptor_set_layout, nullptr);
     if (context.hzb_full_view != VK_NULL_HANDLE) vkDestroyImageView(device, context.hzb_full_view, nullptr);
+    if (context.fallback_hzb_view != VK_NULL_HANDLE) vkDestroyImageView(device, context.fallback_hzb_view, nullptr);
+    if (context.fallback_hzb_image != VK_NULL_HANDLE) vkDestroyImage(device, context.fallback_hzb_image, nullptr);
+    if (context.fallback_hzb_memory != VK_NULL_HANDLE) vkFreeMemory(device, context.fallback_hzb_memory, nullptr);
     if (context.pipeline != VK_NULL_HANDLE) vkDestroyPipeline(device, context.pipeline, nullptr);
     if (context.pipeline_layout != VK_NULL_HANDLE) vkDestroyPipelineLayout(device, context.pipeline_layout, nullptr);
     context = {};
@@ -1615,7 +1618,8 @@ void record_occlusion_refine_pass(VkCommandBuffer cmd,
                                   const OcclusionRefineContext& occlusion_refine,
                                   const HzbContext& hzb,
                                   const ComputeSelectionContext& compute_selection,
-                                  const CameraFrameData& camera_frame) {
+                                  const CameraFrameData& camera_frame,
+                                  bool temporal_hzb_valid) {
     vkCmdFillBuffer(cmd, occlusion_refine.output_count.buffer, 0, 2 * sizeof(uint32_t), 0);
 
     VkMemoryBarrier fill_bar{};
@@ -1627,15 +1631,22 @@ void record_occlusion_refine_pass(VkCommandBuffer cmd,
                          0, nullptr, 0, nullptr);
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, occlusion_refine.pipeline);
+    // Temporally invalid frames bind the 1x1 far-depth fallback instead of
+    // the previous frame's HZB (stale camera/scene pairing): sampling max
+    // depth never rejects, so the pass conservatively keeps everything.
+    // Dims must match the bound image -- the shader derives its mip and
+    // footprint math from them.
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                             occlusion_refine.pipeline_layout, 0, 1,
-                            &occlusion_refine.descriptor_set, 0, nullptr);
+                            temporal_hzb_valid ? &occlusion_refine.descriptor_set
+                                               : &occlusion_refine.fallback_descriptor_set,
+                            0, nullptr);
 
     OcclusionPushConstants occ_push{};
     std::memcpy(occ_push.view_projection, camera_frame.view_projection.m,
                 sizeof(occ_push.view_projection));
-    occ_push.hzb_width = hzb.width;
-    occ_push.hzb_height = hzb.height;
+    occ_push.hzb_width = temporal_hzb_valid ? hzb.width : 1;
+    occ_push.hzb_height = temporal_hzb_valid ? hzb.height : 1;
     vkCmdPushConstants(cmd, occlusion_refine.pipeline_layout,
                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(OcclusionPushConstants), &occ_push);
 
@@ -1805,16 +1816,17 @@ VkResult record_debug_command_buffer(FrameContext& frame, const DebugRenderConte
                                       const CameraFrameData& camera_frame,
                                       const FrustumPlanes& frustum,
                                       float error_threshold,
-                                      const TraversalSelection& selection,
-                                      const UploadableScene& scene,
-                                       uint32_t frame_index,
-                                       uint32_t image_index,
-                                       bool has_draw_indirect_count,
+                                       const TraversalSelection& selection,
+                                       const UploadableScene& scene,
+                                        uint32_t frame_index,
+                                        uint32_t image_index,
+                                        bool has_draw_indirect_count,
                                         uint32_t shadow_draw_count,
                                         const DrawBucket* shadow_buckets,
                                         const DrawBucket* main_buckets,
                                         const GpuProfiler& profiler,
-                                        bool capture_visibility) {
+                                        bool capture_visibility,
+                                        bool temporal_hzb_valid) {
     VkCommandBufferBeginInfo begin_info{};
     begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     VkResult result = vkBeginCommandBuffer(frame.command_buffer, &begin_info);
@@ -1866,7 +1878,8 @@ VkResult record_debug_command_buffer(FrameContext& frame, const DebugRenderConte
                             profiler.query_pool, 4); // occ start
     }
 
-    // Occlusion refinement pass (uses previous frame's HZB; skip frame 0).
+    // Occlusion refinement pass (uses previous frame's HZB when temporally
+    // valid; the 1x1 far-depth fallback otherwise; skip frame 0).
     // Only the drawIndirectCount path can consume the GPU-written survivor
     // list; on the fallback (MoltenVK) the CPU-folded list is drawn directly
     // and this pass is dead per-frame work, so it runs once in the
@@ -1875,7 +1888,7 @@ VkResult record_debug_command_buffer(FrameContext& frame, const DebugRenderConte
         occlusion_refine.pipeline != VK_NULL_HANDLE &&
         occlusion_refine.descriptor_set != VK_NULL_HANDLE) {
         record_occlusion_refine_pass(frame.command_buffer, occlusion_refine, hzb,
-                                     compute_selection, camera_frame);
+                                     compute_selection, camera_frame, temporal_hzb_valid);
     }
 
     if (profiler.query_pool != VK_NULL_HANDLE) {
@@ -2113,8 +2126,11 @@ VkResult submit_diagnostic_epilogue(VkDevice device, VkQueue queue, FrameContext
     if (need_occ) {
         record_hzb_build_pass(frame.command_buffer, hzb, debug_render.depth_image,
                               VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        // Same-frame pairing: this HZB was just rebuilt from the final
+        // frame's depth with the final camera, so temporal validity does not
+        // apply here.
         record_occlusion_refine_pass(frame.command_buffer, occlusion_refine, hzb,
-                                     compute_selection, camera_frame);
+                                     compute_selection, camera_frame, true);
     }
     if (need_copy) {
         record_visibility_copy_pass(frame.command_buffer, debug_render, swapchain.extent);
@@ -2708,6 +2724,25 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
         }
 
         const std::vector<uint8_t> initial_resident_pages = build_resident_page_mask(residency_model);
+
+        // Temporal HZB validity (the refine pass binds the previous frame's
+        // HZB while pushing the current camera's view-projection). The pair
+        // is valid only while the view-projection is bitwise identical to
+        // the previous frame's AND the scene did not change under it:
+        // matrices here are products of the same inputs through the same
+        // deterministic float ops, so exact equality is the correct test --
+        // any real camera/resident-set change produces different bytes, and
+        // an epsilon would wrongly validate matrices built from moved eyes.
+        // Scene changes are coarsely tracked as the resident page mask;
+        // every mutation site (streaming completions, failures, evictions)
+        // lands in the mask before the next frame's draw list is built.
+        // has_history additionally covers swapchain recreation, where the
+        // recreated HZB carries no usable previous-frame content.
+        Mat4f temporal_hzb_last_view_projection;
+        uint64_t temporal_hzb_last_generation = 0;
+        bool temporal_hzb_has_history = false;
+        uint64_t scene_generation = 0;
+        std::vector<uint8_t> previous_resident_mask = initial_resident_pages;
         // Resolve the LOD selection threshold. A negative config value means
         // auto: a fixed multiple of the scene's median LOD-group geometric
         // error, floored at the historical 0.001 default. The multiple is
@@ -2837,7 +2872,9 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
             }
             r = create_occlusion_refine_context(selection.physical_device, device,
                                                 compute_selection, scene_buffers, hzb,
-                                                total_clusters, occlusion_refine);
+                                                total_clusters, graphics_queue,
+                                                selection.queues.graphics_family,
+                                                occlusion_refine);
             if (r != VK_SUCCESS) {
                 return r;
             }
@@ -2886,6 +2923,8 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
             destroy_hzb_context(device, hzb);
             destroy_debug_render_context(device, debug_render);
             destroy_swapchain(device, swapchain);
+            // The recreated HZB carries no usable previous-frame content.
+            temporal_hzb_has_history = false;
             VkResult r =
                 create_swapchain(selection.physical_device, device, surface, window,
                                  selection.queues, swapchain);
@@ -3088,6 +3127,12 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
             using clock_t = std::chrono::steady_clock;
             auto t_traverse_start = clock_t::now();
             const std::vector<uint8_t> resident_pages = build_resident_page_mask(residency_model);
+            if (resident_pages != previous_resident_mask) {
+                // Any page becoming resident or evicted changes what the
+                // next draw list renders; the HZB lags one frame behind.
+                scene_generation += 1;
+                previous_resident_mask = resident_pages;
+            }
             // Shadow caster LOD: casters come from a second traversal at a
             // coarser error threshold. Shadow maps are depth-only and filtered
             // (2048px cascades + 8-tap PCF), so silhouette detail far below the
@@ -3763,6 +3808,12 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
             // last-frame signal exists there).
             const bool capture_visibility =
                 config.interactive || (frame_index + 1 == config.present_frame_count);
+            const bool temporal_hzb_valid =
+                frame_index >= 2 && temporal_hzb_has_history &&
+                scene_generation == temporal_hzb_last_generation &&
+                std::memcmp(camera_frame.view_projection.m,
+                            temporal_hzb_last_view_projection.m,
+                            sizeof(temporal_hzb_last_view_projection.m)) == 0;
             result = record_debug_command_buffer(frame, debug_render, compute_cull, compute_selection,
                                                  hzb, occlusion_refine, shadow, swapchain,
                                                  camera_frame, frustum, error_threshold,
@@ -3770,7 +3821,7 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
                                                  frame_index, image_index,
                                                  has_draw_indirect_count, shadow_draw_count,
                                                  shadow_buckets, main_buckets, gpu_profiler,
-                                                 capture_visibility);
+                                                 capture_visibility, temporal_hzb_valid);
             auto t_cmdrec_end = clock_t::now();
             acc_cmdrec_ms +=
                 std::chrono::duration<double, std::milli>(t_cmdrec_end - t_cmdrec_start).count();
@@ -3830,6 +3881,12 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
                 cleanup();
                 return report;
             }
+
+            // This frame's HZB build (recorded above) is what the next
+            // frame's refine pass will bind; remember the pairing inputs.
+            temporal_hzb_last_view_projection = camera_frame.view_projection;
+            temporal_hzb_last_generation = scene_generation;
+            temporal_hzb_has_history = true;
 
             VkSemaphore present_wait_semaphore =
                 image_index < frame.render_finished_per_image.size()
