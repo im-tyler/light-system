@@ -37,8 +37,12 @@ constexpr std::array<char, 4> kMagic = {'V', 'G', 'E', 'O'};
 // v5: cull_sphere[4] appended to cluster + LOD-cluster records (bounding
 // sphere for the radius-compensated normal-cone cull). Readers loading v3/v4
 // files synthesize the sphere from the cluster AABB.
-constexpr uint32_t kSchemaVersion = 5;
-constexpr uint32_t kBuilderVersion = 2;
+// v6: content_fingerprint in the file header -- 64-bit FNV-1a over the
+// payload bytes and the page layout, so the persisted-.vgeo fast path can
+// reject a cache whose content does not match the freshly built resource
+// (versions/counts/byte-totals alone cannot).
+constexpr uint32_t kSchemaVersion = 6;
+constexpr uint32_t kBuilderVersion = 3;
 constexpr uint32_t kPageFlagLodPayload = 1u << 0;
 constexpr uint32_t kFileFlagHasFallback = 1u << 0;
 constexpr uint32_t kFileFlagTextured = 1u << 1;
@@ -73,6 +77,8 @@ struct FileHeader {
     uint64_t lod_group_base_run_table_offset;
     uint64_t cluster_geometry_payload_offset;
     uint64_t lod_geometry_payload_offset;
+    // v6: see kSchemaVersion. Zero in files written before v6.
+    uint64_t content_fingerprint;
 };
 
 struct SummaryBlockDisk {
@@ -363,6 +369,7 @@ void build_lod_metadata(VGeoResource& resource, const MeshData& mesh, const Buil
 void build_page_dependencies(VGeoResource& resource);
 
 void validate_resource(const VGeoResource& resource);
+uint64_t compute_content_fingerprint(const VGeoResource& resource);
 TraversalSelection simulate_traversal(const VGeoResource& resource, float error_threshold,
                                        const std::vector<uint8_t>& resident_pages,
                                        ParallelExecutor* executor = nullptr);

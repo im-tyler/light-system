@@ -163,6 +163,53 @@ ResourceSummary read_resource_summary(const std::filesystem::path& input_path) {
     return summary;
 }
 
+// 64-bit FNV-1a over the payload bytes and the page layout (fields hashed
+// individually: PageRecord contains alignment padding between page_index and
+// byte_offset that would leak uninitialized bytes into a raw-struct hash).
+// The persisted-.vgeo acceptance check recomputes this from the freshly
+// built resource -- versions/counts/byte-totals alone cannot distinguish two
+// builds whose payloads differ, and the streaming path would then mmap a
+// file whose bytes do not match the resource the GPU was assembled from.
+uint64_t compute_content_fingerprint(const VGeoResource& resource) {
+    uint64_t hash = 1469598103934665603ull;
+    const auto mix_bytes = [&hash](const std::byte* data, size_t size) {
+        for (size_t i = 0; i < size; ++i) {
+            hash ^= static_cast<uint64_t>(data[i]);
+            hash *= 1099511628211ull;
+        }
+    };
+    const auto mix_u64 = [&hash](uint64_t value) {
+        for (int i = 0; i < 8; ++i) {
+            hash ^= (value >> (i * 8)) & 0xffull;
+            hash *= 1099511628211ull;
+        }
+    };
+    const auto mix_payload = [&](const std::vector<std::byte>& payload) {
+        mix_u64(payload.size());
+        if (!payload.empty()) {
+            mix_bytes(payload.data(), payload.size());
+        }
+    };
+    mix_u64(resource.pages.size());
+    for (const PageRecord& page : resource.pages) {
+        mix_u64(page.page_index);
+        mix_u64(page.byte_offset);
+        mix_u64(page.compressed_byte_size);
+        mix_u64(page.uncompressed_byte_size);
+        mix_u64(page.first_cluster_index);
+        mix_u64(page.cluster_count);
+        mix_u64(page.first_lod_cluster_index);
+        mix_u64(page.lod_cluster_count);
+        mix_u64(page.dependency_page_start);
+        mix_u64(page.dependency_page_count);
+        mix_u64(page.flags);
+    }
+    mix_payload(resource.cluster_geometry_payload);
+    mix_payload(resource.lod_geometry_payload);
+    mix_payload(resource.texture_payload);
+    return hash;
+}
+
 void write_resource(const VGeoResource& resource, const std::filesystem::path& output_path) {
     if (!output_path.parent_path().empty()) {
         std::filesystem::create_directories(output_path.parent_path());
@@ -230,6 +277,7 @@ void write_resource(const VGeoResource& resource, const std::filesystem::path& o
     header.lod_group_base_run_table_offset = lod_group_base_run_table_offset;
     header.cluster_geometry_payload_offset = cluster_geometry_payload_offset;
     header.lod_geometry_payload_offset = lod_geometry_payload_offset;
+    header.content_fingerprint = compute_content_fingerprint(resource);
 
     ResourceMetadata metadata = resource.metadata;
     metadata.material_mapping_offset = material_table_offset;
