@@ -249,6 +249,7 @@ VkResult create_compute_selection_context(VkPhysicalDevice physical_device, VkDe
 VkResult create_hzb_context(VkPhysicalDevice physical_device, VkDevice device,
                             uint32_t width, uint32_t height,
                             VkImageView depth_view, VkFormat depth_format,
+                            VkQueue init_queue, uint32_t init_queue_family,
                             HzbContext& context);
 
 VkResult create_occlusion_refine_context(VkPhysicalDevice physical_device, VkDevice device,

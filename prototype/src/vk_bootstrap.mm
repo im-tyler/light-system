@@ -2809,7 +2809,8 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             }
             r = create_hzb_context(selection.physical_device, device,
                                    swapchain.extent.width, swapchain.extent.height,
-                                   debug_render.depth_view, debug_render.depth_format, hzb);
+                                   debug_render.depth_view, debug_render.depth_format,
+                                   graphics_queue, selection.queues.graphics_family, hzb);
             if (r != VK_SUCCESS) {
                 return r;
             }
