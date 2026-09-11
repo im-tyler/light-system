@@ -14,15 +14,23 @@ void main() {
     ivec2 dst_size = imageSize(dst_mip);
     if (dst_coord.x >= dst_size.x || dst_coord.y >= dst_size.y) return;
 
-    // Sample 4 texels from the source mip
-    vec2 src_uv = (vec2(dst_coord) * 2.0 + 1.0) / vec2(params.src_width, params.src_height);
-    vec2 texel = 1.0 / vec2(params.src_width, params.src_height);
+    // Mip extents are floor(src/2), so a fixed 2x2 tap grid never covers odd
+    // source edges (src 5 -> dst 2 leaves source column 4 unsampled; a lost
+    // far-depth texel breaks conservative rejection). Instead reduce over the
+    // exact footprint this destination texel represents: src range
+    // [floor(d*S/D), floor((d+1)*S/D)-1] per axis. Each source texel maps to
+    // exactly one destination texel, footprints span 2..3 texels per axis at
+    // odd edges (S/D <= 2 + rounding under floor halving), and the reduce
+    // stays a pure max over covered texels.
+    ivec2 src_size = ivec2(params.src_width, params.src_height);
+    ivec2 base = (dst_coord * src_size) / dst_size;
+    ivec2 end = min(((dst_coord + 1) * src_size) / dst_size - 1, src_size - 1);
 
-    float d00 = texture(src_mip, src_uv + vec2(-0.25, -0.25) * texel).r;
-    float d10 = texture(src_mip, src_uv + vec2( 0.25, -0.25) * texel).r;
-    float d01 = texture(src_mip, src_uv + vec2(-0.25,  0.25) * texel).r;
-    float d11 = texture(src_mip, src_uv + vec2( 0.25,  0.25) * texel).r;
-
-    float max_depth = max(max(d00, d10), max(d01, d11));
+    float max_depth = 0.0;
+    for (int y = base.y; y <= end.y; ++y) {
+        for (int x = base.x; x <= end.x; ++x) {
+            max_depth = max(max_depth, texelFetch(src_mip, ivec2(x, y), 0).r);
+        }
+    }
     imageStore(dst_mip, dst_coord, vec4(max_depth));
 }
