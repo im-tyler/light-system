@@ -1,5 +1,11 @@
 #include "builder_internal.h"
 
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <chrono>
+#include <cstdio>
+
 namespace meridian::detail {
 
 MaterialSectionDisk to_disk(const MaterialSection& section) {
@@ -215,9 +221,18 @@ void write_resource(const VGeoResource& resource, const std::filesystem::path& o
         std::filesystem::create_directories(output_path.parent_path());
     }
 
-    std::ofstream output(output_path, std::ios::binary);
+    // Publish by atomic rename, never by truncating the destination in
+    // place: a concurrent reader (the viewer mmaps the published .vgeo and
+    // streams pages from it) holding the old file keeps seeing the complete
+    // old generation -- an in-place truncate hands it a shrinking file whose
+    // header is gone mid-read. Generations are immutable once published.
+    const std::filesystem::path temp_path =
+        output_path.parent_path() /
+        (output_path.filename().string() + ".tmp-" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::ofstream output(temp_path, std::ios::binary);
     if (!output) {
-        throw BuilderError("failed to open output file: " + output_path.string());
+        throw BuilderError("failed to open output file: " + temp_path.string());
     }
 
     const uint64_t metadata_offset = sizeof(FileHeader) + sizeof(SummaryBlockDisk);
@@ -342,6 +357,25 @@ void write_resource(const VGeoResource& resource, const std::filesystem::path& o
     if (!resource.texture_payload.empty()) {
         output.write(reinterpret_cast<const char*>(resource.texture_payload.data()),
                      static_cast<std::streamsize>(resource.texture_payload.size()));
+    }
+    output.close();
+    if (!output) {
+        std::error_code remove_ec;
+        std::filesystem::remove(temp_path, remove_ec);
+        throw BuilderError("failed to write output file: " + temp_path.string());
+    }
+    // Durability before visibility: fsync the temp file so the published
+    // name never resolves to a generation that a crash could truncate, then
+    // rename() over the destination (atomic replace on POSIX).
+    const int fd = ::open(temp_path.c_str(), O_RDONLY);
+    if (fd >= 0) {
+        ::fsync(fd);
+        ::close(fd);
+    }
+    if (::rename(temp_path.c_str(), output_path.c_str()) != 0) {
+        std::error_code remove_ec;
+        std::filesystem::remove(temp_path, remove_ec);
+        throw BuilderError("failed to publish output file: " + output_path.string());
     }
 }
 
