@@ -374,7 +374,12 @@ VkResult create_debug_render_context(VkPhysicalDevice physical_device, VkDevice 
     depth_attachment.format = context.depth_format;
     depth_attachment.samples = VK_SAMPLE_COUNT_1_BIT;
     depth_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    // Depth is sampled by the HZB build after the render pass ends (per-frame
+    // drawIndirectCount path and the diagnostic epilogue both read
+    // debug_render.depth_image), so DONT_CARE here leaves the HZB sourcing
+    // undefined (tile-memory discard on tilers). Both pass variants inherit
+    // this description; stencil is never read and stays DONT_CARE.
+    depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     depth_attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     depth_attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     depth_attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
