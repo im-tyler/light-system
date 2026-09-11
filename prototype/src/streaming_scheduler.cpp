@@ -35,6 +35,21 @@ ResidencyUpdateInput update_streaming_scheduler(StreamingScheduler& scheduler,
         }
     }
 
+    // Missing pages: direct demand (geometry the traversal wants to render
+    // whose page is not resident). They never appear in selected_page_indices
+    // -- the traversal only records pages it confirmed resident -- so without
+    // an explicit score they starve: the load queue admits priority > 0 only,
+    // and the demand-streaming caller replaces step_residency's missing list
+    // with that queue. Scored under resident retention (1.0) and above
+    // prefetch (0.5) so demand always beats speculation for load slots; the
+    // traversal re-emits them every frame while non-resident, which also
+    // re-arms the request after an eviction.
+    for (uint32_t page : selection.missing_page_indices) {
+        if (page < scheduler.page_count && priorities[page] < 0.9f) {
+            priorities[page] = 0.9f;
+        }
+    }
+
     // Prefetch pages: medium priority
     for (uint32_t page : selection.prefetch_page_indices) {
         if (page < scheduler.page_count && priorities[page] < 0.5f) {
