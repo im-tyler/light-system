@@ -588,9 +588,18 @@ void build_node_lod_links(VGeoResource& resource,
 
     for (uint32_t node_index = 0; node_index < resource.hierarchy_nodes.size(); ++node_index) {
         std::vector<uint32_t>& linked = links_by_node[node_index];
+        // Total order, not error alone: LOD groups tie on geometric_error
+        // regularly (uniform simplification ladders), and std::sort is not
+        // stable, so a keyless tie would permute the link table per
+        // platform/stdlib and flip the traversal's pick. Group index (build
+        // output order) is the deterministic tiebreak.
         std::sort(linked.begin(), linked.end(), [&](uint32_t lhs, uint32_t rhs) {
-            return resource.lod_groups[lhs].geometric_error <
-                   resource.lod_groups[rhs].geometric_error;
+            const float lhs_error = resource.lod_groups[lhs].geometric_error;
+            const float rhs_error = resource.lod_groups[rhs].geometric_error;
+            if (lhs_error != rhs_error) {
+                return lhs_error < rhs_error;
+            }
+            return lhs < rhs;
         });
         linked.erase(std::unique(linked.begin(), linked.end()), linked.end());
 

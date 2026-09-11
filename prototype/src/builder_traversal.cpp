@@ -344,7 +344,10 @@ void traverse_node_selection(const VGeoResource& resource, uint32_t node_index, 
     // Pick the coarsest LOD link that meets the error threshold AND whose
     // group does not overlap already-covered clusters. We iterate in the
     // table's sorted order (ascending geometric error) and greedy-choose the
-    // last eligible one.
+    // last eligible one. Equal-error ties resolve deterministically: the
+    // link table is totally ordered by (geometric_error, group index) at
+    // build time, so the greedy pick prefers the highest group index among
+    // tied groups -- identical on every platform.
     uint32_t selected_link_index = 0xffffffffu;
     for (uint32_t link_offset = 0; link_offset < node.lod_link_count; ++link_offset) {
         const NodeLodLink& link =
