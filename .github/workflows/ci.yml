@@ -61,7 +61,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
         with:
-          repository: im-tyler/simval
+          repository: usestemframework/simval
           path: simval
       - name: Build + verify committed ontos corpora bit-for-bit
         run: |
