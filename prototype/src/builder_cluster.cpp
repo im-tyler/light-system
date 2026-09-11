@@ -698,6 +698,9 @@ void build_lod_metadata(VGeoResource& resource, const MeshData& mesh, const Buil
         clod_mesh.vertex_positions = reinterpret_cast<const float*>(mesh.positions.data());
         clod_mesh.vertex_positions_stride = sizeof(Vec3f);
         clod_mesh.vertex_lock = mesh.vertex_locks.data();
+        // clod_mesh.attribute_weights must outlive the branch below: clodBuild
+        // runs after the if/else closes, so a block-local array would dangle.
+        static constexpr float uv_weights[2] = {1.0f, 1.0f};
         if (mesh.emit_uv_payloads && !mesh.texcoords.empty()) {
             // Attribute-aware simplification: track UVs alongside positions so
             // LOD clusters keep UVs consistent with their geometry (seam
@@ -706,7 +709,6 @@ void build_lod_metadata(VGeoResource& resource, const MeshData& mesh, const Buil
             // attribute-blind so provenance signatures still match.
             clod_mesh.vertex_attributes = mesh.texcoords.data();
             clod_mesh.vertex_attributes_stride = 2 * sizeof(float);
-            const float uv_weights[2] = {1.0f, 1.0f};
             clod_mesh.attribute_weights = uv_weights;
             clod_mesh.attribute_count = 2;
         } else {
