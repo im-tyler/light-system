@@ -1,6 +1,8 @@
 #define CLUSTERLOD_IMPLEMENTATION
 #include "builder_internal.h"
 
+#include <cstdio>
+
 namespace meridian::detail {
 
 std::vector<unsigned int> extract_meshlet_global_indices(
@@ -681,7 +683,6 @@ void build_lod_metadata(VGeoResource& resource, const MeshData& mesh, const Buil
                         const std::vector<uint32_t>& source_to_runtime_cluster_indices) {
     const clodConfig config = make_clod_config(manifest);
     std::vector<LodGroupBuildInfo> lod_group_infos;
-    std::vector<std::vector<uint32_t>> group_provenance_by_index(resource.lod_groups.size());
 
     for (const MeshSection& section : mesh.sections) {
         if (section.indices.empty()) {
@@ -699,6 +700,61 @@ void build_lod_metadata(VGeoResource& resource, const MeshData& mesh, const Buil
             original_cluster_lookup.emplace(
                 make_index_signature(global_indices.data(), global_indices.size()), source_cluster_index);
         }
+
+        // Per-clodBuild state: callback groups (clodBuild invocations) do not
+        // map 1:1 onto LodGroupRecords. clod's partition() may split one
+        // predecessor group's simplified clusters across several successor
+        // callback groups; each successor inherits the predecessor's WHOLE
+        // base provenance, and the traversal's whole-unit coverage model
+        // would then suppress the siblings' base geometry after selecting
+        // only one of them (hole). Groups sharing a predecessor therefore
+        // merge into one record (union-find over callback group ids), so a
+        // record is always the complete replacement unit its provenance
+        // claims. Cluster payloads are staged per callback group and
+        // materialized into contiguous per-record spans after clodBuild.
+        struct StagedLodGroup {
+            uint32_t depth = 0;
+            Bounds3f bounds;
+            float geometric_error = 0.0f;
+            std::vector<int32_t> refined_ids;
+            std::vector<LodClusterRecord> clusters;
+        };
+        std::vector<StagedLodGroup> staged_groups;
+        std::vector<uint32_t> group_parent;
+        // provenance_by_group[g] accumulates the merged record's whole
+        // provenance on the record's root; reads go through find_root.
+        std::vector<std::vector<uint32_t>> provenance_by_group;
+        // predecessor group id -> first callback group that held children of it
+        std::vector<uint32_t> children_claim_by_group;
+
+        const auto find_root = [&](uint32_t group_id) {
+            uint32_t root = group_id;
+            while (group_parent[root] != root) {
+                root = group_parent[root];
+            }
+            while (group_parent[group_id] != root) {
+                const uint32_t next = group_parent[group_id];
+                group_parent[group_id] = root;
+                group_id = next;
+            }
+            return root;
+        };
+
+        // Union by smallest id: the root is the record's first callback
+        // group, so record order and staging order stay deterministic.
+        const auto unite_roots = [&](uint32_t lhs, uint32_t rhs) {
+            if (lhs == rhs) {
+                return lhs;
+            }
+            if (rhs < lhs) {
+                std::swap(lhs, rhs);
+            }
+            group_parent[rhs] = lhs;
+            provenance_by_group[lhs].insert(provenance_by_group[lhs].end(),
+                                            provenance_by_group[rhs].begin(),
+                                            provenance_by_group[rhs].end());
+            return lhs;
+        };
 
         clodMesh clod_mesh{};
         clod_mesh.indices = section.indices.data();
@@ -731,6 +787,7 @@ void build_lod_metadata(VGeoResource& resource, const MeshData& mesh, const Buil
         clodBuild(config, clod_mesh,
                   [&](clodGroup group, const clodCluster* clusters, size_t cluster_count) -> int {
                       std::vector<uint32_t> group_source_cluster_ids;
+                      std::vector<int32_t> refined_group_ids;
                       for (size_t i = 0; i < cluster_count; ++i) {
                           if (clusters[i].refined == -1) {
                               const auto found = original_cluster_lookup.find(
@@ -742,46 +799,164 @@ void build_lod_metadata(VGeoResource& resource, const MeshData& mesh, const Buil
                               group_source_cluster_ids.push_back(found->second);
                           } else {
                               if (clusters[i].refined < 0 ||
-                                  static_cast<size_t>(clusters[i].refined) >= group_provenance_by_index.size()) {
+                                  static_cast<size_t>(clusters[i].refined) >= provenance_by_group.size()) {
                                   throw BuilderError("lod cluster refined group index is out of provenance range");
                               }
                               const std::vector<uint32_t>& refined_provenance =
-                                  group_provenance_by_index[static_cast<size_t>(clusters[i].refined)];
+                                  provenance_by_group[find_root(static_cast<uint32_t>(clusters[i].refined))];
                               group_source_cluster_ids.insert(group_source_cluster_ids.end(),
                                                               refined_provenance.begin(),
                                                               refined_provenance.end());
+                              refined_group_ids.push_back(clusters[i].refined);
                           }
                       }
                       std::sort(group_source_cluster_ids.begin(), group_source_cluster_ids.end());
                       group_source_cluster_ids.erase(
                           std::unique(group_source_cluster_ids.begin(), group_source_cluster_ids.end()),
                           group_source_cluster_ids.end());
+                      std::sort(refined_group_ids.begin(), refined_group_ids.end());
+                      refined_group_ids.erase(
+                          std::unique(refined_group_ids.begin(), refined_group_ids.end()),
+                          refined_group_ids.end());
 
-                      LodGroupRecord lod_group;
-                      lod_group.depth = static_cast<uint32_t>(group.depth);
-                      lod_group.first_lod_cluster_index =
-                          static_cast<uint32_t>(resource.lod_clusters.size());
-                      lod_group.lod_cluster_count = static_cast<uint32_t>(cluster_count);
-                      lod_group.material_section_index = section.material_section_index;
-                      lod_group.bounds = sphere_bounds_to_aabb(group.simplified);
-                      lod_group.geometric_error = group.simplified.error;
+                      // Resolve the record this group belongs to: the union
+                      // of records that already hold children of any of its
+                      // predecessors (transitive through unite_roots when a
+                      // group straddles several claimed predecessors).
+                      uint32_t record_root = 0xffffffffu;
+                      for (const int32_t refined : refined_group_ids) {
+                          const uint32_t claim =
+                              children_claim_by_group[static_cast<uint32_t>(refined)];
+                          if (claim == 0xffffffffu) {
+                              continue;
+                          }
+                          const uint32_t claim_root = find_root(claim);
+                          record_root = record_root == 0xffffffffu
+                                            ? claim_root
+                                            : unite_roots(record_root, claim_root);
+                      }
+                      const uint32_t group_id = static_cast<uint32_t>(group_parent.size());
+                      group_parent.push_back(record_root == 0xffffffffu ? group_id : record_root);
+                      children_claim_by_group.push_back(0xffffffffu);
+                      for (const int32_t refined : refined_group_ids) {
+                          const uint32_t refined_index = static_cast<uint32_t>(refined);
+                          if (children_claim_by_group[refined_index] == 0xffffffffu) {
+                              children_claim_by_group[refined_index] = group_id;
+                          }
+                      }
+                      provenance_by_group.push_back(group_source_cluster_ids);
+                      if (record_root != 0xffffffffu) {
+                          provenance_by_group[record_root].insert(
+                              provenance_by_group[record_root].end(),
+                              group_source_cluster_ids.begin(), group_source_cluster_ids.end());
+                      }
 
-                      const uint32_t group_index = static_cast<uint32_t>(resource.lod_groups.size());
-                      resource.lod_groups.push_back(lod_group);
-                      group_provenance_by_index.push_back(group_source_cluster_ids);
-                      lod_group_infos.push_back(LodGroupBuildInfo{section.material_section_index,
-                                                                  group_source_cluster_ids});
+                      StagedLodGroup& staged = staged_groups.emplace_back();
+                      staged.depth = static_cast<uint32_t>(group.depth);
+                      staged.bounds = sphere_bounds_to_aabb(group.simplified);
+                      staged.geometric_error = group.simplified.error;
+                      staged.refined_ids = std::move(refined_group_ids);
 
+                      // group_index is 0 (and refined stays a callback-local
+                      // group id) here; both are patched to final record
+                      // indices when the staged records materialize below.
                       for (size_t i = 0; i < cluster_count; ++i) {
-                          resource.lod_clusters.push_back(append_lod_cluster_payload(
-                              mesh, clusters[i].indices, clusters[i].index_count, group_index,
+                          staged.clusters.push_back(append_lod_cluster_payload(
+                              mesh, clusters[i].indices, clusters[i].index_count, 0,
                               clusters[i].refined, section.material_section_index,
                               resource.lod_geometry_payload, clusters[i].bounds,
                               clusters[i].vertex_count));
                       }
 
-                      return static_cast<int>(group_index);
+                      return static_cast<int>(group_id);
                   });
+
+        // Materialize records: one per union-find root, in first-member
+        // (callback) order; a record's members emit contiguously so its
+        // [first, first + count) span covers the whole merged payload.
+        std::vector<uint32_t> record_of_group(staged_groups.size(), 0xffffffffu);
+        for (uint32_t g = 0; g < staged_groups.size(); ++g) {
+            if (find_root(g) != g) {
+                continue;
+            }
+            record_of_group[g] = static_cast<uint32_t>(resource.lod_groups.size());
+            LodGroupRecord lod_group;
+            lod_group.depth = staged_groups[g].depth;
+            lod_group.material_section_index = section.material_section_index;
+            lod_group.bounds = staged_groups[g].bounds;
+            lod_group.geometric_error = staged_groups[g].geometric_error;
+            resource.lod_groups.push_back(lod_group);
+        }
+
+        std::vector<std::vector<uint32_t>> members_of_root(staged_groups.size());
+        for (uint32_t g = 0; g < staged_groups.size(); ++g) {
+            members_of_root[find_root(g)].push_back(g);
+        }
+
+        uint32_t merged_group_count = 0;
+        for (uint32_t root = 0; root < staged_groups.size(); ++root) {
+            const std::vector<uint32_t>& members = members_of_root[root];
+            if (members.empty()) {
+                continue;
+            }
+            LodGroupRecord& lod_group = resource.lod_groups[record_of_group[root]];
+            lod_group.first_lod_cluster_index =
+                static_cast<uint32_t>(resource.lod_clusters.size());
+            for (const uint32_t member : members) {
+                record_of_group[member] = record_of_group[root];
+                if (member != root) {
+                    merged_group_count += 1;
+                    // The record replaces the union of its members: bounds
+                    // span every member, and eligibility waits for the worst
+                    // member's error (selecting below it would render a
+                    // member above its acceptable error).
+                    update_bounds(lod_group.bounds, staged_groups[member].bounds.min);
+                    update_bounds(lod_group.bounds, staged_groups[member].bounds.max);
+                    lod_group.geometric_error =
+                        std::max(lod_group.geometric_error, staged_groups[member].geometric_error);
+                }
+                for (LodClusterRecord& cluster : staged_groups[member].clusters) {
+                    cluster.group_index = record_of_group[root];
+                    if (cluster.refined_group_index >= 0) {
+                        cluster.refined_group_index = static_cast<int32_t>(record_of_group[find_root(
+                            static_cast<uint32_t>(cluster.refined_group_index))]);
+                    }
+                    resource.lod_clusters.push_back(cluster);
+                }
+                lod_group.lod_cluster_count +=
+                    static_cast<uint32_t>(staged_groups[member].clusters.size());
+            }
+
+            std::vector<uint32_t> provenance = std::move(provenance_by_group[root]);
+            std::sort(provenance.begin(), provenance.end());
+            provenance.erase(std::unique(provenance.begin(), provenance.end()), provenance.end());
+            lod_group_infos.push_back(
+                LodGroupBuildInfo{section.material_section_index, std::move(provenance)});
+        }
+
+        // Invariant the coverage model depends on: no predecessor group's
+        // children span more than one LodGroupRecord. The merge above
+        // guarantees it for today's clusterlod (all children of a group are
+        // emitted at exactly one depth, in level order); fail loudly if that
+        // ever changes.
+        for (uint32_t g = 0; g < staged_groups.size(); ++g) {
+            for (const int32_t refined : staged_groups[g].refined_ids) {
+                const uint32_t claim =
+                    children_claim_by_group[static_cast<uint32_t>(refined)];
+                if (claim == 0xffffffffu ||
+                    record_of_group[g] != record_of_group[find_root(claim)]) {
+                    throw BuilderError(
+                        "lod predecessor group's children span multiple lod group records");
+                }
+            }
+        }
+
+        if (merged_group_count > 0) {
+            std::fprintf(stderr,
+                         "MERIDIAN_LOD: merged %u split successor groups into shared records "
+                         "(material section %u)\n",
+                         merged_group_count, section.material_section_index);
+        }
     }
 
     build_node_lod_links(resource, lod_group_infos, source_to_runtime_cluster_indices);
