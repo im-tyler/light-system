@@ -70,7 +70,9 @@ int main(int argc, char** argv) {
 
     try {
         const meridian::BuildManifest manifest = meridian::load_manifest(manifest_path);
-        const meridian::VGeoResource resource = meridian::build_resource(manifest);
+        // Non-const: the demand-streaming runtime consumes the payload
+        // vectors once the .vgeo is mmap'd (see build_vk_bootstrap_report).
+        meridian::VGeoResource resource = meridian::build_resource(manifest);
         meridian::validate_resource(resource);
 
         meridian::VkBootstrapConfig config{};

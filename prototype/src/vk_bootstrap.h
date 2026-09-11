@@ -104,7 +104,11 @@ struct VkBootstrapReport {
     UploadableScene uploadable_scene;
 };
 
-VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
+// Non-const on purpose: the demand-streaming path drops the resource's
+// CPU-side geometry payload vectors after the .vgeo is serialized and
+// mmap'd (the file becomes the source of truth for page bytes). A const&
+// signature that mutates through const_cast is UB; this contract is honest.
+VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
                                             const VkBootstrapConfig& config);
 
 }  // namespace meridian

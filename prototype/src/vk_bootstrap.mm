@@ -2137,7 +2137,7 @@ VkResult submit_diagnostic_epilogue(VkDevice device, VkQueue queue, FrameContext
 
 }  // namespace
 
-VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
+VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
                                             const VkBootstrapConfig& config) {
     VkBootstrapReport report;
     report.uploadable_scene = build_uploadable_scene(resource);
@@ -2601,17 +2601,17 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                          stream_page_failures,
                          async_reader.mmap_active() ? "mmap" : "pread");
             // The mmap'd .vgeo is now the source of truth for page bytes;
-            // drop the CPU-side payload copies (the resource is const in
-            // this scope but owned by a non-const caller object).
+            // drop the CPU-side payload copies. build_vk_bootstrap_report
+            // takes the resource by non-const reference exactly for this
+            // consumption (see vk_bootstrap.h).
             report.uploadable_scene.base_payload.clear();
             report.uploadable_scene.base_payload.shrink_to_fit();
             report.uploadable_scene.lod_payload.clear();
             report.uploadable_scene.lod_payload.shrink_to_fit();
-            VGeoResource& mutable_resource = const_cast<VGeoResource&>(resource);
-            mutable_resource.cluster_geometry_payload.clear();
-            mutable_resource.cluster_geometry_payload.shrink_to_fit();
-            mutable_resource.lod_geometry_payload.clear();
-            mutable_resource.lod_geometry_payload.shrink_to_fit();
+            resource.cluster_geometry_payload.clear();
+            resource.cluster_geometry_payload.shrink_to_fit();
+            resource.lod_geometry_payload.clear();
+            resource.lod_geometry_payload.shrink_to_fit();
         }
 
         result = create_compute_cull_context(selection.physical_device, device, scene_buffers,
