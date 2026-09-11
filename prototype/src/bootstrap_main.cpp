@@ -135,6 +135,7 @@ int main(int argc, char** argv) {
         std::cout << "runtime_loading_pages=" << report.runtime_loading_page_count << '\n';
         std::cout << "runtime_completed_pages=" << report.runtime_completed_page_count << '\n';
         std::cout << "runtime_resident_pages=" << report.runtime_resident_page_count << '\n';
+        std::cout << "runtime_failed_pages=" << report.runtime_failed_page_count << '\n';
         std::cout << "visibility_valid_pixels=" << report.visibility_valid_pixels << '\n';
         std::cout << "visibility_unique_base_geometry=" << report.visibility_unique_base_geometry << '\n';
         std::cout << "visibility_unique_lod_geometry=" << report.visibility_unique_lod_geometry << '\n';

@@ -2398,6 +2398,7 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
         StreamingScheduler streaming_scheduler;
         uint32_t stream_pages_uploaded = 0;
         uint64_t stream_bytes_uploaded = 0;
+        uint32_t stream_page_failures = 0;
         if (config.demand_streaming) {
             for (PageResidencyEntry& entry : residency_model.pages) {
                 entry.state = PageResidencyState::unloaded;
@@ -2557,6 +2558,14 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                 if (range.size == 0) continue;
                 seed_scratch.resize(range.size);
                 if (!async_reader.read_sync(range.offset, range.size, seed_scratch.data())) {
+                    // Residency is only publishable with bytes behind it:
+                    // leave the seed page unloaded so the streaming path
+                    // re-requests it (traversal reports it missing, the
+                    // scheduler scores the demand, the async reader retries)
+                    // instead of rendering a resident page whose payload
+                    // slots were never uploaded.
+                    residency_model.pages[p].state = PageResidencyState::unloaded;
+                    stream_page_failures += 1;
                     continue;
                 }
                 const PageRecord& page = resource.pages[p];
@@ -2579,8 +2588,10 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                 stream_bytes_uploaded += range.size;
             }
             std::fprintf(stderr,
-                         "MERIDIAN_STREAM: seeded %u pages (%llu bytes) synchronously via %s\n",
+                         "MERIDIAN_STREAM: seeded %u pages (%llu bytes, %u failed) "
+                         "synchronously via %s\n",
                          seeded_pages, static_cast<unsigned long long>(stream_bytes_uploaded),
+                         stream_page_failures,
                          async_reader.mmap_active() ? "mmap" : "pread");
             // The mmap'd .vgeo is now the source of truth for page bytes;
             // drop the CPU-side payload copies (the resource is const in
@@ -3020,8 +3031,26 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                 if (async_io_active) {
                     std::vector<AsyncReadCompletion> reads = async_reader.drain_completions();
                     for (auto& r : reads) {
-                        if (!r.success) continue;
                         if (r.page_index >= residency_model.pages.size()) continue;
+                        if (!r.success) {
+                            // A failed read must not strand the page in
+                            // loading forever: drop it back to unloaded so
+                            // next frame's traversal reports it missing and
+                            // the scheduler re-requests the read (retryable
+                            // failure, surfaced below and in the report).
+                            if (residency_model.pages[r.page_index].state ==
+                                PageResidencyState::loading) {
+                                residency_model.pages[r.page_index].state =
+                                    PageResidencyState::unloaded;
+                                page_load_start_frame[r.page_index] = 0xffffffffu;
+                                stream_page_failures += 1;
+                                std::fprintf(stderr,
+                                             "MERIDIAN_STREAM: page %u read failed; "
+                                             "queued for retry\n",
+                                             r.page_index);
+                            }
+                            continue;
+                        }
                         if (residency_model.pages[r.page_index].state !=
                             PageResidencyState::loading) continue;
                         completed_this_frame.push_back(r.page_index);
@@ -3209,13 +3238,13 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
                 }
                 if (async_io_active && (frame_index % 60) == 0) {
                     std::fprintf(stderr,
-                                 "MERIDIAN_STREAM: uploads=%u pages / %llu bytes, "
-                                 "resident=%u/%u, pending_reads=%zu\n",
-                                 stream_pages_uploaded,
-                                 static_cast<unsigned long long>(stream_bytes_uploaded),
-                                 count_resident_pages(residency_model),
-                                 static_cast<uint32_t>(residency_model.pages.size()),
-                                 async_reader.pending_count());
+                                  "MERIDIAN_STREAM: uploads=%u pages / %llu bytes, "
+                                  "resident=%u/%u, pending_reads=%zu, failed_reads=%u\n",
+                                  stream_pages_uploaded,
+                                  static_cast<unsigned long long>(stream_bytes_uploaded),
+                                  count_resident_pages(residency_model),
+                                  static_cast<uint32_t>(residency_model.pages.size()),
+                                  async_reader.pending_count(), stream_page_failures);
                 }
             }
 
@@ -3243,6 +3272,7 @@ VkBootstrapReport build_vk_bootstrap_report(const VGeoResource& resource,
             report.runtime_loading_page_count =
                 static_cast<uint32_t>(residency_update.loading_pages.size());
             report.runtime_resident_page_count = count_resident_pages(residency_model);
+            report.runtime_failed_page_count = stream_page_failures;
 
             report.replay_runtime_parity =
                 report.debug_selected_node_count == report.replay_selected_node_count &&

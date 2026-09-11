@@ -80,6 +80,7 @@ struct VkBootstrapReport {
     uint32_t runtime_loading_page_count = 0;
     uint32_t runtime_completed_page_count = 0;
     uint32_t runtime_resident_page_count = 0;
+    uint32_t runtime_failed_page_count = 0;
     uint32_t visibility_valid_pixels = 0;
     uint32_t visibility_unique_base_geometry = 0;
     uint32_t visibility_unique_lod_geometry = 0;
