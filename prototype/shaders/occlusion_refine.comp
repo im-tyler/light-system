@@ -98,10 +98,27 @@ void main() {
     // Select HZB mip level based on extent
     float mip_level = max_extent > 0.0 ? ceil(log2(max_extent)) : 0.0;
 
-    // Sample HZB at the center of the screen-space rect
-    vec2 uv = vec2((min_ndc_x + max_ndc_x) * 0.25 + 0.5,
-                   (min_ndc_y + max_ndc_y) * 0.25 + 0.5);
-    float hzb_depth = textureLod(hzb_texture, uv, mip_level).r;
+    // Max-reduce over the texel footprint the rect covers at this mip, not a
+    // single center tap: ceil(log2(max_extent)) bounds the rect's larger side
+    // to ~1 texel, but a rect straddling a texel boundary still touches up to
+    // 2x2 texels, and a NEAREST center read can sample the nearer texel and
+    // wrongly reject. Mip extents follow the floor-halving chain
+    // (max(dim>>level, 1)); textureLod clamps to the sampler's maxLod if the
+    // requested level exceeds the chain, where the footprint is 1x1 anyway.
+    uint mip_l = uint(clamp(mip_level, 0.0, 32.0));
+    vec2 lvl_size = vec2(max(params.hzb_width >> mip_l, 1u), max(params.hzb_height >> mip_l, 1u));
+    vec2 uv_min = vec2(min_ndc_x, min_ndc_y) * 0.5 + 0.5;
+    vec2 uv_max = vec2(max_ndc_x, max_ndc_y) * 0.5 + 0.5;
+    ivec2 t0 = ivec2(clamp(floor(uv_min * lvl_size), vec2(0.0), lvl_size - 1.0));
+    ivec2 t1 = ivec2(clamp(ceil(uv_max * lvl_size) - 1.0, vec2(0.0), lvl_size - 1.0));
+
+    float hzb_depth = 0.0;
+    for (int y = t0.y; y <= t1.y; ++y) {
+        for (int x = t0.x; x <= t1.x; ++x) {
+            vec2 tap_uv = (vec2(x, y) + 0.5) / lvl_size;
+            hzb_depth = max(hzb_depth, textureLod(hzb_texture, tap_uv, mip_level).r);
+        }
+    }
 
     // If cluster's nearest depth is behind the HZB depth, it's occluded
     if (min_depth > hzb_depth) {
