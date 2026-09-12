@@ -89,7 +89,9 @@ ResidencyUpdateInput update_streaming_scheduler(StreamingScheduler& scheduler,
     }
 
     // Build load queue: collect non-resident pages that have priority > 0,
-    // sort by priority descending, cap at max_loads_per_frame
+    // sort by priority descending, cap at max_loads_per_frame. Priority ties
+    // break by page index so the truncation is deterministic (a non-total
+    // comparator would leave tie order implementation-defined).
     scheduler.load_queue.clear();
     for (uint32_t i = 0; i < scheduler.page_count; ++i) {
         if (priorities[i] > 0.0f) {
@@ -102,7 +104,10 @@ ResidencyUpdateInput update_streaming_scheduler(StreamingScheduler& scheduler,
     }
     std::sort(scheduler.load_queue.begin(), scheduler.load_queue.end(),
               [&](uint32_t a, uint32_t b) {
-                  return priorities[a] > priorities[b];
+                  if (priorities[a] != priorities[b]) {
+                      return priorities[a] > priorities[b];
+                  }
+                  return a < b;
               });
     if (scheduler.load_queue.size() > config.max_loads_per_frame) {
         scheduler.load_queue.resize(config.max_loads_per_frame);
@@ -126,10 +131,16 @@ ResidencyUpdateInput update_streaming_scheduler(StreamingScheduler& scheduler,
             }
         }
 
-        // Sort by last_touched_frame ascending (oldest first)
+        // Sort by last_touched_frame ascending (oldest first); ties break by
+        // page index so the evict truncation is deterministic
         std::sort(candidates.begin(), candidates.end(),
                   [&](uint32_t a, uint32_t b) {
-                      return model.pages[a].last_touched_frame < model.pages[b].last_touched_frame;
+                      if (model.pages[a].last_touched_frame !=
+                          model.pages[b].last_touched_frame) {
+                          return model.pages[a].last_touched_frame <
+                                 model.pages[b].last_touched_frame;
+                      }
+                      return a < b;
                   });
 
         uint32_t evict_count = std::min(need_to_evict, static_cast<uint32_t>(candidates.size()));
