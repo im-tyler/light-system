@@ -542,6 +542,22 @@ VkResult create_debug_render_context(VkPhysicalDevice physical_device, VkDevice 
     color_blend_attachments[0].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                                                 VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
     color_blend_attachments[1].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT;
+    // The main pass writes RGBA to the color attachment but only RG to the
+    // R32G32_UINT visibility attachment. VUID 00605: without independentBlend
+    // (mirrored, not required, at device creation) every color attachment
+    // must use an identical blend state and colorWriteMask. On such devices
+    // the visibility attachment takes the color attachment's RGBA mask:
+    // mask bits for channels the destination format lacks are ignored, so
+    // both visibility words still land and the shaded output is unchanged.
+    {
+        VkPhysicalDeviceFeatures supported_features{};
+        vkGetPhysicalDeviceFeatures(physical_device, &supported_features);
+        if (!supported_features.independentBlend) {
+            color_blend_attachments[1].colorWriteMask =
+                VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        }
+    }
 
     VkPipelineColorBlendStateCreateInfo color_blending{};
     color_blending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
