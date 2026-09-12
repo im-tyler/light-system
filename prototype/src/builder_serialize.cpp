@@ -20,6 +20,25 @@ std::string fixed_char_field(const char* field, size_t size, const char* field_n
     return std::string(field, length);
 }
 
+// Crash-persistent publication (POSIX, macOS/Linux clean): after a file is
+// renamed into place, fsync the containing directory so the directory
+// entry itself survives a crash. The file is already fsynced by then; an
+// unfsynced rename can lose the published name.
+void fsync_parent_directory(const std::filesystem::path& published_path) {
+    const std::filesystem::path parent = published_path.parent_path().empty()
+                                              ? std::filesystem::path(".")
+                                              : published_path.parent_path();
+    const int dir_fd = ::open(parent.c_str(), O_RDONLY);
+    if (dir_fd < 0) {
+        throw BuilderError("failed to open output directory for fsync: " + parent.string());
+    }
+    const int dir_fsync_result = ::fsync(dir_fd);
+    ::close(dir_fd);
+    if (dir_fsync_result != 0) {
+        throw BuilderError("failed to fsync output directory: " + parent.string());
+    }
+}
+
 }  // namespace
 
 MaterialSectionDisk to_disk(const MaterialSection& section) {
@@ -441,18 +460,30 @@ void write_resource(const VGeoResource& resource, const std::filesystem::path& o
         throw BuilderError("failed to write output file: " + temp_path.string());
     }
     // Durability before visibility: fsync the temp file so the published
-    // name never resolves to a generation that a crash could truncate, then
-    // rename() over the destination (atomic replace on POSIX).
+    // name never resolves to a generation a crash could truncate, then
+    // rename() over the destination (atomic replace on POSIX), then fsync
+    // the parent directory so the rename itself is crash-persistent. A
+    // failed reopen or fsync is a write failure -- never rename a file
+    // whose bytes may not be on disk.
     const int fd = ::open(temp_path.c_str(), O_RDONLY);
-    if (fd >= 0) {
-        ::fsync(fd);
-        ::close(fd);
+    if (fd < 0) {
+        std::error_code remove_ec;
+        std::filesystem::remove(temp_path, remove_ec);
+        throw BuilderError("failed to reopen output file for fsync: " + temp_path.string());
+    }
+    const int fsync_result = ::fsync(fd);
+    ::close(fd);
+    if (fsync_result != 0) {
+        std::error_code remove_ec;
+        std::filesystem::remove(temp_path, remove_ec);
+        throw BuilderError("failed to fsync output file: " + temp_path.string());
     }
     if (::rename(temp_path.c_str(), output_path.c_str()) != 0) {
         std::error_code remove_ec;
         std::filesystem::remove(temp_path, remove_ec);
         throw BuilderError("failed to publish output file: " + output_path.string());
     }
+    fsync_parent_directory(output_path);
 }
 
 void write_summary(const VGeoResource& resource, const std::filesystem::path& output_path) {
@@ -592,11 +623,27 @@ void write_summary(const VGeoResource& resource, const std::filesystem::path& ou
         std::filesystem::remove(temp_path, remove_ec);
         throw BuilderError("failed to write summary file: " + temp_path.string());
     }
+    // Same publication discipline as the .vgeo itself (write_resource):
+    // fsync the temp file, rename, then fsync the parent directory.
+    const int fd = ::open(temp_path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        std::error_code remove_ec;
+        std::filesystem::remove(temp_path, remove_ec);
+        throw BuilderError("failed to reopen summary file for fsync: " + temp_path.string());
+    }
+    const int fsync_result = ::fsync(fd);
+    ::close(fd);
+    if (fsync_result != 0) {
+        std::error_code remove_ec;
+        std::filesystem::remove(temp_path, remove_ec);
+        throw BuilderError("failed to fsync summary file: " + temp_path.string());
+    }
     if (::rename(temp_path.c_str(), output_path.c_str()) != 0) {
         std::error_code remove_ec;
         std::filesystem::remove(temp_path, remove_ec);
         throw BuilderError("failed to publish summary file: " + output_path.string());
     }
+    fsync_parent_directory(output_path);
 }
 
 }  // namespace meridian::detail
