@@ -43,6 +43,8 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -4320,19 +4322,51 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
                             report.capture_status = "capture failed: readback map failed";
                         } else {
                             const uint8_t* pixels = static_cast<const uint8_t*>(mapped);
-                            std::ofstream ppm(screenshot_path, std::ios::binary);
-                            if (ppm) {
+                            // Publish via temp + rename: the stream state is
+                            // checked after every write and the close, so a
+                            // mid-write ENOSPC can no longer leave a truncated
+                            // PPM behind a "capture ok" report. Only a fully
+                            // written file is renamed into place.
+                            const std::filesystem::path screenshot_dir =
+                                screenshot_path.parent_path().empty()
+                                    ? std::filesystem::path(".")
+                                    : screenshot_path.parent_path();
+                            const std::filesystem::path temp_path =
+                                screenshot_dir /
+                                (screenshot_path.filename().string() + ".tmp-" +
+                                 std::to_string(
+                                     std::chrono::steady_clock::now().time_since_epoch().count()));
+                            std::ofstream ppm(temp_path, std::ios::binary);
+                            if (!ppm) {
+                                report.capture_status = "capture failed: file open failed";
+                            } else {
                                 ppm << "P6\n" << w << " " << h << "\n255\n";
-                                const uint32_t blue_offset = 3 - red_offset - green_offset;
+                                const uint32_t blue_offset =
+                                    3 - red_offset - green_offset;
                                 for (uint32_t i = 0; i < w * h; ++i) {
                                     ppm.put(static_cast<char>(pixels[i * 4 + red_offset]));
                                     ppm.put(static_cast<char>(pixels[i * 4 + green_offset]));
                                     ppm.put(static_cast<char>(pixels[i * 4 + blue_offset]));
                                 }
-                                std::cout << "screenshot=" << screenshot_path.string() << '\n';
-                                report.capture_status = "capture ok";
-                            } else {
-                                report.capture_status = "capture failed: file open failed";
+                                ppm.flush();
+                                const bool write_ok = static_cast<bool>(ppm);
+                                ppm.close();
+                                if (!write_ok || !ppm) {
+                                    std::error_code remove_ec;
+                                    std::filesystem::remove(temp_path, remove_ec);
+                                    report.capture_status =
+                                        "capture failed: file write failed";
+                                } else if (::rename(temp_path.c_str(),
+                                                    screenshot_path.c_str()) != 0) {
+                                    std::error_code remove_ec;
+                                    std::filesystem::remove(temp_path, remove_ec);
+                                    report.capture_status =
+                                        "capture failed: file publish failed";
+                                } else {
+                                    std::cout << "screenshot=" << screenshot_path.string()
+                                              << '\n';
+                                    report.capture_status = "capture ok";
+                                }
                             }
                             vkUnmapMemory(device, readback.memory);
                         }
