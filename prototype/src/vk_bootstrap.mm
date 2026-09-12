@@ -1473,15 +1473,22 @@ VkResult create_frame_context(VkDevice device, const QueueFamilySelection& queue
 }  // close anonymous namespace for find_depth_format extraction
 
 VkFormat find_depth_format(VkPhysicalDevice physical_device) {
+    // Depth images are also sampled (HZB source, shadow-map reads), so a
+    // candidate must support both attachment use and sampling; the
+    // samplers are NEAREST, so SAMPLED_IMAGE suffices (no filtered bit).
+    // D16 is the last-resort no-stencil fallback.
     const VkFormat candidates[] = {
         VK_FORMAT_D32_SFLOAT,
         VK_FORMAT_D32_SFLOAT_S8_UINT,
         VK_FORMAT_D24_UNORM_S8_UINT,
+        VK_FORMAT_D16_UNORM,
     };
     for (VkFormat format : candidates) {
         VkFormatProperties properties{};
         vkGetPhysicalDeviceFormatProperties(physical_device, format, &properties);
-        if ((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0) {
+        const VkFormatFeatureFlags required = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                                              VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+        if ((properties.optimalTilingFeatures & required) == required) {
             return format;
         }
     }
