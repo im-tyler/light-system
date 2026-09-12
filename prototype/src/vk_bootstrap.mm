@@ -1210,8 +1210,23 @@ DeviceSelection select_device(VkInstance instance, VkSurfaceKHR surface, VkBoots
         }
         // The merged multi-cascade shadow pass selects the output layer per
         // instance from the vertex shader; that needs viewport/layer writes
-        // from the vertex stage.
-        if (!supports_extension(extensions, "VK_EXT_shader_viewport_index_layer")) {
+        // from the vertex stage. On Vulkan >= 1.2 the core
+        // shaderOutputLayer feature provides them; the
+        // VK_EXT_shader_viewport_index_layer extension is the pre-1.2
+        // fallback route.
+        bool shader_output_layer_feature = false;
+        if (properties.apiVersion >= VK_API_VERSION_1_2) {
+            VkPhysicalDeviceFeatures2 features2{};
+            features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            VkPhysicalDeviceVulkan12Features features12{};
+            features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+            features2.pNext = &features12;
+            vkGetPhysicalDeviceFeatures2(physical_device, &features2);
+            if (features12.shaderOutputLayer != VK_TRUE) {
+                continue;
+            }
+            shader_output_layer_feature = true;
+        } else if (!supports_extension(extensions, "VK_EXT_shader_viewport_index_layer")) {
             continue;
         }
         if (!has_swapchain_support(physical_device, surface)) {
@@ -1224,6 +1239,7 @@ DeviceSelection select_device(VkInstance instance, VkSurfaceKHR surface, VkBoots
             supports_extension(extensions, "VK_KHR_portability_subset");
         selection.has_draw_indirect_count =
             supports_extension(extensions, VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME);
+        selection.shader_output_layer_feature = shader_output_layer_feature;
         report.selected_device = properties.deviceName;
         report.graphics_queue_family = queues.graphics_family;
         report.present_queue_family = queues.present_family;
@@ -2318,7 +2334,14 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
 
         std::vector<const char*> device_extensions;
         device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
-        device_extensions.push_back("VK_EXT_shader_viewport_index_layer");
+        // Viewport/layer vertex-stage writes: on >= 1.2 devices the core
+        // shaderOutputLayer feature is requested through the
+        // VkPhysicalDeviceVulkan12Features chain below instead of the EXT
+        // extension (never both at once); only pre-1.2 devices take the
+        // extension route here.
+        if (!selection.shader_output_layer_feature) {
+            device_extensions.push_back("VK_EXT_shader_viewport_index_layer");
+        }
         if (selection.enable_portability_subset) {
             device_extensions.push_back("VK_KHR_portability_subset");
         }
@@ -2332,6 +2355,13 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
         device_features.multiDrawIndirect = supported_features.multiDrawIndirect;
         device_features.drawIndirectFirstInstance = supported_features.drawIndirectFirstInstance;
         device_features.independentBlend = supported_features.independentBlend;
+
+        VkPhysicalDeviceVulkan12Features vulkan12_features{};
+        if (selection.shader_output_layer_feature) {
+            vulkan12_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+            vulkan12_features.shaderOutputLayer = VK_TRUE;
+        }
+
         VkDeviceCreateInfo device_info{};
         device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
         device_info.queueCreateInfoCount = static_cast<uint32_t>(queue_infos.size());
@@ -2339,6 +2369,9 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
         device_info.enabledExtensionCount = static_cast<uint32_t>(device_extensions.size());
         device_info.ppEnabledExtensionNames = device_extensions.data();
         device_info.pEnabledFeatures = &device_features;
+        if (vulkan12_features.sType != 0) {
+            device_info.pNext = &vulkan12_features;
+        }
 
         result = vkCreateDevice(selection.physical_device, &device_info, nullptr, &device);
         if (result != VK_SUCCESS) {

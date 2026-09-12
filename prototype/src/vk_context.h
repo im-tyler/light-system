@@ -42,6 +42,10 @@ struct DeviceSelection {
     QueueFamilySelection queues;
     bool enable_portability_subset = false;
     bool has_draw_indirect_count = false;
+    // True when viewport/layer vertex-stage writes come from the Vulkan
+    // 1.2 core shaderOutputLayer feature instead of
+    // VK_EXT_shader_viewport_index_layer (devices >= 1.2).
+    bool shader_output_layer_feature = false;
 };
 
 struct SwapchainContext {
