@@ -595,7 +595,10 @@ VkResult create_debug_render_context(VkPhysicalDevice physical_device, VkDevice 
         ph_img.samples = VK_SAMPLE_COUNT_1_BIT;
         ph_img.tiling = VK_IMAGE_TILING_OPTIMAL;
         ph_img.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-        vkCreateImage(device, &ph_img, nullptr, &context.placeholder_depth_image);
+        result = vkCreateImage(device, &ph_img, nullptr, &context.placeholder_depth_image);
+        if (result != VK_SUCCESS) {
+            return result;
+        }
         VkMemoryRequirements ph_req{};
         vkGetImageMemoryRequirements(device, context.placeholder_depth_image, &ph_req);
         VkMemoryAllocateInfo ph_alloc{};
@@ -603,8 +606,26 @@ VkResult create_debug_render_context(VkPhysicalDevice physical_device, VkDevice 
         ph_alloc.allocationSize = ph_req.size;
         ph_alloc.memoryTypeIndex = find_memory_type(physical_device, ph_req.memoryTypeBits,
                                                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        vkAllocateMemory(device, &ph_alloc, nullptr, &context.placeholder_depth_memory);
-        vkBindImageMemory(device, context.placeholder_depth_image, context.placeholder_depth_memory, 0);
+        if (ph_alloc.memoryTypeIndex == kInvalidQueueFamily) {
+            vkDestroyImage(device, context.placeholder_depth_image, nullptr);
+            context.placeholder_depth_image = VK_NULL_HANDLE;
+            return VK_ERROR_MEMORY_MAP_FAILED;
+        }
+        result = vkAllocateMemory(device, &ph_alloc, nullptr, &context.placeholder_depth_memory);
+        if (result != VK_SUCCESS) {
+            vkDestroyImage(device, context.placeholder_depth_image, nullptr);
+            context.placeholder_depth_image = VK_NULL_HANDLE;
+            return result;
+        }
+        result = vkBindImageMemory(device, context.placeholder_depth_image,
+                                   context.placeholder_depth_memory, 0);
+        if (result != VK_SUCCESS) {
+            vkFreeMemory(device, context.placeholder_depth_memory, nullptr);
+            context.placeholder_depth_memory = VK_NULL_HANDLE;
+            vkDestroyImage(device, context.placeholder_depth_image, nullptr);
+            context.placeholder_depth_image = VK_NULL_HANDLE;
+            return result;
+        }
         VkImageViewCreateInfo ph_view{};
         ph_view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
         ph_view.image = context.placeholder_depth_image;
@@ -613,7 +634,14 @@ VkResult create_debug_render_context(VkPhysicalDevice physical_device, VkDevice 
         ph_view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
         ph_view.subresourceRange.levelCount = 1;
         ph_view.subresourceRange.layerCount = 1;
-        vkCreateImageView(device, &ph_view, nullptr, &context.placeholder_depth_view);
+        result = vkCreateImageView(device, &ph_view, nullptr, &context.placeholder_depth_view);
+        if (result != VK_SUCCESS) {
+            vkFreeMemory(device, context.placeholder_depth_memory, nullptr);
+            context.placeholder_depth_memory = VK_NULL_HANDLE;
+            vkDestroyImage(device, context.placeholder_depth_image, nullptr);
+            context.placeholder_depth_image = VK_NULL_HANDLE;
+            return result;
+        }
         VkSamplerCreateInfo ph_samp{};
         ph_samp.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
         ph_samp.magFilter = VK_FILTER_NEAREST;
@@ -623,7 +651,16 @@ VkResult create_debug_render_context(VkPhysicalDevice physical_device, VkDevice 
         ph_samp.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
         ph_samp.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
         ph_samp.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
-        vkCreateSampler(device, &ph_samp, nullptr, &context.placeholder_sampler);
+        result = vkCreateSampler(device, &ph_samp, nullptr, &context.placeholder_sampler);
+        if (result != VK_SUCCESS) {
+            vkDestroyImageView(device, context.placeholder_depth_view, nullptr);
+            context.placeholder_depth_view = VK_NULL_HANDLE;
+            vkFreeMemory(device, context.placeholder_depth_memory, nullptr);
+            context.placeholder_depth_memory = VK_NULL_HANDLE;
+            vkDestroyImage(device, context.placeholder_depth_image, nullptr);
+            context.placeholder_depth_image = VK_NULL_HANDLE;
+            return result;
+        }
     }
 
     VkDescriptorPoolSize pool_sizes[3] = {};
