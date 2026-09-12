@@ -330,14 +330,19 @@ VkResult create_device_local_buffer_staged(VkPhysicalDevice physical_device, VkD
     if (r != VK_SUCCESS) { destroy_uploaded_buffer(device, staging); return r; }
     out_buffer.size = size;
 
-    // One-shot transient command pool for the copy.
+    // One-shot transient command pool for the copy. Failure paths destroy
+    // what this call created so the caller never sees half-built handles.
     VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandPoolCreateInfo pool_info{};
     pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     pool_info.queueFamilyIndex = queue_family;
     pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
     r = vkCreateCommandPool(device, &pool_info, nullptr, &pool);
-    if (r != VK_SUCCESS) { destroy_uploaded_buffer(device, staging); return r; }
+    if (r != VK_SUCCESS) {
+        destroy_uploaded_buffer(device, staging);
+        destroy_uploaded_buffer(device, out_buffer);
+        return r;
+    }
 
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     VkCommandBufferAllocateInfo cb_info{};
@@ -345,25 +350,51 @@ VkResult create_device_local_buffer_staged(VkPhysicalDevice physical_device, VkD
     cb_info.commandPool = pool;
     cb_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     cb_info.commandBufferCount = 1;
-    vkAllocateCommandBuffers(device, &cb_info, &cmd);
+    r = vkAllocateCommandBuffers(device, &cb_info, &cmd);
+    if (r != VK_SUCCESS) {
+        vkDestroyCommandPool(device, pool, nullptr);
+        destroy_uploaded_buffer(device, staging);
+        destroy_uploaded_buffer(device, out_buffer);
+        return r;
+    }
 
     VkCommandBufferBeginInfo begin{};
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &begin);
+    r = vkBeginCommandBuffer(cmd, &begin);
+    if (r != VK_SUCCESS) {
+        vkDestroyCommandPool(device, pool, nullptr);
+        destroy_uploaded_buffer(device, staging);
+        destroy_uploaded_buffer(device, out_buffer);
+        return r;
+    }
 
     VkBufferCopy copy{};
     copy.size = size;
     vkCmdCopyBuffer(cmd, staging.buffer, out_buffer.buffer, 1, &copy);
 
-    vkEndCommandBuffer(cmd);
+    r = vkEndCommandBuffer(cmd);
+    if (r != VK_SUCCESS) {
+        vkDestroyCommandPool(device, pool, nullptr);
+        destroy_uploaded_buffer(device, staging);
+        destroy_uploaded_buffer(device, out_buffer);
+        return r;
+    }
 
     VkSubmitInfo submit{};
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &cmd;
-    vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
-    vkQueueWaitIdle(queue);
+    r = vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
+    if (r == VK_SUCCESS) {
+        r = vkQueueWaitIdle(queue);
+    }
+    if (r != VK_SUCCESS) {
+        vkDestroyCommandPool(device, pool, nullptr);
+        destroy_uploaded_buffer(device, staging);
+        destroy_uploaded_buffer(device, out_buffer);
+        return r;
+    }
 
     vkDestroyCommandPool(device, pool, nullptr);
     destroy_uploaded_buffer(device, staging);
@@ -519,12 +550,22 @@ VkResult upload_page_bytes(VkPhysicalDevice physical_device, VkDevice device, Vk
     cb_info.commandPool = pool;
     cb_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     cb_info.commandBufferCount = 1;
-    vkAllocateCommandBuffers(device, &cb_info, &cmd);
+    result = vkAllocateCommandBuffers(device, &cb_info, &cmd);
+    if (result != VK_SUCCESS) {
+        vkDestroyCommandPool(device, pool, nullptr);
+        destroy_uploaded_buffer(device, staging);
+        return result;
+    }
 
     VkCommandBufferBeginInfo begin{};
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &begin);
+    result = vkBeginCommandBuffer(cmd, &begin);
+    if (result != VK_SUCCESS) {
+        vkDestroyCommandPool(device, pool, nullptr);
+        destroy_uploaded_buffer(device, staging);
+        return result;
+    }
 
     VkBufferCopy copy{};
     copy.srcOffset = 0;
@@ -532,14 +573,26 @@ VkResult upload_page_bytes(VkPhysicalDevice physical_device, VkDevice device, Vk
     copy.size = size;
     vkCmdCopyBuffer(cmd, staging.buffer, dst.buffer, 1, &copy);
 
-    vkEndCommandBuffer(cmd);
+    result = vkEndCommandBuffer(cmd);
+    if (result != VK_SUCCESS) {
+        vkDestroyCommandPool(device, pool, nullptr);
+        destroy_uploaded_buffer(device, staging);
+        return result;
+    }
 
     VkSubmitInfo submit{};
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &cmd;
-    vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
-    vkQueueWaitIdle(queue);
+    result = vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
+    if (result == VK_SUCCESS) {
+        result = vkQueueWaitIdle(queue);
+    }
+    if (result != VK_SUCCESS) {
+        vkDestroyCommandPool(device, pool, nullptr);
+        destroy_uploaded_buffer(device, staging);
+        return result;
+    }
 
     vkDestroyCommandPool(device, pool, nullptr);
     destroy_uploaded_buffer(device, staging);
