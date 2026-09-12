@@ -4203,42 +4203,55 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
                     report.capture_status = "capture failed: image acquisition failed";
                 }
             } else {
-                vkWaitForFences(device, 1, &acquire_fence, VK_TRUE, UINT64_MAX);
-
+                const VkResult fence_result =
+                    vkWaitForFences(device, 1, &acquire_fence, VK_TRUE, UINT64_MAX);
                 UploadedBuffer readback{};
-                if (create_uploaded_buffer(selection.physical_device, device, nullptr, buf_size,
-                                           VK_BUFFER_USAGE_TRANSFER_DST_BIT, readback) ==
-                    VK_SUCCESS) {
-                    vkResetCommandPool(device, frame.command_pool, 0);
-                    VkCommandBufferBeginInfo begin{};
-                    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-                    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-                    vkBeginCommandBuffer(frame.command_buffer, &begin);
+                if (fence_result != VK_SUCCESS) {
+                    report.capture_status = "capture failed: acquire fence wait failed";
+                } else if (create_uploaded_buffer(selection.physical_device, device, nullptr,
+                                                  buf_size,
+                                                  VK_BUFFER_USAGE_TRANSFER_DST_BIT, readback) !=
+                           VK_SUCCESS) {
+                    report.capture_status = "capture failed: readback buffer allocation failed";
+                } else {
+                    // One-shot copy submission with every result checked
+                    // (LS-21/40 pattern): on any failure the readback buffer
+                    // is still destroyed, the file is not published, and the
+                    // report records a non-success capture status.
+                    VkResult one_shot = vkResetCommandPool(device, frame.command_pool, 0);
+                    if (one_shot == VK_SUCCESS) {
+                        VkCommandBufferBeginInfo begin{};
+                        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+                        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                        one_shot = vkBeginCommandBuffer(frame.command_buffer, &begin);
+                    }
+                    if (one_shot == VK_SUCCESS) {
+                        // Transition swapchain image to transfer src
+                        VkImageMemoryBarrier to_src{};
+                        to_src.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                        to_src.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+                        to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                        to_src.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+                        to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                        to_src.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                        to_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                        to_src.image = swapchain.images[shot_image_index];
+                        to_src.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                        vkCmdPipelineBarrier(frame.command_buffer,
+                                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                                             nullptr, 1, &to_src);
 
-                    // Transition swapchain image to transfer src
-                    VkImageMemoryBarrier to_src{};
-                    to_src.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-                    to_src.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-                    to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-                    to_src.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-                    to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-                    to_src.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                    to_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                    to_src.image = swapchain.images[shot_image_index];
-                    to_src.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-                    vkCmdPipelineBarrier(frame.command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
-                                         1, &to_src);
+                        VkBufferImageCopy region{};
+                        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                        region.imageExtent = {w, h, 1};
+                        vkCmdCopyImageToBuffer(frame.command_buffer,
+                                               swapchain.images[shot_image_index],
+                                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                               readback.buffer, 1, &region);
 
-                    VkBufferImageCopy region{};
-                    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-                    region.imageExtent = {w, h, 1};
-                    vkCmdCopyImageToBuffer(frame.command_buffer,
-                                           swapchain.images[shot_image_index],
-                                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.buffer, 1,
-                                           &region);
-
-                    vkEndCommandBuffer(frame.command_buffer);
+                        one_shot = vkEndCommandBuffer(frame.command_buffer);
+                    }
                     VkSubmitInfo sub{};
                     sub.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
                     const VkPipelineStageFlags acquire_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
@@ -4247,28 +4260,43 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
                     sub.pWaitDstStageMask = &acquire_stage;
                     sub.commandBufferCount = 1;
                     sub.pCommandBuffers = &frame.command_buffer;
-                    vkQueueSubmit(graphics_queue, 1, &sub, VK_NULL_HANDLE);
-                    vkQueueWaitIdle(graphics_queue);
-
-                    void* mapped = nullptr;
-                    if (vkMapMemory(device, readback.memory, 0, buf_size, 0, &mapped) ==
-                        VK_SUCCESS) {
-                        const uint8_t* pixels = static_cast<const uint8_t*>(mapped);
-                        std::ofstream ppm(screenshot_path, std::ios::binary);
-                        if (ppm) {
-                            ppm << "P6\n" << w << " " << h << "\n255\n";
-                            const uint32_t blue_offset = 3 - red_offset - green_offset;
-                            for (uint32_t i = 0; i < w * h; ++i) {
-                                ppm.put(static_cast<char>(pixels[i * 4 + red_offset]));
-                                ppm.put(static_cast<char>(pixels[i * 4 + green_offset]));
-                                ppm.put(static_cast<char>(pixels[i * 4 + blue_offset]));
-                            }
-                            std::cout << "screenshot=" << screenshot_path.string() << '\n';
-                            report.capture_status = "capture ok";
-                        }
-                        vkUnmapMemory(device, readback.memory);
+                    if (one_shot == VK_SUCCESS) {
+                        one_shot = vkQueueSubmit(graphics_queue, 1, &sub, VK_NULL_HANDLE);
                     }
-                    destroy_uploaded_buffer(device, readback);
+                    if (one_shot == VK_SUCCESS) {
+                        one_shot = vkQueueWaitIdle(graphics_queue);
+                    }
+                    if (one_shot != VK_SUCCESS) {
+                        std::fprintf(stderr,
+                                     "screenshot copy submission failed with code %d\n",
+                                     static_cast<int>(one_shot));
+                        report.capture_status = "capture failed: copy submission failed";
+                        destroy_uploaded_buffer(device, readback);
+                    } else {
+                        void* mapped = nullptr;
+                        if (vkMapMemory(device, readback.memory, 0, buf_size, 0, &mapped) !=
+                            VK_SUCCESS) {
+                            report.capture_status = "capture failed: readback map failed";
+                        } else {
+                            const uint8_t* pixels = static_cast<const uint8_t*>(mapped);
+                            std::ofstream ppm(screenshot_path, std::ios::binary);
+                            if (ppm) {
+                                ppm << "P6\n" << w << " " << h << "\n255\n";
+                                const uint32_t blue_offset = 3 - red_offset - green_offset;
+                                for (uint32_t i = 0; i < w * h; ++i) {
+                                    ppm.put(static_cast<char>(pixels[i * 4 + red_offset]));
+                                    ppm.put(static_cast<char>(pixels[i * 4 + green_offset]));
+                                    ppm.put(static_cast<char>(pixels[i * 4 + blue_offset]));
+                                }
+                                std::cout << "screenshot=" << screenshot_path.string() << '\n';
+                                report.capture_status = "capture ok";
+                            } else {
+                                report.capture_status = "capture failed: file open failed";
+                            }
+                            vkUnmapMemory(device, readback.memory);
+                        }
+                        destroy_uploaded_buffer(device, readback);
+                    }
                 }
             }
             if (acquire_semaphore != VK_NULL_HANDLE) {
