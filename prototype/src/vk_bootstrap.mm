@@ -2874,7 +2874,15 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
             glfwGetCursorPos(window, &interactive_cam.last_cursor_x, &interactive_cam.last_cursor_y);
             interactive_cam.cursor_captured = true;
         }
+        // Two clocks, one per concern (LS-56): last_frame_time drives the
+        // interactive camera integration dt; benchmark_last_frame_time is
+        // the MERIDIAN_BENCHMARK frame-period sample. They must not share a
+        // variable: the camera update used to reset the shared timestamp,
+        // so the benchmark then measured only the camera-update sliver
+        // (median_ms=0.00 at vsync frame periods), never the inter-frame
+        // interval.
         double last_frame_time = glfwGetTime();
+        double benchmark_last_frame_time = last_frame_time;
         uint32_t fps_frame_count = 0;
         // Draw-list upload scratch: entries past the live count are zeroed so the
         // vkCmdDrawIndirect fallback (no draw_indirect_count extension) never
@@ -3162,6 +3170,18 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
                 continue;
             }
 
+            // Benchmark clock: sampled once per frame BEFORE the camera
+            // update, so the sample spans the full frame period (present
+            // wait -> camera -> submit -> present) regardless of what the
+            // camera-integration clock does to its own timestamp.
+            {
+                const double frame_now = glfwGetTime();
+                if (frame_index > 2) {
+                    frame_times_ms.push_back((frame_now - benchmark_last_frame_time) * 1000.0);
+                }
+                benchmark_last_frame_time = frame_now;
+            }
+
             // Interactive camera update
             if (config.interactive) {
                 const double now = glfwGetTime();
@@ -3241,15 +3261,6 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
                     fps_frame_count = 0;
                     fps_timer = now;
                 }
-            }
-
-            // Frame timing (common path)
-            {
-                const double frame_now = glfwGetTime();
-                if (frame_index > 2) {
-                    frame_times_ms.push_back((frame_now - last_frame_time) * 1000.0);
-                }
-                last_frame_time = frame_now;
             }
 
             // Async-load completion. Two paths:
