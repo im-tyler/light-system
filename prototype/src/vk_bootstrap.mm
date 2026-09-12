@@ -2530,7 +2530,9 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
 
         // Create GPU profiler (7 timer pairs: cull, sel, occ, shadow, main, hzb, total)
         if (config.enable_gpu_timers) {
-            VkResult prof_result = create_gpu_profiler(selection.physical_device, device, 7, gpu_profiler);
+            VkResult prof_result = create_gpu_profiler(selection.physical_device, device,
+                                                        selection.queues.graphics_family, 7,
+                                                        gpu_profiler);
             if (prof_result == VK_SUCCESS) {
                 gpu_profiler.names[0] = "cull";
                 gpu_profiler.names[1] = "sel";
