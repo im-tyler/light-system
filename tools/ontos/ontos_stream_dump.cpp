@@ -2411,6 +2411,22 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count,
     }
   }
 
+  // The stream format has no terminal flush: queued records (RegionLevel,
+  // RegionCollapsed, RegionMultipole, Contact, RegionRadial, RegionShells)
+  // are applied and verified only when the next TickHeader arrives. A
+  // nonempty queue at EOF means those records were silently never applied
+  // -- fail instead of exiting 0 without having verified them.
+  if (!pending.empty() || !pending_collapsed.empty() || !pending_multipole.empty() ||
+      !pending_contact.empty() || !pending_radial.empty() || !pending_shells.empty()) {
+    std::fprintf(stderr,
+                 "error: dangling record(s) at EOF, never applied (no terminal tick boundary): "
+                 "RegionLevel=%zu RegionCollapsed=%zu RegionMultipole=%zu Contact=%zu "
+                 "RegionRadial=%zu RegionShells=%zu\n",
+                 pending.size(), pending_collapsed.size(), pending_multipole.size(),
+                 pending_contact.size(), pending_radial.size(), pending_shells.size());
+    return 2;
+  }
+
   u64 r_fine = 0, r_cn = 0;
   f64 r_mass = 0, r_px = 0, r_py = 0, r_e0 = 0;
   reference.totals(r_fine, r_cn, r_mass, r_px, r_py, r_e0);
