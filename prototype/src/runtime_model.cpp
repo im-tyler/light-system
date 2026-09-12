@@ -105,6 +105,17 @@ ResidencyUpdateResult step_residency(ResidencyModel& model, const ResidencyUpdat
         }
     }
 
+    // Pages in this call's selection set must stay resident: at frame 0 a
+    // freshly-touched page's last_touched_frame (0) equals every untouched
+    // page's, so without protection a tight budget could evict pages that
+    // were selected this very frame.
+    std::vector<uint8_t> selected_this_call(model.pages.size(), 0);
+    for (const uint32_t page_index : input.selected_pages) {
+        if (page_index < model.pages.size()) {
+            selected_this_call[page_index] = 1;
+        }
+    }
+
     std::vector<uint32_t> resident_like_pages;
     for (uint32_t page_index = 0; page_index < model.pages.size(); ++page_index) {
         if (is_resident_like(model.pages[page_index].state)) {
@@ -113,28 +124,43 @@ ResidencyUpdateResult step_residency(ResidencyModel& model, const ResidencyUpdat
     }
 
     if (resident_like_pages.size() > input.resident_budget) {
+        // Total order: state (eviction candidates first), then
+        // last_touched_frame, then page index -- the page-index tiebreak
+        // keeps the sort deterministic when timestamps collide (e.g. every
+        // page initialized at frame 0).
         std::sort(resident_like_pages.begin(), resident_like_pages.end(), [&](uint32_t lhs, uint32_t rhs) {
             const PageResidencyEntry& left = model.pages[lhs];
             const PageResidencyEntry& right = model.pages[rhs];
             if (left.state != right.state) {
                 return left.state == PageResidencyState::eviction_candidate;
             }
-            return left.last_touched_frame < right.last_touched_frame;
+            if (left.last_touched_frame != right.last_touched_frame) {
+                return left.last_touched_frame < right.last_touched_frame;
+            }
+            return lhs < rhs;
         });
 
-        while (resident_like_pages.size() > input.resident_budget) {
-            const uint32_t page_index = resident_like_pages.front();
-            resident_like_pages.erase(resident_like_pages.begin());
+        size_t evicted = 0;
+        const size_t to_remove = resident_like_pages.size() - input.resident_budget;
+        for (const uint32_t page_index : resident_like_pages) {
+            if (evicted >= to_remove) {
+                break;
+            }
+            if (selected_this_call[page_index] != 0) {
+                continue;
+            }
             PageResidencyEntry& entry = model.pages[page_index];
             if (entry.state == PageResidencyState::resident) {
+                // Demote first; the page keeps one more pass as a candidate
+                // and is only unloaded on a later call if it stays cold.
                 entry.state = PageResidencyState::eviction_candidate;
                 result.eviction_candidate_pages.push_back(page_index);
-                resident_like_pages.push_back(page_index);
                 continue;
             }
             entry.state = PageResidencyState::unloaded;
             entry.request_priority = 0;
             result.evicted_pages.push_back(page_index);
+            evicted += 1;
         }
     }
 
