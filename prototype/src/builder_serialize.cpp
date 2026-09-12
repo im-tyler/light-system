@@ -122,20 +122,28 @@ ResourceSummary read_resource_summary(const std::filesystem::path& input_path) {
         throw BuilderError("failed to open input file: " + input_path.string());
     }
 
+    // Read only the fixed prefix (magic + schema_version) first: older
+    // schema versions have smaller headers, so reading sizeof(FileHeader)
+    // up front would misalign on anything but the current version. Only
+    // the current version is decodable; legacy versions are rejected.
     FileHeader header{};
     SummaryBlockDisk summary_disk{};
-    input.read(reinterpret_cast<char*>(&header), sizeof(header));
-    input.read(reinterpret_cast<char*>(&summary_disk), sizeof(summary_disk));
+    input.read(reinterpret_cast<char*>(&header), 8);
     if (!input) {
         throw BuilderError("failed to read summary from input file: " + input_path.string());
     }
     if (!std::equal(std::begin(header.magic), std::end(header.magic), kMagic.begin())) {
         throw BuilderError("input file does not have a valid VGEO header: " + input_path.string());
     }
-    if (header.schema_version == 0 || header.schema_version > kSchemaVersion) {
-        throw BuilderError("unsupported VGEO schema version " + std::to_string(header.schema_version) +
-                           " (supported: 1.." + std::to_string(kSchemaVersion) + "): " +
-                           input_path.string());
+    if (header.schema_version != kSchemaVersion) {
+        throw BuilderError("unsupported VGEO schema version " +
+                           std::to_string(header.schema_version) + " (supported: " +
+                           std::to_string(kSchemaVersion) + "): " + input_path.string());
+    }
+    input.read(reinterpret_cast<char*>(&header) + 8, sizeof(header) - 8);
+    input.read(reinterpret_cast<char*>(&summary_disk), sizeof(summary_disk));
+    if (!input) {
+        throw BuilderError("failed to read summary from input file: " + input_path.string());
     }
     const bool file_is_textured = (header.flags & kFileFlagTextured) != 0;
 
@@ -156,7 +164,7 @@ ResourceSummary read_resource_summary(const std::filesystem::path& input_path) {
     summary.page_dependency_count = header.total_page_dependencies;
     summary.cluster_geometry_bytes = header.total_cluster_geometry_bytes;
     summary.lod_geometry_bytes = header.total_lod_geometry_bytes;
-    if (file_is_textured && header.schema_version >= 4) {
+    if (file_is_textured) {
         summary.texture_bytes = header.total_texture_bytes;
         ResourceMetadata metadata{};
         input.seekg(static_cast<std::streamoff>(header.metadata_offset), std::ios::beg);
