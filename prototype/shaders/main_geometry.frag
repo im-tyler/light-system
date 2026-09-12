@@ -32,7 +32,11 @@ void main() {
     vec3 hash_color = vec3(0.62 + hue * 0.12, 0.64 + hue * 0.08, 0.68 - hue * 0.06);
     vec3 base_color = frag_has_uv == 1u ? texture(base_texture, frag_uv).rgb : hash_color;
 
-    vec3 N = gl_FrontFacing ? frag_normal : -frag_normal;
+    // Renormalize after interpolation: the vertex stage's normalize() does
+    // not survive perspective-correct interpolation, and dot(N, L) (diffuse),
+    // the slope-scaled shadow bias, and the hemisphere ambient all consume
+    // unit-length N.
+    vec3 N = normalize(gl_FrontFacing ? frag_normal : -frag_normal);
     vec3 L = normalize(frame.light_dir.xyz);
     float ndotl = max(dot(N, L), 0.0);
 
