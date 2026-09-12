@@ -30,14 +30,24 @@ Required fields:
   - v5 added cull_sphere[4] to cluster and LOD-cluster records (readers
     loading v3/v4 files synthesize the sphere from the cluster AABB)
   - v6 added content_fingerprint to the file header, a 64-bit FNV-1a over
-    the payload bytes, the page layout, and the header/summary metadata
-    (asset_id, source_asset, fallback/textured flags, bounds, totals,
-    texture dimensions), so persisted-.vgeo fast paths can reject a cache
-    whose content does not match the freshly built resource. Metadata was
-    added to the hash input after the LS-23 reopen (metadata-only rebuilds
-    previously kept the old fingerprint and let stale sidecars pair); that
-    input change invalidates every pre-change fingerprint by design --
-    old .vgeo+sidecar pairs fail the pairing check and must be regenerated
+    the payload bytes, the page layout, and the header/summary metadata,
+    so persisted-.vgeo fast paths can reject a cache whose content does
+    not match the freshly built resource. Metadata was added to the hash
+    input after the LS-23 reopen (metadata-only rebuilds previously kept
+    the old fingerprint and let stale sidecars pair); a second reopen
+    (LS-23, 3rd) replaced the ad-hoc metadata list with ONE canonical
+    table of the summary sidecar's scalar fields
+    (`collect_sidecar_fields` in `prototype/src/builder_serialize.cpp`),
+    which both the sidecar writer and the fingerprint consume: asset_id,
+    source_asset, has_fallback, source_vertices, source_triangles,
+    seam_locked_vertices, bounds_min/max, material_sections,
+    hierarchy_nodes, clusters, pages, lod_groups, lod_clusters,
+    node_lod_links, page_dependencies, cluster_geometry_bytes,
+    lod_geometry_bytes, texture kind, texture_width/height/bytes,
+    uv_clusters, uv_lod_clusters. The Godot importer reads these keys by
+    name (plus content_fingerprint itself) from the sidecar. Each input
+    change invalidates every pre-change fingerprint by design -- old
+    .vgeo+sidecar pairs fail the pairing check and must be regenerated
   - the current version is also pinned by
     `kSchemaVersion` in `prototype/src/builder_internal.h`; CI compares
     the two via `tools/check_schema_version.sh`

@@ -39,6 +39,126 @@ void fsync_parent_directory(const std::filesystem::path& published_path) {
     }
 }
 
+// ONE canonical list of the summary sidecar's scalar metadata fields (the
+// LS-23 fix family). write_summary emits exactly these keys in this order,
+// and compute_content_fingerprint mixes every key and canonical value into
+// the .vgeo fingerprint -- both consume this single table, so the sidecar
+// writer, the fingerprint, and (by key name) the Godot importer
+// (addons/meridian_importer/vgeo_import_plugin.gd) cannot drift apart
+// again: a published sidecar field that the fingerprint does not cover
+// cannot exist, because there is no second list to forget to update.
+//
+// Canonical value forms (what the fingerprint hashes, independent of the
+// sidecar's lossy 6-significant-digit float text): u32/count/size/payload
+// fields and booleans hash as one u64 (a); text fields hash the length
+// (a) plus the bytes; bounds triples hash the three raw float bit
+// patterns (a, b, c). Fields that are not triples leave b/c at 0.
+// content_fingerprint itself is deliberately absent: it is the digest of
+// this table and cannot be an input to itself.
+struct SidecarField {
+    const char* key;
+    uint64_t a = 0;
+    uint64_t b = 0;
+    uint64_t c = 0;
+    std::string text;
+};
+
+uint64_t float_to_bits(float value) {
+    uint32_t bits = 0;
+    static_assert(sizeof(bits) == sizeof(value), "float must be 32-bit");
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+std::string render_vec3(const Vec3f& value) {
+    std::ostringstream stream;
+    stream << value.x << ' ' << value.y << ' ' << value.z;
+    return stream.str();
+}
+
+uint32_t count_uv_clusters(const std::vector<ClusterRecord>& clusters) {
+    uint32_t count = 0;
+    for (const ClusterRecord& cluster : clusters) {
+        if ((cluster.flags & kClusterFlagHasUv) != 0) {
+            count += 1;
+        }
+    }
+    return count;
+}
+
+uint32_t count_uv_lod_clusters(const std::vector<LodClusterRecord>& clusters) {
+    uint32_t count = 0;
+    for (const LodClusterRecord& cluster : clusters) {
+        if ((cluster.flags & kClusterFlagHasUv) != 0) {
+            count += 1;
+        }
+    }
+    return count;
+}
+
+std::vector<SidecarField> collect_sidecar_fields(const VGeoResource& resource) {
+    std::vector<SidecarField> fields;
+    const auto text_field = [&fields](const char* key, const std::string& value) {
+        SidecarField field;
+        field.key = key;
+        field.a = value.size();
+        field.text = value;
+        fields.push_back(std::move(field));
+    };
+    const auto u32_field = [&fields](const char* key, uint32_t value) {
+        SidecarField field;
+        field.key = key;
+        field.a = value;
+        field.text = std::to_string(value);
+        fields.push_back(std::move(field));
+    };
+    const auto size_field = [&u32_field](const char* key, size_t value) {
+        u32_field(key, narrow_payload_u32(value, key));
+    };
+    const auto bool_field = [&fields](const char* key, bool value) {
+        SidecarField field;
+        field.key = key;
+        field.a = value ? 1ull : 0ull;
+        field.text = value ? "true" : "false";
+        fields.push_back(std::move(field));
+    };
+    const auto vec3_field = [&fields](const char* key, const Vec3f& value) {
+        SidecarField field;
+        field.key = key;
+        field.a = float_to_bits(value.x);
+        field.b = float_to_bits(value.y);
+        field.c = float_to_bits(value.z);
+        field.text = render_vec3(value);
+        fields.push_back(std::move(field));
+    };
+
+    text_field("asset_id", resource.asset_id);
+    text_field("source_asset", resource.source_asset.string());
+    bool_field("has_fallback", resource.has_fallback);
+    u32_field("source_vertices", resource.source_vertex_count);
+    u32_field("source_triangles", resource.source_triangle_count);
+    u32_field("seam_locked_vertices", resource.seam_locked_vertex_count);
+    vec3_field("bounds_min", resource.bounds.min);
+    vec3_field("bounds_max", resource.bounds.max);
+    size_field("material_sections", resource.material_sections.size());
+    size_field("hierarchy_nodes", resource.hierarchy_nodes.size());
+    size_field("clusters", resource.clusters.size());
+    size_field("pages", resource.pages.size());
+    size_field("lod_groups", resource.lod_groups.size());
+    size_field("lod_clusters", resource.lod_clusters.size());
+    size_field("node_lod_links", resource.node_lod_links.size());
+    size_field("page_dependencies", resource.page_dependencies.size());
+    size_field("cluster_geometry_bytes", resource.cluster_geometry_payload.size());
+    size_field("lod_geometry_bytes", resource.lod_geometry_payload.size());
+    text_field("texture", resource.texture_payload.empty() ? "none" : "checker");
+    u32_field("texture_width", resource.texture_width);
+    u32_field("texture_height", resource.texture_height);
+    size_field("texture_bytes", resource.texture_payload.size());
+    u32_field("uv_clusters", count_uv_clusters(resource.clusters));
+    u32_field("uv_lod_clusters", count_uv_lod_clusters(resource.lod_clusters));
+    return fields;
+}
+
 }  // namespace
 
 MaterialSectionDisk to_disk(const MaterialSection& section) {
@@ -212,20 +332,21 @@ ResourceSummary read_resource_summary(const std::filesystem::path& input_path) {
     return summary;
 }
 
-// 64-bit FNV-1a over the header/summary metadata, the payload bytes, and the
-// page layout (fields hashed individually: PageRecord contains alignment
-// padding between page_index and byte_offset that would leak uninitialized
-// bytes into a raw-struct hash). The metadata coverage is what ties the
-// fingerprint to the fields the textual sidecar and the persisted-.vgeo
-// acceptance check mirror (asset_id, source_asset, fallback/textured flags,
-// bounds, totals, texture dims): without it, a rebuild that changed only
-// metadata produced the same fingerprint and a stale sidecar still paired.
-// The header's table offsets are pure functions of the totals and payload
-// sizes hashed here (see the layout math in write_resource) and are not
-// hashed separately: the viewer's rebuild comparison computes this from an
-// in-memory resource that has not derived its offsets yet. Changing this
-// input set changes every fingerprint; pre-change .vgeo+sidecar pairs then
-// fail the pairing check on purpose (regeneration required).
+// 64-bit FNV-1a over the canonical sidecar field table (every scalar
+// metadata field the summary publishes -- see collect_sidecar_fields), the
+// page layout, the base-run count, and the payload bytes (fields hashed
+// individually: PageRecord contains alignment padding between page_index
+// and byte_offset that would leak uninitialized bytes into a raw-struct
+// hash). Hashing the field table is what ties the fingerprint to the
+// sidecar: a rebuild that changed only sidecar metadata (e.g. only
+// seam_locked_vertices) produces a different fingerprint, so a stale
+// sidecar can never pair with a new .vgeo. The header's table offsets are
+// pure functions of the totals and payload sizes hashed here (see the
+// layout math in write_resource) and are not hashed separately: the
+// viewer's rebuild comparison computes this from an in-memory resource
+// that has not derived its offsets yet. Changing this input set changes
+// every fingerprint; pre-change .vgeo+sidecar pairs then fail the pairing
+// check on purpose (regeneration required).
 uint64_t compute_content_fingerprint(const VGeoResource& resource) {
     uint64_t hash = 1469598103934665603ull;
     const auto mix_bytes = [&hash](const std::byte* data, size_t size) {
@@ -252,29 +373,18 @@ uint64_t compute_content_fingerprint(const VGeoResource& resource) {
             mix_bytes(payload.data(), payload.size());
         }
     };
-    // Summary block: asset_id, source_asset, has_fallback, source counts.
-    mix_string(resource.asset_id);
-    mix_string(resource.source_asset.string());
-    mix_u64(resource.has_fallback ? 1ull : 0ull);
-    mix_u64(resource.source_vertex_count);
-    mix_u64(resource.source_triangle_count);
-    // File header flags and totals: the textured flag mirrors a non-empty
-    // texture payload; the byte totals mirror the payload sizes mixed below.
-    mix_u64(resource.texture_payload.empty() ? 0ull : 1ull);
-    mix_u64(resource.texture_width);
-    mix_u64(resource.texture_height);
-    const float bounds_fields[6] = {resource.bounds.min.x, resource.bounds.min.y,
-                                    resource.bounds.min.z, resource.bounds.max.x,
-                                    resource.bounds.max.y, resource.bounds.max.z};
-    mix_bytes(reinterpret_cast<const std::byte*>(bounds_fields), sizeof(bounds_fields));
-    mix_u64(resource.material_sections.size());
-    mix_u64(resource.hierarchy_nodes.size());
-    mix_u64(resource.clusters.size());
-    mix_u64(resource.pages.size());
-    mix_u64(resource.lod_groups.size());
-    mix_u64(resource.lod_clusters.size());
-    mix_u64(resource.node_lod_links.size());
-    mix_u64(resource.page_dependencies.size());
+    for (const SidecarField& field : collect_sidecar_fields(resource)) {
+        mix_string(field.key);
+        mix_u64(field.a);
+        mix_u64(field.b);
+        mix_u64(field.c);
+        if (!field.text.empty()) {
+            mix_bytes(reinterpret_cast<const std::byte*>(field.text.data()), field.text.size());
+        }
+    }
+    // Layout inputs beyond the sidecar table: the base-run table has no
+    // sidecar scalar, and the page records + payload bytes are the content
+    // the sidecar's counts summarize.
     mix_u64(resource.lod_group_base_runs.size());
     for (const PageRecord& page : resource.pages) {
         mix_u64(page.page_index);
@@ -501,45 +611,16 @@ void write_summary(const VGeoResource& resource, const std::filesystem::path& ou
         throw BuilderError("failed to open summary file: " + temp_path.string());
     }
 
-    output << "asset_id=" << resource.asset_id << '\n';
-    output << "source_asset=" << resource.source_asset.string() << '\n';
-    output << "content_fingerprint=" << compute_content_fingerprint(resource) << '\n';
-    output << "has_fallback=" << (resource.has_fallback ? "true" : "false") << '\n';
-    output << "source_vertices=" << resource.source_vertex_count << '\n';
-    output << "source_triangles=" << resource.source_triangle_count << '\n';
-    output << "seam_locked_vertices=" << resource.seam_locked_vertex_count << '\n';
-    output << "bounds_min=" << resource.bounds.min.x << ' ' << resource.bounds.min.y << ' '
-           << resource.bounds.min.z << '\n';
-    output << "bounds_max=" << resource.bounds.max.x << ' ' << resource.bounds.max.y << ' '
-           << resource.bounds.max.z << '\n';
-    output << "material_sections=" << resource.material_sections.size() << '\n';
-    output << "hierarchy_nodes=" << resource.hierarchy_nodes.size() << '\n';
-    output << "clusters=" << resource.clusters.size() << '\n';
-    output << "pages=" << resource.pages.size() << '\n';
-    output << "lod_groups=" << resource.lod_groups.size() << '\n';
-    output << "lod_clusters=" << resource.lod_clusters.size() << '\n';
-    output << "node_lod_links=" << resource.node_lod_links.size() << '\n';
-    output << "page_dependencies=" << resource.page_dependencies.size() << '\n';
-    output << "cluster_geometry_bytes=" << resource.cluster_geometry_payload.size() << '\n';
-    output << "lod_geometry_bytes=" << resource.lod_geometry_payload.size() << '\n';
-    output << "texture=" << (resource.texture_payload.empty() ? "none" : "checker") << '\n';
-    output << "texture_width=" << resource.texture_width << '\n';
-    output << "texture_height=" << resource.texture_height << '\n';
-    output << "texture_bytes=" << resource.texture_payload.size() << '\n';
-    uint32_t uv_cluster_count = 0;
-    for (const ClusterRecord& cluster : resource.clusters) {
-        if ((cluster.flags & kClusterFlagHasUv) != 0) {
-            uv_cluster_count += 1;
+    // The scalar metadata section comes from the same canonical field
+    // table the fingerprint hashes (collect_sidecar_fields); the pairing
+    // key is inserted at its historical position right after source_asset.
+    const std::vector<SidecarField> sidecar_fields = collect_sidecar_fields(resource);
+    for (const SidecarField& field : sidecar_fields) {
+        output << field.key << '=' << field.text << '\n';
+        if (std::string_view(field.key) == "source_asset") {
+            output << "content_fingerprint=" << compute_content_fingerprint(resource) << '\n';
         }
     }
-    uint32_t uv_lod_cluster_count = 0;
-    for (const LodClusterRecord& cluster : resource.lod_clusters) {
-        if ((cluster.flags & kClusterFlagHasUv) != 0) {
-            uv_lod_cluster_count += 1;
-        }
-    }
-    output << "uv_clusters=" << uv_cluster_count << '\n';
-    output << "uv_lod_clusters=" << uv_lod_cluster_count << '\n';
 
     for (size_t index = 0; index < resource.material_sections.size(); ++index) {
         output << "material[" << index << "]=" << resource.material_sections[index].name << '\n';
