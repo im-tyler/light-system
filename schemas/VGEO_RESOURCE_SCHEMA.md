@@ -1,6 +1,6 @@
 # VGeo Resource Schema
 
-Last updated: 2026-03-23
+Last updated: 2026-09-12
 
 This is the first-pass logical schema for a dense-geometry resource.
 
@@ -21,7 +21,21 @@ It is intentionally implementation-agnostic and should be refined before binary 
 Required fields:
 
 - magic
-- schema version (current: 3 -- v2 added multi-run LOD-group base coverage, v3 added LOD-cluster normal cones)
+- schema version (current: 6)
+  - v2 added multi-run LOD-group base coverage
+  - v3 added LOD-cluster normal cones
+  - v4 added optional per-vertex UVs in cluster payloads
+    (kClusterFlagHasUv) and an embedded RGBA8 texture payload domain
+    (header flag kFileFlagTextured)
+  - v5 added cull_sphere[4] to cluster and LOD-cluster records (readers
+    loading v3/v4 files synthesize the sphere from the cluster AABB)
+  - v6 added content_fingerprint to the file header, a 64-bit FNV-1a
+    over the payload bytes and the page layout, so persisted-.vgeo fast
+    paths can reject a cache whose content does not match the freshly
+    built resource
+  - the current version is also pinned by
+    `kSchemaVersion` in `prototype/src/builder_internal.h`; CI compares
+    the two via `tools/check_schema_version.sh`
 - builder version
 - source asset identifier
 - source asset hash

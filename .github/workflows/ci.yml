@@ -12,6 +12,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Vendor dependencies
         run: ./tools/vendor_thirdparty.sh
+      - name: Check schema version pin
+        run: ./tools/check_schema_version.sh
       - name: Install build dependencies
         run: brew install glfw shaderc vulkan-headers vulkan-loader pkg-config
       - name: Configure
