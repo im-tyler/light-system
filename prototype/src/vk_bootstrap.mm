@@ -1348,6 +1348,22 @@ VkPresentModeKHR choose_present_mode(const std::vector<VkPresentModeKHR>& presen
     return present_modes.front();
 }
 
+// First supported composite alpha mode, preferring opaque. The spec
+// guarantees at least one bit in supportedCompositeAlpha; INHERIT is the
+// final fallback and is always legal.
+VkCompositeAlphaFlagBitsKHR choose_composite_alpha(VkCompositeAlphaFlagsKHR supported) {
+    if ((supported & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR) != 0) {
+        return VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    }
+    if ((supported & VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR) != 0) {
+        return VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
+    }
+    if ((supported & VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR) != 0) {
+        return VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR;
+    }
+    return VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
+}
+
 VkExtent2D choose_swapchain_extent(GLFWwindow* window, const VkSurfaceCapabilitiesKHR& capabilities) {
     if (capabilities.currentExtent.width != std::numeric_limits<uint32_t>::max()) {
         return capabilities.currentExtent;
@@ -1420,9 +1436,18 @@ VkResult create_swapchain(VkPhysicalDevice physical_device, VkDevice device, VkS
     create_info.imageColorSpace = swapchain.surface_format.colorSpace;
     create_info.imageExtent = swapchain.extent;
     create_info.imageArrayLayers = 1;
-    create_info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    // COLOR_ATTACHMENT is guaranteed to be supported for swapchains;
+    // everything else must come from supportedUsageFlags. TRANSFER_SRC is
+    // what the screenshot readback needs -- when the surface does not
+    // allow it the swapchain is still created and the screenshot request
+    // fails explicitly instead (see the capture path).
+    create_info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    if ((capabilities.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0) {
+        create_info.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        swapchain.images_support_transfer_src = true;
+    }
     create_info.preTransform = capabilities.currentTransform;
-    create_info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    create_info.compositeAlpha = choose_composite_alpha(capabilities.supportedCompositeAlpha);
     create_info.presentMode = swapchain.present_mode;
     create_info.clipped = VK_TRUE;
 
@@ -4098,6 +4123,11 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
         // images must be re-acquired before use.
         if (!config.screenshot_path.empty() && report.presented_frame_count > 0 &&
             !swapchain.images.empty() && frame.command_pool != VK_NULL_HANDLE) {
+            if (!swapchain.images_support_transfer_src) {
+                std::fprintf(stderr,
+                             "screenshot requested but this surface does not support "
+                             "TRANSFER_SRC swapchain usage; capture unavailable\n");
+            } else {
             std::filesystem::path screenshot_path(config.screenshot_path);
             if (screenshot_path.extension() != ".ppm") {
                 screenshot_path.replace_extension(".ppm");
@@ -4193,6 +4223,7 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
             }
             if (acquire_fence != VK_NULL_HANDLE) {
                 vkDestroyFence(device, acquire_fence, nullptr);
+            }
             }
         }
 

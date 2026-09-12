@@ -66,6 +66,11 @@ struct SwapchainContext {
     VkExtent2D extent{};
     std::vector<VkImage> images;
     std::vector<VkImageView> image_views;
+    // Whether the created swapchain's images can be used as transfer
+    // sources (surface supportedUsageFlags bit). The screenshot path is
+    // the consumer; when false it must fail at request time instead of
+    // recording a copy the usage flags never allowed.
+    bool images_support_transfer_src = false;
 };
 
 struct FrameContext {
