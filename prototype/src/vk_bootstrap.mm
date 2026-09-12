@@ -1098,7 +1098,8 @@ void analyze_visibility_readback(VkDevice device, const SwapchainContext& swapch
     vkUnmapMemory(device, debug_render.visibility_readback_buffer.memory);
 }
 
-std::vector<const char*> collect_instance_extensions() {
+std::vector<const char*> collect_instance_extensions(bool& portability_enumeration) {
+    portability_enumeration = false;
     uint32_t available_extension_count = 0;
     vkEnumerateInstanceExtensionProperties(nullptr, &available_extension_count, nullptr);
     std::vector<VkExtensionProperties> available_extensions(available_extension_count);
@@ -1125,8 +1126,14 @@ std::vector<const char*> collect_instance_extensions() {
 #endif
     }
 
-    extensions.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
-    extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+    // VK_KHR_get_physical_device_properties2 is core since Vulkan 1.1 and
+    // the requested apiVersion below is 1.2, so the extension name is not
+    // requested at all -- loaders that only expose it as an extension (and
+    // nothing newer) must not fail instance creation over it.
+    if (supports_extension(available_extensions, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
+        extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+        portability_enumeration = true;
+    }
     return extensions;
 }
 
@@ -2347,7 +2354,9 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
         glfwWindowHint(GLFW_VISIBLE, config.visible_window ? GLFW_TRUE : GLFW_FALSE);
         glfwWindowHint(GLFW_RESIZABLE, config.visible_window ? GLFW_TRUE : GLFW_FALSE);
 
-        std::vector<const char*> instance_extensions = collect_instance_extensions();
+        bool portability_enumeration = false;
+        std::vector<const char*> instance_extensions =
+            collect_instance_extensions(portability_enumeration);
         std::vector<const char*> validation_layers = collect_validation_layers(config.enable_validation);
         if (!validation_layers.empty()) {
             instance_extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
@@ -2369,7 +2378,12 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
         instance_info.enabledLayerCount = static_cast<uint32_t>(validation_layers.size());
         instance_info.ppEnabledLayerNames =
             validation_layers.empty() ? nullptr : validation_layers.data();
-        instance_info.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+        // The portability enumeration flag is only valid together with the
+        // VK_KHR_portability_enumeration extension; setting it when the
+        // extension was not enabled fails instance creation.
+        if (portability_enumeration) {
+            instance_info.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+        }
 
         VkResult result = vkCreateInstance(&instance_info, nullptr, &instance);
         if (result != VK_SUCCESS) {
