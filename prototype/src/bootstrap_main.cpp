@@ -192,6 +192,23 @@ int main(int argc, char** argv) {
             std::cout << "physical_device[" << device_index << "]="
                       << report.physical_devices[device_index] << '\n';
         }
+
+        // The report is the verdict: fail on initialization, submission, or
+        // fixed-count present-loop failure. A completed fixed-frame run and
+        // a clean interactive close (present_loop_completed is by design
+        // false there) both stay success.
+        const bool initialization_ok = report.compiled_with_vulkan && report.instance_created &&
+                                       report.window_created && report.surface_created &&
+                                       report.device_created && report.swapchain_created;
+        const bool submission_ok = report.debug_draw_submitted;
+        const bool present_loop_ok = interactive || report.present_loop_completed;
+        if (!initialization_ok || !submission_ok || !present_loop_ok) {
+            std::cerr << "bootstrap failed (initialization=" << initialization_ok
+                      << " submission=" << submission_ok
+                      << " present_loop=" << present_loop_ok
+                      << "): " << report.status << '\n';
+            return 4;
+        }
         return 0;
     } catch (const meridian::BuilderError& error) {
         std::cerr << "Bootstrap error: " << error.what() << '\n';
