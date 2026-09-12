@@ -29,6 +29,16 @@ constexpr uint32_t kSceneFlagTextured = 1u << 1;
 }  // namespace
 
 UploadableScene build_uploadable_scene(const VGeoResource& resource) {
+    // Defensive twin of the build-time check (builder_validate.cpp): the
+    // visibility encoding stores geometry_index in 22 bits, so anything
+    // the GPU-side ids could not represent is rejected at upload time
+    // instead of aliasing on readback.
+    constexpr uint32_t kVisibilityMaxGeometryCount = 0x400000u;
+    if (resource.clusters.size() > kVisibilityMaxGeometryCount ||
+        resource.lod_clusters.size() > kVisibilityMaxGeometryCount) {
+        throw BuilderError("cluster count exceeds the visibility encoding limit of 0x400000 "
+                           "(22-bit geometry_index)");
+    }
     UploadableScene scene;
     scene.header.instance_count = 1;
     scene.header.hierarchy_node_count = static_cast<uint32_t>(resource.hierarchy_nodes.size());

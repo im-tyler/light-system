@@ -81,6 +81,19 @@ void validate_resource(const VGeoResource& resource) {
     if (!resource.clusters.empty() && resource.pages.empty()) {
         throw BuilderError("resource with clusters must define pages");
     }
+    // The visibility ABI (visibility_format.h) stores geometry_index in 22
+    // bits (kVisibilityGeometryIndexMask = 0x3fffff): encode_visibility
+    // silently truncates, so ids past 0x400000 alias earlier geometry in
+    // the readback and the selection-subset check sees phantom survivors.
+    constexpr uint32_t kVisibilityMaxGeometryCount = 0x400000u;
+    if (resource.clusters.size() > kVisibilityMaxGeometryCount) {
+        throw BuilderError("cluster count exceeds the visibility encoding limit of 0x400000 "
+                           "(22-bit geometry_index)");
+    }
+    if (resource.lod_clusters.size() > kVisibilityMaxGeometryCount) {
+        throw BuilderError("lod cluster count exceeds the visibility encoding limit of 0x400000 "
+                           "(22-bit geometry_index)");
+    }
 
     for (size_t cluster_index = 0; cluster_index < resource.clusters.size(); ++cluster_index) {
         const ClusterRecord& cluster = resource.clusters[cluster_index];
