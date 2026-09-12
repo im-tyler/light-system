@@ -1030,11 +1030,13 @@ struct GravityWorld {
         all_pairs.emplace_back(w, dx * dx + dy * dy);
       }
     }
-    const f64 lam = solve(all_pairs, c.binding);
-    for (auto &b : base) {
-      b.first *= lam;
-      b.second *= lam;
-    }
+    // Section 25 pins the order: classify the base (step 2) before the
+    // global scale (step 3). The mass-weighted mean and radii come from
+    // the UNSCALED section 20 displacements and the shells vector is
+    // retained for the per-shell solves — solving and applying lambda
+    // first can flip rank near-ties under binary64 rounding (scaled
+    // radii about the scaled mean are not exactly the unscaled radii),
+    // changing shell membership.
     f64 swx = 0.0;
     f64 swy = 0.0;
     for (std::size_t a = 0; a < n; ++a) {
@@ -1051,6 +1053,11 @@ struct GravityWorld {
       radii[a] = std::sqrt(dx * dx + dy * dy);
     }
     const std::vector<int> shells = g_shell_assignment(radii);
+    const f64 lam = solve(all_pairs, c.binding);
+    for (auto &b : base) {
+      b.first *= lam;
+      b.second *= lam;
+    }
     const int s = g_shell_count(n);
     std::vector<std::vector<std::pair<f64, f64>>> pairs(s);
     for (std::size_t a = 0; a < n; ++a) {
