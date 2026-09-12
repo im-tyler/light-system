@@ -2528,6 +2528,36 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
         vkGetDeviceQueue(device, selection.queues.graphics_family, 0, &graphics_queue);
         vkGetDeviceQueue(device, selection.queues.present_family, 0, &present_queue);
 
+        // The main-pass descriptors bind the whole geometry payload buffers
+        // as storage buffers (vk_render.cpp writes use the full buffer
+        // range), and maxStorageBufferRange (core minimum 128 MiB) caps the
+        // range a device must accept. Reject an oversized payload cleanly
+        // here, before any descriptor is written or rendering starts.
+        // Payload splitting or 64-bit shader addressing is future work
+        // (AUDIT_OPEN.md, LS-54).
+        {
+            VkPhysicalDeviceProperties properties{};
+            vkGetPhysicalDeviceProperties(selection.physical_device, &properties);
+            const uint64_t max_storage_range =
+                static_cast<uint64_t>(properties.limits.maxStorageBufferRange);
+            const uint64_t payload_sizes[2] = {resource.cluster_geometry_payload.size(),
+                                               resource.lod_geometry_payload.size()};
+            const char* payload_names[2] = {"cluster geometry payload",
+                                            "LOD geometry payload"};
+            for (int payload_index = 0; payload_index < 2; ++payload_index) {
+                if (payload_sizes[payload_index] > max_storage_range) {
+                    std::ostringstream message;
+                    message << payload_names[payload_index] << " (" << payload_sizes[payload_index]
+                            << " bytes) exceeds device maxStorageBufferRange ("
+                            << max_storage_range
+                            << " bytes); payload splitting is not implemented";
+                    report.status = message.str();
+                    cleanup();
+                    return report;
+                }
+            }
+        }
+
         // Create GPU profiler (7 timer pairs: cull, sel, occ, shadow, main, hzb, total)
         if (config.enable_gpu_timers) {
             VkResult prof_result = create_gpu_profiler(selection.physical_device, device,
