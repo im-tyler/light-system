@@ -3457,14 +3457,16 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
             // The main pass draws the main selection; the shadow pass draws the
             // (possibly coarser) shadow caster selection.
             //
-            // Filters applied to the main list:
-            //   1. Frustum AABB test (base + LOD) -- mirrors instance_cull but at
-            //      cluster granularity. Assumes cluster bounds are world-space
-            //      (single-instance / identity transform scenes).
-            //   2. Normal-cone backface cull (base + LOD clusters), radius-compensated.
-            // The shadow list applies only the per-cascade ortho-frustum overlap
-            // test: camera-facing culls don't apply to casters (a cluster facing
-            // away from the camera can still cast a shadow into the camera's view).
+             // Filters applied to the main list:
+             //   1. Frustum AABB test (base + LOD) -- mirrors instance_cull but at
+             //      cluster granularity. Assumes cluster bounds are world-space
+             //      (single-instance / identity transform scenes).
+             // No normal-cone backface cull on the main list: the main pass
+             // rasterizes two-sided (VK_CULL_MODE_NONE), so cone-backfacing
+             // clusters remain visible and must not be CPU-dropped.
+             // The shadow list applies only the per-cascade ortho-frustum overlap
+             // test: camera-facing culls don't apply to casters (a cluster facing
+             // away from the camera can still cast a shadow into the camera's view).
             const FrustumPlanes frustum =
                 extract_frustum_planes(camera_frame.view_projection);
             auto aabb_outside_frustum = [&](const float bmin[4], const float bmax[4]) -> bool {
@@ -3517,9 +3519,8 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
                 std::vector<GpuDrawEntry> shadow_draws;
                 cpu_draws.reserve(selection_for_frame.selected_cluster_indices.size() +
                                   selection_for_frame.selected_lod_cluster_indices.size());
-                shadow_draws.reserve(shadow_selection->selected_cluster_indices.size() +
-                                     shadow_selection->selected_lod_cluster_indices.size());
-                const Vec3f cam = camera_frame.camera_position;
+                 shadow_draws.reserve(shadow_selection->selected_cluster_indices.size() +
+                                      shadow_selection->selected_lod_cluster_indices.size());
                 // Chunked selection -> GpuDrawEntry conversion. Each chunk
                 // job appends to its own output with chunk-local
                 // first_instance; the ordered concat afterwards fixes
@@ -3548,38 +3549,20 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
                             out.reserve(end - begin);
                             for (size_t i = begin; i < end; ++i) {
                                 const uint32_t ci = selection_list[i];
-                                // Main-pass entry has camera-frustum +
-                                // normal-cone culls.
-                                // Normal-cone backface cull (mirrors
-                                // is_base_cluster_backfacing). Cone packing:
-                                // xyz = cone axis, w = cone cutoff. Cutoff >= 1.0
-                                // means meshoptimizer could not compute a useful
-                                // cone; do not cull. Radius-compensated test
-                                // (meshopt canonical, sphere formulation): reject
-                                // when dot(center - cam, axis) >= cutoff *
-                                // |center - cam| + radius, with the cluster's
-                                // bounding sphere. Without the radius term, tight
-                                // front-facing cones get wrongly culled.
+                                // Main-pass entry has camera-frustum culls.
+                                // No normal-cone backface cull here: the main
+                                // pass rasterizes two-sided
+                                // (VK_CULL_MODE_NONE, see vk_render.cpp), so a
+                                // cone-backfacing cluster is still visible
+                                // (e.g. a plane viewed from behind) and must
+                                // not be CPU-dropped. This costs some extra
+                                // draw entries on silhouette clusters.
                                 if (is_lod_domain) {
                                     const GpuLodClusterRecord& c =
                                         report.uploadable_scene.lod_clusters[ci];
                                     if (aabb_outside_frustum(c.bounds_min.data(),
                                                              c.bounds_max.data())) {
                                         continue;
-                                    }
-                                    const float cone_cutoff = c.normal_cone[3];
-                                    if (cone_cutoff < 1.0f) {
-                                        const float vx = c.cull_sphere[0] - cam.x;
-                                        const float vy = c.cull_sphere[1] - cam.y;
-                                        const float vz = c.cull_sphere[2] - cam.z;
-                                        const float len =
-                                            std::sqrt(vx * vx + vy * vy + vz * vz);
-                                        const float d = vx * c.normal_cone[0] +
-                                                        vy * c.normal_cone[1] +
-                                                        vz * c.normal_cone[2];
-                                        if (d >= cone_cutoff * len + c.cull_sphere[3]) {
-                                            continue;
-                                        }
                                     }
                                     GpuDrawEntry e{};
                                     e.draw_vertex_count = c.local_triangle_count * 3u;
@@ -3600,20 +3583,6 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
                                     if (aabb_outside_frustum(c.bounds_min.data(),
                                                              c.bounds_max.data())) {
                                         continue;
-                                    }
-                                    const float cone_cutoff = c.normal_cone[3];
-                                    if (cone_cutoff < 1.0f) {
-                                        const float vx = c.cull_sphere[0] - cam.x;
-                                        const float vy = c.cull_sphere[1] - cam.y;
-                                        const float vz = c.cull_sphere[2] - cam.z;
-                                        const float len =
-                                            std::sqrt(vx * vx + vy * vy + vz * vz);
-                                        const float d = vx * c.normal_cone[0] +
-                                                        vy * c.normal_cone[1] +
-                                                        vz * c.normal_cone[2];
-                                        if (d >= cone_cutoff * len + c.cull_sphere[3]) {
-                                            continue;
-                                        }
                                     }
                                     GpuDrawEntry e{};
                                     e.draw_vertex_count = c.local_triangle_count * 3u;
