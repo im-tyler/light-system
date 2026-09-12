@@ -3,6 +3,10 @@
 #include "runtime_model.h"
 #include "vgeo_builder.h"
 
+#include <cerrno>
+#include <charconv>
+#include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 
@@ -32,22 +36,33 @@ std::vector<std::string> split_list(std::string_view input) {
     return values;
 }
 
-uint32_t parse_u32(std::string_view value) {
+// Checked full-string parsing: std::stoul/stof accept trailing junk, wrap
+// out-of-range values (4294967296 -> 0), and parse nan/inf/partial floats.
+// Errors name the key and the offending value.
+uint32_t parse_u32(const std::string& key, std::string_view value) {
     const std::string trimmed = trim(value);
-    try {
-        return static_cast<uint32_t>(std::stoul(trimmed));
-    } catch (const std::exception&) {
-        throw BuilderError("invalid replay u32 value: " + std::string(value));
+    uint32_t parsed = 0;
+    const char* begin = trimmed.data();
+    const char* end = begin + trimmed.size();
+    const std::from_chars_result result = std::from_chars(begin, end, parsed);
+    if (trimmed.empty() || result.ec != std::errc() || result.ptr != end) {
+        throw BuilderError("replay script key '" + key + "' has invalid u32 value: " + trimmed);
     }
+    return parsed;
 }
 
-float parse_float(std::string_view value) {
+float parse_float(const std::string& key, std::string_view value) {
     const std::string trimmed = trim(value);
-    try {
-        return std::stof(trimmed);
-    } catch (const std::exception&) {
-        throw BuilderError("invalid replay float value: " + std::string(value));
+    if (!trimmed.empty()) {
+        const char* begin = trimmed.c_str();
+        char* parse_end = nullptr;
+        errno = 0;
+        const float parsed = std::strtof(begin, &parse_end);
+        if (errno != ERANGE && parse_end == begin + trimmed.size() && std::isfinite(parsed)) {
+            return parsed;
+        }
     }
+    throw BuilderError("replay script key '" + key + "' has invalid float value: " + trimmed);
 }
 
 }  // namespace
@@ -82,11 +97,11 @@ ReplayScript load_replay_script(const std::filesystem::path& script_path) {
         if (key == "name") {
             script.name = value;
         } else if (key == "frame_count") {
-            script.frame_count = parse_u32(value);
+            script.frame_count = parse_u32(key, value);
         } else if (key == "resident_budget") {
-            script.resident_budget = parse_u32(value);
+            script.resident_budget = parse_u32(key, value);
         } else if (key == "eviction_grace_frames") {
-            script.eviction_grace_frames = parse_u32(value);
+            script.eviction_grace_frames = parse_u32(key, value);
         } else if (key == "bootstrap_resident") {
             script.bootstrap_resident = value;
         } else if (key == "error_thresholds") {
@@ -94,7 +109,7 @@ ReplayScript load_replay_script(const std::filesystem::path& script_path) {
             script.error_thresholds.clear();
             script.error_thresholds.reserve(values.size());
             for (const std::string& item : values) {
-                script.error_thresholds.push_back(parse_float(item));
+                script.error_thresholds.push_back(parse_float(key, item));
             }
         } else {
             throw BuilderError("unknown replay script key: " + key);
