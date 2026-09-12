@@ -41,7 +41,18 @@ struct DeviceSelection {
     VkPhysicalDevice physical_device = VK_NULL_HANDLE;
     QueueFamilySelection queues;
     bool enable_portability_subset = false;
+    // KHR_draw_indirect_count (extension string or the Vulkan 1.2 core
+    // feature) AND the core features the generated draws rely on:
+    // multiDrawIndirect and drawIndirectFirstInstance. The runtime draw
+    // path additionally checks max_draw_indirect_count against the draw
+    // list capacities (see build_vk_bootstrap_report).
     bool has_draw_indirect_count = false;
+    uint32_t max_draw_indirect_count = 0;
+    // True when the device advertises the VK_KHR_draw_indirect_count
+    // extension string (as opposed to only the promoted Vulkan 1.2 core
+    // feature, which must then be requested via the Vulkan12Features
+    // chain at device creation).
+    bool has_draw_indirect_count_extension = false;
     // True when viewport/layer vertex-stage writes come from the Vulkan
     // 1.2 core shaderOutputLayer feature instead of
     // VK_EXT_shader_viewport_index_layer (devices >= 1.2).

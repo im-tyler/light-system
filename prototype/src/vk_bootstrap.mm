@@ -1233,12 +1233,39 @@ DeviceSelection select_device(VkInstance instance, VkSurfaceKHR surface, VkBoots
             continue;
         }
 
+        // The indirect-count draw path generates multi-draw commands with
+        // non-zero firstInstance, so the KHR extension (or its Vulkan 1.2
+        // core promotion) alone is not enough: the core
+        // multiDrawIndirect + drawIndirectFirstInstance features must be
+        // supported too, and the draw list must fit maxDrawIndirectCount
+        // (checked against the list capacities after they are known).
+        VkPhysicalDeviceFeatures supported_features{};
+        vkGetPhysicalDeviceFeatures(physical_device, &supported_features);
+        const bool has_dic_extension =
+            supports_extension(extensions, VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME);
+        bool draw_indirect_count_capable = has_dic_extension;
+        if (!draw_indirect_count_capable && properties.apiVersion >= VK_API_VERSION_1_2) {
+            VkPhysicalDeviceFeatures2 features2{};
+            features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            VkPhysicalDeviceVulkan12Features features12{};
+            features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+            features2.pNext = &features12;
+            vkGetPhysicalDeviceFeatures2(physical_device, &features2);
+            draw_indirect_count_capable = features12.drawIndirectCount == VK_TRUE;
+        }
+        if (draw_indirect_count_capable &&
+            (supported_features.multiDrawIndirect != VK_TRUE ||
+             supported_features.drawIndirectFirstInstance != VK_TRUE)) {
+            draw_indirect_count_capable = false;
+        }
+
         selection.physical_device = physical_device;
         selection.queues = queues;
         selection.enable_portability_subset =
             supports_extension(extensions, "VK_KHR_portability_subset");
-        selection.has_draw_indirect_count =
-            supports_extension(extensions, VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME);
+        selection.has_draw_indirect_count = draw_indirect_count_capable;
+        selection.has_draw_indirect_count_extension = has_dic_extension;
+        selection.max_draw_indirect_count = properties.limits.maxDrawIndirectCount;
         selection.shader_output_layer_feature = shader_output_layer_feature;
         report.selected_device = properties.deviceName;
         report.graphics_queue_family = queues.graphics_family;
@@ -2339,14 +2366,23 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
         // VkPhysicalDeviceVulkan12Features chain below instead of the EXT
         // extension (never both at once); only pre-1.2 devices take the
         // extension route here.
-        if (!selection.shader_output_layer_feature) {
+        const bool viewport_layer_via_extension = !selection.shader_output_layer_feature;
+        if (viewport_layer_via_extension) {
             device_extensions.push_back("VK_EXT_shader_viewport_index_layer");
         }
         if (selection.enable_portability_subset) {
             device_extensions.push_back("VK_KHR_portability_subset");
         }
+        // When the draw-indirect-count capability comes from the Vulkan
+        // 1.2 core feature rather than the extension string, the feature
+        // is requested through the Vulkan12Features chain below.
+        bool draw_indirect_count_via_feature = false;
         if (selection.has_draw_indirect_count) {
-            device_extensions.push_back(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME);
+            if (selection.has_draw_indirect_count_extension) {
+                device_extensions.push_back(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME);
+            } else {
+                draw_indirect_count_via_feature = true;
+            }
         }
 
         VkPhysicalDeviceFeatures supported_features{};
@@ -2357,9 +2393,14 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
         device_features.independentBlend = supported_features.independentBlend;
 
         VkPhysicalDeviceVulkan12Features vulkan12_features{};
+        bool chain_vulkan12_features = false;
         if (selection.shader_output_layer_feature) {
-            vulkan12_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
             vulkan12_features.shaderOutputLayer = VK_TRUE;
+            chain_vulkan12_features = true;
+        }
+        if (draw_indirect_count_via_feature) {
+            vulkan12_features.drawIndirectCount = VK_TRUE;
+            chain_vulkan12_features = true;
         }
 
         VkDeviceCreateInfo device_info{};
@@ -2369,7 +2410,8 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
         device_info.enabledExtensionCount = static_cast<uint32_t>(device_extensions.size());
         device_info.ppEnabledExtensionNames = device_extensions.data();
         device_info.pEnabledFeatures = &device_features;
-        if (vulkan12_features.sType != 0) {
+        if (chain_vulkan12_features) {
+            vulkan12_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
             device_info.pNext = &vulkan12_features;
         }
 
@@ -2910,6 +2952,21 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
             report.status = message.str();
             cleanup();
             return report;
+        }
+        // maxDrawIndirectCount gate: every vkCmdDrawIndirectCount passes its
+        // list capacity as maxDrawCount, which must not exceed the device
+        // limit. Splitting is impractical here because the count buffer is
+        // GPU-written (the occlusion survivor count), so when any capacity
+        // exceeds the limit the run falls back to the CPU folded path.
+        if (has_draw_indirect_count &&
+            (selection.max_draw_indirect_count < compute_selection.max_draws ||
+             selection.max_draw_indirect_count < occlusion_refine.max_draws ||
+             selection.max_draw_indirect_count < shadow.max_draws)) {
+            has_draw_indirect_count = false;
+            std::fprintf(stderr,
+                         "MERIDIAN_VK: draw list capacity %u exceeds maxDrawIndirectCount %u; "
+                         "using the CPU folded draw path\n",
+                         compute_selection.max_draws, selection.max_draw_indirect_count);
         }
         report.debug_pipeline_created = true;
         report.debug_geometry_uploaded = debug_render.descriptor_set != VK_NULL_HANDLE;
