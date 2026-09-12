@@ -4134,7 +4134,32 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
             }
             const uint32_t w = swapchain.extent.width;
             const uint32_t h = swapchain.extent.height;
-            const VkDeviceSize pixel_size = 4; // BGRA
+            // Byte offsets of R and G inside each 4-byte pixel of the
+            // readback, from the swapchain's actual format (B is 3 - R - G).
+            // Formats outside the BGRA8/RGBA8 pairs are rejected rather
+            // than written with a guessed channel order.
+            uint32_t red_offset = 0;
+            uint32_t green_offset = 0;
+            switch (swapchain.surface_format.format) {
+                case VK_FORMAT_B8G8R8A8_UNORM:
+                case VK_FORMAT_B8G8R8A8_SRGB:
+                    red_offset = 2;
+                    green_offset = 1;
+                    break;
+                case VK_FORMAT_R8G8B8A8_UNORM:
+                case VK_FORMAT_R8G8B8A8_SRGB:
+                    red_offset = 0;
+                    green_offset = 1;
+                    break;
+                default:
+                    std::fprintf(stderr,
+                                 "screenshot requested but surface format %d has no capture "
+                                 "swizzle; capture unavailable\n",
+                                 static_cast<int>(swapchain.surface_format.format));
+                    screenshot_path.clear();
+                    break;
+            }
+            const VkDeviceSize pixel_size = 4;
             const VkDeviceSize buf_size = w * h * pixel_size;
 
             VkSemaphore acquire_semaphore = VK_NULL_HANDLE;
@@ -4145,11 +4170,12 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
             fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
             uint32_t shot_image_index = 0;
             const bool image_acquired =
-                vkCreateSemaphore(device, &semaphore_info, nullptr, &acquire_semaphore) ==
-                    VK_SUCCESS &&
-                vkCreateFence(device, &fence_info, nullptr, &acquire_fence) == VK_SUCCESS &&
-                vkAcquireNextImageKHR(device, swapchain.swapchain, UINT64_MAX, acquire_semaphore,
-                                      acquire_fence, &shot_image_index) == VK_SUCCESS;
+                screenshot_path.empty() ||
+                (vkCreateSemaphore(device, &semaphore_info, nullptr, &acquire_semaphore) ==
+                     VK_SUCCESS &&
+                 vkCreateFence(device, &fence_info, nullptr, &acquire_fence) == VK_SUCCESS &&
+                 vkAcquireNextImageKHR(device, swapchain.swapchain, UINT64_MAX, acquire_semaphore,
+                                       acquire_fence, &shot_image_index) == VK_SUCCESS);
             if (image_acquired) {
                 vkWaitForFences(device, 1, &acquire_fence, VK_TRUE, UINT64_MAX);
 
@@ -4205,11 +4231,11 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
                         std::ofstream ppm(screenshot_path, std::ios::binary);
                         if (ppm) {
                             ppm << "P6\n" << w << " " << h << "\n255\n";
+                            const uint32_t blue_offset = 3 - red_offset - green_offset;
                             for (uint32_t i = 0; i < w * h; ++i) {
-                                // BGRA -> RGB
-                                ppm.put(static_cast<char>(pixels[i * 4 + 2]));
-                                ppm.put(static_cast<char>(pixels[i * 4 + 1]));
-                                ppm.put(static_cast<char>(pixels[i * 4 + 0]));
+                                ppm.put(static_cast<char>(pixels[i * 4 + red_offset]));
+                                ppm.put(static_cast<char>(pixels[i * 4 + green_offset]));
+                                ppm.put(static_cast<char>(pixels[i * 4 + blue_offset]));
                             }
                             std::cout << "screenshot=" << screenshot_path.string() << '\n';
                         }
