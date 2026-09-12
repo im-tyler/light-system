@@ -2096,6 +2096,23 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count,
           std::fprintf(stderr, "error: truncated CellFlipped at offset %zu\n", rec_start);
           return 2;
         }
+        // CellFlipped is reserved and unused in v2 (spec section 16), but
+        // the all-records-verified contract still applies to a record that
+        // is present: fields must be in-world and the timestamp must name
+        // the tick section the record belongs to.
+        if (x >= static_cast<u32>(WORLD) || y >= static_cast<u32>(WORLD)) {
+          std::fprintf(stderr,
+                       "error: bad CellFlipped (x=%" PRIu32 " y=%" PRIu32 ") at offset %zu\n", x,
+                       y, rec_start);
+          return 2;
+        }
+        if (t != world.tick) {
+          std::fprintf(stderr,
+                       "MISMATCH: CellFlipped record tick=%" PRIu64 " current tick=%" PRIu64
+                       "\n",
+                       t, world.tick);
+          return 1;
+        }
       } break;
       case 4: {
         u32 rx = 0;
@@ -2137,6 +2154,16 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count,
           std::fprintf(stderr, "error: bad RegionState region at offset %zu\n", rec_start);
           return 2;
         }
+        // Spec section 16: the tick field repeats the TickHeader tick of
+        // the tick the record belongs to. A decoded-but-unchecked timestamp
+        // let a mutated record still verify (all-records-verified contract).
+        if (t != world.tick) {
+          std::fprintf(stderr,
+                       "MISMATCH: RegionState record tick=%" PRIu64 " current tick=%" PRIu64
+                       "\n",
+                       t, world.tick);
+          return 1;
+        }
         ++states_seen;
         u8 w_level = 0;
         u64 w_pop = 0;
@@ -2174,6 +2201,14 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count,
                        bid, lv, rec_start);
           return 2;
         }
+        // Mirror the ontos_view parser: the record's tick must be the tick
+        // of the TickHeader it follows.
+        if (t != world.tick) {
+          std::fprintf(stderr,
+                       "MISMATCH: BodyState record tick=%" PRIu64 " current tick=%" PRIu64 "\n",
+                       t, world.tick);
+          return 1;
+        }
         ++bodies_seen;
         u8 w_reg = 0;
         u8 w_lv = 0;
@@ -2198,6 +2233,13 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count,
             !take_f64(data, off, tpy) || !take_f64(data, off, energy)) {
           std::fprintf(stderr, "error: truncated TotalsState at offset %zu\n", rec_start);
           return 2;
+        }
+        if (t != world.tick) {
+          std::fprintf(stderr,
+                       "MISMATCH: TotalsState record tick=%" PRIu64 " current tick=%" PRIu64
+                       "\n",
+                       t, world.tick);
+          return 1;
         }
         ++totals_seen;
         u64 w_fine = 0;
