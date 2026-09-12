@@ -404,13 +404,23 @@ void write_resource(const VGeoResource& resource, const std::filesystem::path& o
 }
 
 void write_summary(const VGeoResource& resource, const std::filesystem::path& output_path) {
-    std::ofstream output(output_path);
+    // Publish by atomic rename like the .vgeo itself (write_resource): the
+    // summary is the Godot importer's sidecar, and overwriting it in place
+    // can hand a concurrent reader a half-written file. The content
+    // fingerprint ties the sidecar to exactly this .vgeo generation, so the
+    // importer can reject a stale summary instead of defaulting its fields.
+    const std::filesystem::path temp_path =
+        output_path.parent_path() /
+        (output_path.filename().string() + ".tmp-" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::ofstream output(temp_path);
     if (!output) {
-        throw BuilderError("failed to open summary file: " + output_path.string());
+        throw BuilderError("failed to open summary file: " + temp_path.string());
     }
 
     output << "asset_id=" << resource.asset_id << '\n';
     output << "source_asset=" << resource.source_asset.string() << '\n';
+    output << "content_fingerprint=" << compute_content_fingerprint(resource) << '\n';
     output << "has_fallback=" << (resource.has_fallback ? "true" : "false") << '\n';
     output << "source_vertices=" << resource.source_vertex_count << '\n';
     output << "source_triangles=" << resource.source_triangle_count << '\n';
@@ -522,6 +532,18 @@ void write_summary(const VGeoResource& resource, const std::filesystem::path& ou
                << " error=" << cluster.local_error
                << " payload_offset=" << cluster.geometry_payload_offset
                << " payload_size=" << cluster.geometry_payload_size << '\n';
+    }
+
+    output.close();
+    if (!output) {
+        std::error_code remove_ec;
+        std::filesystem::remove(temp_path, remove_ec);
+        throw BuilderError("failed to write summary file: " + temp_path.string());
+    }
+    if (::rename(temp_path.c_str(), output_path.c_str()) != 0) {
+        std::error_code remove_ec;
+        std::filesystem::remove(temp_path, remove_ec);
+        throw BuilderError("failed to publish summary file: " + output_path.string());
     }
 }
 

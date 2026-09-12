@@ -52,6 +52,18 @@ func _import(source_file: String, save_path: String, options: Dictionary, platfo
 
 	var summary_text := FileAccess.get_file_as_string(summary_file)
 	var values := _parse_summary(summary_text)
+	# The summary is only valid for the .vgeo generation whose content
+	# fingerprint it carries; a stale or mismatched sidecar is rejected
+	# instead of silently importing defaulted fields.
+	var summary_fingerprint := values.get("content_fingerprint", "")
+	if summary_fingerprint == "":
+		push_error("Meridian importer summary %s has no content_fingerprint" % summary_file)
+		return ERR_FILE_CORRUPT
+	var vgeo_fingerprint := _read_vgeo_fingerprint(source_file)
+	if vgeo_fingerprint == "" or vgeo_fingerprint != summary_fingerprint:
+		push_error("Meridian importer summary %s fingerprint %s does not match %s (%s)" % [
+			summary_file, summary_fingerprint, source_file, vgeo_fingerprint])
+		return ERR_FILE_CORRUPT
 	var resource := VGeoImportResource.new()
 	resource.asset_id = values.get("asset_id", "")
 	resource.source_asset = values.get("source_asset", "")
@@ -69,6 +81,27 @@ func _import(source_file: String, save_path: String, options: Dictionary, platfo
 	resource.summary_path = summary_file
 
 	return ResourceSaver.save(resource, "%s.%s" % [save_path, _get_save_extension()])
+
+
+# content_fingerprint lives at the end of the VGEO file header (v6):
+# magic[4] + 15 u32 fields + Bounds3f (6 floats) + 12 u64 offsets, then
+# the u64 fingerprint. Returns "" when the file is not a readable vgeo.
+func _read_vgeo_fingerprint(source_file: String) -> String:
+	var file := FileAccess.open(source_file, FileAccess.READ)
+	if file == null:
+		return ""
+	var header := file.get_buffer(4)
+	if header.size() < 4 or header.get_string_from_ascii() != "VGEO":
+		return ""
+	const FINGERPRINT_OFFSET := 4 + 15 * 4 + 6 * 4 + 12 * 8
+	file.seek(FINGERPRINT_OFFSET)
+	var bytes := file.get_buffer(8)
+	if bytes.size() < 8:
+		return ""
+	var fingerprint := 0
+	for i in range(7, -1, -1):
+		fingerprint = (fingerprint << 8) | bytes[i]
+	return String.num_uint64(fingerprint)
 
 
 func _parse_summary(summary_text: String) -> Dictionary:
