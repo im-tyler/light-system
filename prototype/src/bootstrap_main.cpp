@@ -122,6 +122,7 @@ int main(int argc, char** argv) {
         std::cout << "present_loop_completed=" << (report.present_loop_completed ? "true" : "false")
                   << '\n';
         std::cout << "status=" << report.status << '\n';
+        std::cout << "capture_status=" << report.capture_status << '\n';
         std::cout << "selected_device=" << report.selected_device << '\n';
         std::cout << "graphics_queue_family=" << report.graphics_queue_family << '\n';
         std::cout << "present_queue_family=" << report.present_queue_family << '\n';

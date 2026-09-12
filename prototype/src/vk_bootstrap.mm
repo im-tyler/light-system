@@ -4143,6 +4143,7 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
                 std::fprintf(stderr,
                              "screenshot requested but this surface does not support "
                              "TRANSFER_SRC swapchain usage; capture unavailable\n");
+                report.capture_status = "capture failed: surface lacks TRANSFER_SRC usage";
             } else {
             std::filesystem::path screenshot_path(config.screenshot_path);
             if (screenshot_path.extension() != ".ppm") {
@@ -4156,6 +4157,7 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
             // than written with a guessed channel order.
             uint32_t red_offset = 0;
             uint32_t green_offset = 0;
+            bool swizzle_available = true;
             switch (swapchain.surface_format.format) {
                 case VK_FORMAT_B8G8R8A8_UNORM:
                 case VK_FORMAT_B8G8R8A8_SRGB:
@@ -4172,7 +4174,8 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
                                  "screenshot requested but surface format %d has no capture "
                                  "swizzle; capture unavailable\n",
                                  static_cast<int>(swapchain.surface_format.format));
-                    screenshot_path.clear();
+                    report.capture_status = "capture failed: surface format has no capture swizzle";
+                    swizzle_available = false;
                     break;
             }
             const VkDeviceSize pixel_size = 4;
@@ -4185,14 +4188,21 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
             VkFenceCreateInfo fence_info{};
             fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
             uint32_t shot_image_index = 0;
+            // An unsupported capture format is an explicit skip: no semaphore,
+            // fence, acquire, or copy runs at all, so no null handles can reach
+            // vkWaitForFences or the submission below.
             const bool image_acquired =
-                screenshot_path.empty() ||
+                swizzle_available &&
                 (vkCreateSemaphore(device, &semaphore_info, nullptr, &acquire_semaphore) ==
                      VK_SUCCESS &&
                  vkCreateFence(device, &fence_info, nullptr, &acquire_fence) == VK_SUCCESS &&
                  vkAcquireNextImageKHR(device, swapchain.swapchain, UINT64_MAX, acquire_semaphore,
                                        acquire_fence, &shot_image_index) == VK_SUCCESS);
-            if (image_acquired) {
+            if (!image_acquired) {
+                if (swizzle_available) {
+                    report.capture_status = "capture failed: image acquisition failed";
+                }
+            } else {
                 vkWaitForFences(device, 1, &acquire_fence, VK_TRUE, UINT64_MAX);
 
                 UploadedBuffer readback{};
@@ -4254,6 +4264,7 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
                                 ppm.put(static_cast<char>(pixels[i * 4 + blue_offset]));
                             }
                             std::cout << "screenshot=" << screenshot_path.string() << '\n';
+                            report.capture_status = "capture ok";
                         }
                         vkUnmapMemory(device, readback.memory);
                     }

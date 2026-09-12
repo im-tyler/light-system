@@ -65,6 +65,12 @@ struct VkBootstrapReport {
     bool debug_draw_submitted = false;
     bool present_loop_completed = false;
     std::string status;
+    // Outcome of the --screenshot request: set whenever a screenshot was
+    // requested and the run reached the capture stage, on success and on
+    // every skip/failure (unsupported format, missing TRANSFER_SRC, failed
+    // acquisition or submission). Empty when no screenshot was requested.
+    // Capture failures do not fail the run; they are reported here.
+    std::string capture_status;
     std::string selected_device;
     uint32_t graphics_queue_family = 0xffffffffu;
     uint32_t present_queue_family = 0xffffffffu;
