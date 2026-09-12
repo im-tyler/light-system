@@ -283,10 +283,22 @@ void write_resource(const VGeoResource& resource, const std::filesystem::path& o
     header.total_lod_clusters = static_cast<uint32_t>(resource.lod_clusters.size());
     header.total_node_lod_links = static_cast<uint32_t>(resource.node_lod_links.size());
     header.total_page_dependencies = static_cast<uint32_t>(resource.page_dependencies.size());
-    header.total_cluster_geometry_bytes = static_cast<uint32_t>(resource.cluster_geometry_payload.size());
-    header.total_lod_geometry_bytes = static_cast<uint32_t>(resource.lod_geometry_payload.size());
+    header.total_cluster_geometry_bytes =
+        narrow_payload_u32(resource.cluster_geometry_payload.size(), "geometry payload");
+    header.total_lod_geometry_bytes =
+        narrow_payload_u32(resource.lod_geometry_payload.size(), "LOD geometry payload");
     header.total_lod_group_base_runs = static_cast<uint32_t>(resource.lod_group_base_runs.size());
-    header.total_texture_bytes = static_cast<uint32_t>(resource.texture_payload.size());
+    header.total_texture_bytes = narrow_payload_u32(resource.texture_payload.size(), "texture payload");
+    // Cluster payload offsets are 32-bit in the schema: the payload bases
+    // plus each payload's own extent must stay addressable, otherwise the
+    // per-cluster adjusted offsets below would wrap.
+    if (cluster_geometry_payload_offset + resource.cluster_geometry_payload.size() >
+        0xffffffffull) {
+        throw BuilderError("geometry payload exceeds 32-bit offset limit");
+    }
+    if (lod_geometry_payload_offset + resource.lod_geometry_payload.size() > 0xffffffffull) {
+        throw BuilderError("LOD geometry payload exceeds 32-bit offset limit");
+    }
     header.bounds = resource.bounds;
     header.metadata_offset = metadata_offset;
     header.material_table_offset = material_table_offset;
@@ -336,7 +348,9 @@ void write_resource(const VGeoResource& resource, const std::filesystem::path& o
     for (const auto& link : resource.node_lod_links) write_pod(output, to_disk(link));
     for (const auto& cluster : resource.clusters) {
         ClusterRecord adjusted_cluster = cluster;
-        adjusted_cluster.geometry_payload_offset += static_cast<uint32_t>(cluster_geometry_payload_offset);
+        adjusted_cluster.geometry_payload_offset =
+            narrow_payload_u32(cluster_geometry_payload_offset + cluster.geometry_payload_offset,
+                               "geometry payload");
         write_pod(output, to_disk(adjusted_cluster));
     }
     for (const auto& page : resource.pages) {
@@ -349,7 +363,9 @@ void write_resource(const VGeoResource& resource, const std::filesystem::path& o
     for (const auto& group : resource.lod_groups) write_pod(output, to_disk(group));
     for (const auto& cluster : resource.lod_clusters) {
         LodClusterRecord adjusted_cluster = cluster;
-        adjusted_cluster.geometry_payload_offset += static_cast<uint32_t>(lod_geometry_payload_offset);
+        adjusted_cluster.geometry_payload_offset =
+            narrow_payload_u32(lod_geometry_payload_offset + cluster.geometry_payload_offset,
+                               "LOD geometry payload");
         write_pod(output, to_disk(adjusted_cluster));
     }
     for (const auto& run : resource.lod_group_base_runs) write_pod(output, to_disk(run));

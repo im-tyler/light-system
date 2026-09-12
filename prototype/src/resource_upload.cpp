@@ -1,8 +1,20 @@
 #include "resource_upload.h"
 
+#include <limits>
+#include <string>
+
 namespace meridian {
 
 namespace {
+
+// Uploadable offsets/sizes are 32-bit on the GPU side (GpuSceneHeader byte
+// totals, GpuPageRecord.byte_offset); reject instead of wrapping.
+uint32_t narrow_u32(size_t value, const char* what) {
+    if (value > std::numeric_limits<uint32_t>::max()) {
+        throw BuilderError(std::string(what) + " exceeds 32-bit offset limit");
+    }
+    return static_cast<uint32_t>(value);
+}
 
 PageKind page_kind_from_record(const PageRecord& page) {
     return page.lod_cluster_count != 0 ? PageKind::lod_cluster : PageKind::base_cluster;
@@ -26,8 +38,10 @@ UploadableScene build_uploadable_scene(const VGeoResource& resource) {
     scene.header.page_count = static_cast<uint32_t>(resource.pages.size());
     scene.header.page_dependency_count = static_cast<uint32_t>(resource.page_dependencies.size());
     scene.header.node_lod_link_count = static_cast<uint32_t>(resource.node_lod_links.size());
-    scene.header.base_payload_bytes = static_cast<uint32_t>(resource.cluster_geometry_payload.size());
-    scene.header.lod_payload_bytes = static_cast<uint32_t>(resource.lod_geometry_payload.size());
+    scene.header.base_payload_bytes =
+        narrow_u32(resource.cluster_geometry_payload.size(), "geometry payload");
+    scene.header.lod_payload_bytes =
+        narrow_u32(resource.lod_geometry_payload.size(), "LOD geometry payload");
     scene.header.visibility_format_word_count = 2;
     scene.header.flags = (resource.has_fallback ? 1u : 0u) |
                          (resource.texture_payload.empty() ? 0u : kSceneFlagTextured);
@@ -129,7 +143,7 @@ UploadableScene build_uploadable_scene(const VGeoResource& resource) {
     for (const PageRecord& page : resource.pages) {
         GpuPageRecord record;
         record.kind = page_kind_from_record(page);
-        record.byte_offset = static_cast<uint32_t>(page.byte_offset);
+        record.byte_offset = narrow_u32(page.byte_offset, "page byte offset");
         record.byte_size = page.uncompressed_byte_size;
         record.first_cluster_index = page.first_cluster_index;
         record.cluster_count = page.cluster_count;

@@ -301,6 +301,15 @@ inline void append_bytes(std::vector<std::byte>& output, const T& value) {
     output.insert(output.end(), begin, begin + sizeof(T));
 }
 
+// Payload offsets/sizes are 32-bit in the schema; reject (do not wrap)
+// when a byte total outgrows that. Compute in size_t, narrow last.
+inline uint32_t narrow_payload_u32(size_t value, const char* what) {
+    if (value > 0xffffffffull) {
+        throw BuilderError(std::string(what) + " exceeds 32-bit offset limit");
+    }
+    return static_cast<uint32_t>(value);
+}
+
 inline void update_bounds(Bounds3f& bounds, const Vec3f& point) {
     bounds.min.x = std::min(bounds.min.x, point.x);
     bounds.min.y = std::min(bounds.min.y, point.y);

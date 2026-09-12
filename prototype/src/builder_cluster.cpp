@@ -45,7 +45,7 @@ ClusterRecord append_meshlet_payload(const MeshData& mesh, const meshopt_Meshlet
         local_normals.push_back(mesh.normals[vertex_index]);
     }
 
-    const uint32_t payload_offset = static_cast<uint32_t>(payload.size());
+    const uint32_t payload_offset = narrow_payload_u32(payload.size(), "geometry payload");
     const PayloadHeader payload_header{meshlet.vertex_count, meshlet.triangle_count};
     append_bytes(payload, payload_header);
     for (const Vec3f& position : local_positions) {
@@ -71,7 +71,8 @@ ClusterRecord append_meshlet_payload(const MeshData& mesh, const meshopt_Meshlet
     cluster.local_vertex_count = meshlet.vertex_count;
     cluster.local_triangle_count = meshlet.triangle_count;
     cluster.geometry_payload_offset = payload_offset;
-    cluster.geometry_payload_size = static_cast<uint32_t>(payload.size()) - payload_offset;
+    cluster.geometry_payload_size =
+        narrow_payload_u32(payload.size(), "geometry payload") - payload_offset;
     cluster.page_index = 0;
     cluster.bounds = bounds;
     const meshopt_Bounds meshlet_bounds = meshopt_computeMeshletBounds(
@@ -217,7 +218,8 @@ uint32_t append_reordered_cluster(const ClusterRecord& source_cluster,
                                   VGeoResource& resource) {
     const uint32_t new_cluster_index = static_cast<uint32_t>(resource.clusters.size());
     ClusterRecord cluster = source_cluster;
-    cluster.geometry_payload_offset = static_cast<uint32_t>(resource.cluster_geometry_payload.size());
+    cluster.geometry_payload_offset =
+        narrow_payload_u32(resource.cluster_geometry_payload.size(), "geometry payload");
     const auto begin = source_payload.begin() + source_cluster.geometry_payload_offset;
     const auto end = begin + source_cluster.geometry_payload_size;
     resource.cluster_geometry_payload.insert(resource.cluster_geometry_payload.end(), begin, end);
@@ -628,7 +630,7 @@ LodClusterRecord append_lod_cluster_payload(const MeshData& mesh, const unsigned
     local_vertices.resize(local_vertex_count);
     local_triangles.resize(index_count);
 
-    const uint32_t payload_offset = static_cast<uint32_t>(payload.size());
+    const uint32_t payload_offset = narrow_payload_u32(payload.size(), "LOD geometry payload");
     const PayloadHeader payload_header{static_cast<uint32_t>(local_vertices.size()),
                                        static_cast<uint32_t>(index_count / 3)};
     append_bytes(payload, payload_header);
@@ -660,7 +662,8 @@ LodClusterRecord append_lod_cluster_payload(const MeshData& mesh, const unsigned
     cluster.local_vertex_count = static_cast<uint32_t>(local_vertices.size());
     cluster.local_triangle_count = static_cast<uint32_t>(index_count / 3);
     cluster.geometry_payload_offset = payload_offset;
-    cluster.geometry_payload_size = static_cast<uint32_t>(payload.size()) - payload_offset;
+    cluster.geometry_payload_size =
+        narrow_payload_u32(payload.size(), "LOD geometry payload") - payload_offset;
     cluster.bounds = sphere_bounds_to_aabb(cluster_bounds);
     cluster.normal_cone_axis[0] = cone_bounds.cone_axis[0];
     cluster.normal_cone_axis[1] = cone_bounds.cone_axis[1];
