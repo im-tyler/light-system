@@ -1,12 +1,33 @@
 #include "vk_bootstrap.h"
 #include "visibility_format.h"
 
+#include <charconv>
 #include <exception>
 #include <filesystem>
 #include <iostream>
 #include <string_view>
 
 namespace {
+
+// Checked upper bound for --threads: a sane ceiling well above any core
+// count; values past it are rejected instead of trying to spawn a thread
+// per requested worker.
+constexpr uint32_t kMaxWorkerThreads = 1024;
+
+// Strict unsigned parse for --threads: atoi cast to uint32_t wrapped
+// negatives ("-1" -> 4294967295 threads) and accepted trailing junk.
+// from_chars on uint32_t rejects leading signs; require the full string.
+bool parse_thread_count(std::string_view value, uint32_t& out) {
+    uint32_t parsed = 0;
+    const auto* begin = value.data();
+    const auto* end = value.data() + value.size();
+    const auto result = std::from_chars(begin, end, parsed);
+    if (result.ec != std::errc() || result.ptr != end || parsed > kMaxWorkerThreads) {
+        return false;
+    }
+    out = parsed;
+    return true;
+}
 
 void print_usage() {
     std::cerr << "Usage: meridian_vk_bootstrap --manifest <path> [--interactive] [--screenshot <path>] [--budget <pages>] [--demand-streaming] [--error-threshold <value>] [--shadow-error-scale <value>] [--threads <count>] [--validate]\n"
@@ -52,7 +73,12 @@ int main(int argc, char** argv) {
         } else if (arg == "--shadow-error-scale" && i + 1 < argc) {
             shadow_error_scale = std::atof(argv[++i]);
         } else if (arg == "--threads" && i + 1 < argc) {
-            worker_threads = static_cast<uint32_t>(std::atoi(argv[++i]));
+            if (!parse_thread_count(argv[i + 1], worker_threads)) {
+                std::cerr << "invalid --threads value: " << argv[i + 1]
+                          << " (expected an integer in [1, " << kMaxWorkerThreads << "])\n";
+                return 1;
+            }
+            ++i;
         } else if (arg == "--validate") {
             validate = true;
         } else if (arg == "--interactive") {

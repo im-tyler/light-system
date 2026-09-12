@@ -24,7 +24,25 @@ public:
         : total_threads_(total_threads < 1 ? 1 : total_threads) {
         workers_.reserve(total_threads_ - 1);
         for (unsigned int i = 0; i + 1 < total_threads_; ++i) {
-            workers_.emplace_back([this] { worker_loop(); });
+            try {
+                workers_.emplace_back([this] { worker_loop(); });
+            } catch (...) {
+                // Worker N failed to start while workers 0..N-1 are already
+                // running. The destructor never runs for a partially
+                // constructed object, and destroying the member vector
+                // would call std::thread::~thread on joinable threads
+                // (std::terminate). Stop and join the started workers
+                // before rethrowing.
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    stopping_ = true;
+                }
+                wake_.notify_all();
+                for (std::thread& worker : workers_) {
+                    worker.join();
+                }
+                throw;
+            }
         }
     }
 
