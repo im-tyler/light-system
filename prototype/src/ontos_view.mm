@@ -78,6 +78,12 @@ struct StreamContact {
     f64 jn = 0, cx = 0, cy = 0;
 };
 
+// Spec section 24 static contactant pseudo body-ids: collapsed-region
+// monopoles and walls are not stream bodies; contacts against them encode the
+// contactant in b as one of these bases.
+constexpr u32 kContactMonopoleBase = 0xFF000000u;
+constexpr u32 kContactWallBase = 0xFFFFFF00u;
+
 struct StreamFrame {
     u64 tick = 0;
     u64 fine = 0;
@@ -89,6 +95,9 @@ struct StreamFrame {
 
 struct Stream {
     u32 body_count = 0;
+    // Collapse mass per region (spec 19 RegionCollapsed records); needed to
+    // resolve monopole-contactant reduced masses like ontos_stream_dump does.
+    f64 region_collapse_mass[4] = {0.0, 0.0, 0.0, 0.0};
     std::vector<StreamFrame> frames;
 };
 
@@ -96,6 +105,30 @@ struct ByteView {
     const u8* data = nullptr;
     std::size_t size = 0;
 };
+
+// Contactant mass resolution for static pseudo body-ids (spec 24), matching
+// ontos_stream_dump: a wall contactant uses the moving body's mass (its audio
+// rule is mu = m_a), a collapsed-region monopole uses the region's collapse
+// mass, anything else is a real stream body.
+f64 contactant_mass(const Stream& stream, const StreamFrame& bodies_frame, u32 b, f64 mass_a) {
+    if (b >= kContactWallBase) {
+        return mass_a;
+    }
+    if (b >= kContactMonopoleBase) {
+        return stream.region_collapse_mass[b - kContactMonopoleBase];
+    }
+    return bodies_frame.bodies[b].mass;
+}
+
+f64 contact_reduced_mass(const Stream& stream, const StreamFrame& bodies_frame,
+                         const StreamContact& c) {
+    const f64 mass_a = bodies_frame.bodies[c.a].mass;
+    if (c.b >= kContactWallBase) {
+        return mass_a;
+    }
+    const f64 mass_b = contactant_mass(stream, bodies_frame, c.b, mass_a);
+    return (mass_a * mass_b) / (mass_a + mass_b);
+}
 
 bool take_u32(ByteView d, std::size_t& off, u32& out) {
     if (d.size - off < 4) return false;
@@ -207,6 +240,8 @@ Stream parse_stream(const std::filesystem::path& path) {
     bool has_snapshot = false;
     u64 snapshot_population = 0;
     std::vector<StreamContact> pending_contacts;
+    bool params_seen = false;
+    u64 last_tick = 0;
     std::size_t off = 20;
 
     try {
@@ -223,6 +258,7 @@ Stream parse_stream(const std::filesystem::path& path) {
                     }
                     StreamFrame frame;
                     frame.tick = t;
+                    last_tick = t;
                     for (StreamContact& c : pending_contacts) {
                         if (c.tick != t) stream_error("Contact tick mismatch", rec_start);
                         frame.contacts.push_back(c);
@@ -335,16 +371,41 @@ Stream parse_stream(const std::filesystem::path& path) {
                     stream.frames.back().coarse = cn;
                 } break;
                 case 8: {
-                    if (data.size - off < 72) {
+                    // Spec 19 RegionCollapsed: the viewer does not replay the
+                    // collapse, but records the mass so monopole-contactant
+                    // reduced masses resolve like ontos_stream_dump's.
+                    u64 t = 0;
+                    u32 rx = 0;
+                    u32 ry = 0;
+                    u64 n = 0;
+                    f64 mass = 0, com_x = 0, com_y = 0, pxt = 0, pyt = 0, energy = 0;
+                    if (!take_u64(data, off, t) || !take_u32(data, off, rx) ||
+                        !take_u32(data, off, ry) || !take_u64(data, off, n) ||
+                        !take_f64(data, off, mass) || !take_f64(data, off, com_x) ||
+                        !take_f64(data, off, com_y) || !take_f64(data, off, pxt) ||
+                        !take_f64(data, off, pyt) || !take_f64(data, off, energy)) {
                         stream_error("truncated RegionCollapsed", rec_start);
                     }
-                    off += 72;
+                    if (rx > 1 || ry > 1) {
+                        stream_error("bad RegionCollapsed", rec_start);
+                    }
+                    stream.region_collapse_mass[ry * 2 + rx] = mass;
                 } break;
                 case 9: {
-                    if (data.size - off < 56) {
+                    // Spec 20 RegionMultipole: validated, not rendered.
+                    u64 t = 0;
+                    u32 rx = 0;
+                    u32 ry = 0;
+                    f64 mx = 0, my = 0, qxx = 0, qxy = 0, qyy = 0;
+                    if (!take_u64(data, off, t) || !take_u32(data, off, rx) ||
+                        !take_u32(data, off, ry) || !take_f64(data, off, mx) ||
+                        !take_f64(data, off, my) || !take_f64(data, off, qxx) ||
+                        !take_f64(data, off, qxy) || !take_f64(data, off, qyy)) {
                         stream_error("truncated RegionMultipole", rec_start);
                     }
-                    off += 56;
+                    if (rx > 1 || ry > 1) {
+                        stream_error("bad RegionMultipole", rec_start);
+                    }
                 } break;
                 case 10: {
                     StreamContact c;
@@ -353,10 +414,61 @@ Stream parse_stream(const std::filesystem::path& path) {
                         !take_f64(data, off, c.cx) || !take_f64(data, off, c.cy)) {
                         stream_error("truncated Contact", rec_start);
                     }
-                    if (c.a >= c.b || c.b >= body_count || c.tick == 0) {
+                    // Static contactants (spec 24) encode a monopole/wall pseudo
+                    // id in b; only real-body bs are bounds-checked against
+                    // body_count (same rule as ontos_stream_dump).
+                    const bool b_static = c.b >= kContactMonopoleBase;
+                    if (c.a >= c.b || (!b_static && c.b >= body_count) || c.tick == 0) {
                         stream_error("bad Contact", rec_start);
                     }
                     pending_contacts.push_back(c);
+                } break;
+                case 11: {
+                    // Spec 23 RegionRadial: validated, not rendered.
+                    u64 t = 0;
+                    u32 rx = 0;
+                    u32 ry = 0;
+                    f64 binding = 0;
+                    if (!take_u64(data, off, t) || !take_u32(data, off, rx) ||
+                        !take_u32(data, off, ry) || !take_f64(data, off, binding)) {
+                        stream_error("truncated RegionRadial", rec_start);
+                    }
+                    if (rx > 1 || ry > 1) {
+                        stream_error("bad RegionRadial", rec_start);
+                    }
+                } break;
+                case 12: {
+                    // Spec 24 ContactParams: at most one, before the first
+                    // tick; gates the extended contact parsing modes (static
+                    // contactants, walls). Validated, not rendered.
+                    f64 restitution = 0;
+                    f64 friction = 0;
+                    if (!take_f64(data, off, restitution) ||
+                        !take_f64(data, off, friction) || data.size - off < 1) {
+                        stream_error("truncated ContactParams", rec_start);
+                    }
+                    const u8 walls = data.data[off++];
+                    if (params_seen || last_tick != 0 || walls > 1 ||
+                        !(restitution >= 0.0 && restitution <= 1.0) || friction < 0.0) {
+                        stream_error("bad ContactParams", rec_start);
+                    }
+                    params_seen = true;
+                } break;
+                case 13: {
+                    // Spec 25 RegionShells: validated, not rendered.
+                    u64 t = 0;
+                    u32 rx = 0;
+                    u32 ry = 0;
+                    f64 binding = 0, b0 = 0, b1 = 0, b2 = 0, b3 = 0;
+                    if (!take_u64(data, off, t) || !take_u32(data, off, rx) ||
+                        !take_u32(data, off, ry) || !take_f64(data, off, binding) ||
+                        !take_f64(data, off, b0) || !take_f64(data, off, b1) ||
+                        !take_f64(data, off, b2) || !take_f64(data, off, b3)) {
+                        stream_error("truncated RegionShells", rec_start);
+                    }
+                    if (rx > 1 || ry > 1) {
+                        stream_error("bad RegionShells", rec_start);
+                    }
                 } break;
                 default: {
                     std::ostringstream message;
@@ -1121,9 +1233,7 @@ u64 render_contact_audio(const Stream& stream, const char* wav_path, bool write_
         for (const StreamContact& c : frame.contacts) {
             const std::size_t e =
                 static_cast<std::size_t>((c.tick + 1) * AudioSpec::kSamplesPerTick);
-            const f64 ma = last.bodies[c.a].mass;
-            const f64 mb = last.bodies[c.b].mass;
-            const f64 mu = (ma * mb) / (ma + mb);
+            const f64 mu = contact_reduced_mass(stream, last, c);
             for (int k = 0; k < 3; ++k) {
                 const f64 omega = AudioSpec::kOmega0 * AudioSpec::kPartial[k] / mu;
                 const f64 a = (2.0 - omega) * AudioSpec::kRho[k];
@@ -1268,9 +1378,8 @@ struct VoiceBank {
         for (ContactVoice& voice : voices) voice.active = false;
     }
 
-    void spawn_contact(const StreamContact& contact, f64 mass_a, f64 mass_b, f64 gl, f64 gr) {
+    void spawn_contact(const StreamContact& contact, f64 mu, f64 gl, f64 gr) {
         ContactVoice voice;
-        const f64 mu = (mass_a * mass_b) / (mass_a + mass_b);
         for (int k = 0; k < 3; ++k) {
             const f64 omega = AudioSpec::kOmega0 * AudioSpec::kPartial[k] / mu;
             voice.a[k] = (2.0 - omega) * AudioSpec::kRho[k];
@@ -1379,8 +1488,8 @@ struct RealtimeAudio {
 
     void reset() { bank.reset(); }
 
-    void spawn_contact(const StreamContact& contact, f64 mass_a, f64 mass_b, f64 gl, f64 gr) {
-        bank.spawn_contact(contact, mass_a, mass_b, gl, gr);
+    void spawn_contact(const StreamContact& contact, f64 mu, f64 gl, f64 gr) {
+        bank.spawn_contact(contact, mu, gl, gr);
     }
 };
 
@@ -1530,8 +1639,8 @@ struct RealtimeAudio {
 
     void reset() { bank.reset(); }
 
-    void spawn_contact(const StreamContact& contact, f64 mass_a, f64 mass_b, f64 gl, f64 gr) {
-        bank.spawn_contact(contact, mass_a, mass_b, gl, gr);
+    void spawn_contact(const StreamContact& contact, f64 mu, f64 gl, f64 gr) {
+        bank.spawn_contact(contact, mu, gl, gr);
     }
 };
 
@@ -2242,10 +2351,10 @@ int main(int argc, char** argv) {
                     ContactFlash flash;
                     flash.x = static_cast<float>(c.cx);
                     flash.y = static_cast<float>(c.cy);
+                    const f64 mass_a = frame.bodies[c.a].mass;
+                    const f64 mass_b = contactant_mass(stream, frame, c.b, mass_a);
                     flash.half_extent =
-                        std::max(body_half_extent(frame.bodies[c.a].mass),
-                                 body_half_extent(frame.bodies[c.b].mass)) *
-                        1.4f;
+                        std::max(body_half_extent(mass_a), body_half_extent(mass_b)) * 1.4f;
                     if (flashes.size() >= kMaxFlashes) flashes.erase(flashes.begin());
                     flashes.push_back(flash);
 #if ONTOS_VIEW_REALTIME_AUDIO
@@ -2253,8 +2362,8 @@ int main(int argc, char** argv) {
                         f64 gl = 1.0, gr = 1.0;
                         contact_gains(state.camera, state.fb_width, state.fb_height, c.cx, c.cy,
                                       gl, gr);
-                        audio.spawn_contact(c, final_frame.bodies[c.a].mass,
-                                            final_frame.bodies[c.b].mass, gl, gr);
+                        audio.spawn_contact(c, contact_reduced_mass(stream, final_frame, c), gl,
+                                            gr);
                     }
 #endif
                 }
