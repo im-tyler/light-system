@@ -246,12 +246,22 @@ VkResult create_base_texture_resources(VkPhysicalDevice physical_device, VkDevic
     command_info.commandPool = command_pool;
     command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     command_info.commandBufferCount = 1;
-    vkAllocateCommandBuffers(device, &command_info, &command_buffer);
+    result = vkAllocateCommandBuffers(device, &command_info, &command_buffer);
+    if (result != VK_SUCCESS) {
+        vkDestroyCommandPool(device, command_pool, nullptr);
+        destroy_staging();
+        return result;
+    }
 
     VkCommandBufferBeginInfo begin{};
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(command_buffer, &begin);
+    result = vkBeginCommandBuffer(command_buffer, &begin);
+    if (result != VK_SUCCESS) {
+        vkDestroyCommandPool(device, command_pool, nullptr);
+        destroy_staging();
+        return result;
+    }
 
     VkImageMemoryBarrier to_transfer_dst{};
     to_transfer_dst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -287,7 +297,13 @@ VkResult create_base_texture_resources(VkPhysicalDevice physical_device, VkDevic
                           VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
                           &to_shader_read);
 
-    vkEndCommandBuffer(command_buffer);
+    result = vkEndCommandBuffer(command_buffer);
+    if (result != VK_SUCCESS) {
+        vkDestroyCommandPool(device, command_pool, nullptr);
+        destroy_staging();
+        return result;
+    }
+
     VkSubmitInfo submit{};
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit.commandBufferCount = 1;
