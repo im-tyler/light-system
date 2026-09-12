@@ -392,6 +392,18 @@ void append_gltf_primitive(MeshData& mesh, const cgltf_primitive& primitive, con
                    primitive.indices->count) {
             throw BuilderError("failed to unpack glTF index accessor");
         }
+        // The pinned cgltf validates base buffer_view indices, not decoded
+        // values against the POSITION accessor count (dense unpack or
+        // sparse overlay alike). An out-of-range index would address a
+        // vertex from the next primitive's block after the
+        // base_vertex_index shift; reject before that shift.
+        for (cgltf_size index = 0; index < primitive.indices->count; ++index) {
+            if (decoded[index] >= positions->count) {
+                throw BuilderError("glTF primitive index " + std::to_string(decoded[index]) +
+                                   " exceeds POSITION accessor count " +
+                                   std::to_string(positions->count));
+            }
+        }
         for (size_t index = previous_index_count; index < section.indices.size(); ++index) {
             section.indices[index] += base_vertex_index;
         }
