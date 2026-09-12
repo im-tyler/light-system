@@ -264,10 +264,16 @@ VkResult create_compute_cull_context(VkPhysicalDevice physical_device, VkDevice 
                                       uint32_t instance_count,
                                       ComputeCullContext& context);
 
+// Creates the draw-list/draw-count buffers the renderer consumes every
+// frame. The cluster_select compute pipeline (11 SSBO bindings) is dead
+// weight on the CPU-folded draw path, so it is only created when
+// create_pipeline is explicitly requested -- and its absence or failure
+// never breaks the context, because nothing dispatches it.
 VkResult create_compute_selection_context(VkPhysicalDevice physical_device, VkDevice device,
                                           const UploadedSceneBuffers& scene_buffers,
                                           const ComputeCullContext& cull_context,
                                           uint32_t max_clusters,
+                                          bool create_pipeline,
                                           ComputeSelectionContext& context);
 
 VkResult create_hzb_context(VkPhysicalDevice physical_device, VkDevice device,

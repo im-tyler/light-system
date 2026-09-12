@@ -19,8 +19,10 @@ void print_usage() {
                  "  --threads sets the total worker threads for traversal and draw-list\n"
                  "  build (default: auto = min(hardware_concurrency, 8); 1 = serial;\n"
                  "  output is bit-identical at any count)\n"
-                 "  --no-gpu-timers disables the per-frame GPU timestamp queries and the\n"
-                 "  MERIDIAN_GPU lines (measures the unprofiled submit path)\n";
+                  "  --no-gpu-timers disables the per-frame GPU timestamp queries and the\n"
+                  "  MERIDIAN_GPU lines (measures the unprofiled submit path)\n"
+                  "  --gpu-selection also builds the (currently undispatched) cluster_select\n"
+                  "  compute pipeline; creation failure is non-fatal\n";
 }
 
 }  // namespace
@@ -36,6 +38,7 @@ int main(int argc, char** argv) {
     bool interactive = false;
     bool demand_streaming = false;
     bool enable_gpu_timers = true;
+    bool gpu_selection = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg = argv[i];
         if (arg == "--manifest" && i + 1 < argc) {
@@ -58,6 +61,8 @@ int main(int argc, char** argv) {
             demand_streaming = true;
         } else if (arg == "--no-gpu-timers") {
             enable_gpu_timers = false;
+        } else if (arg == "--gpu-selection") {
+            gpu_selection = true;
         } else {
             print_usage();
             return 1;
@@ -89,6 +94,7 @@ int main(int argc, char** argv) {
         config.demand_streaming = demand_streaming;
         config.worker_threads = worker_threads;
         config.enable_gpu_timers = enable_gpu_timers;
+        config.enable_gpu_selection = gpu_selection;
         config.persisted_vgeo_path = manifest.output_path.string();
         const meridian::VkBootstrapReport report =
             meridian::build_vk_bootstrap_report(resource, config);

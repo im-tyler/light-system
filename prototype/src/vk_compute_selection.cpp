@@ -4,7 +4,9 @@
 #include "gpu_abi.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
+#include <exception>
 #include <vector>
 
 #if __has_include(<shaderc/shaderc.hpp>)
@@ -22,12 +24,69 @@ VkResult create_compute_selection_context(VkPhysicalDevice physical_device, VkDe
                                           const UploadedSceneBuffers& scene_buffers,
                                           const ComputeCullContext& cull_context,
                                           uint32_t max_clusters,
+                                          bool create_pipeline,
                                           ComputeSelectionContext& context) {
     context.max_draws = max_clusters;
+
+    // Draw-list output buffers first: the renderer uploads the CPU-built
+    // list into these and the indirect-count path draws from them, so
+    // failures here are fatal. The cluster_select compute pipeline below
+    // is dead weight on the CPU-folded draw path (11 SSBO bindings --
+    // the per-stage count can exceed some implementations' descriptor
+    // limits) and is only built when explicitly requested; its absence
+    // or failure never breaks the context because nothing dispatches it.
+    const VkDeviceSize draw_list_size =
+        static_cast<VkDeviceSize>(max_clusters) * sizeof(GpuDrawEntry);
+    VkResult result = create_uploaded_buffer(physical_device, device, nullptr,
+                                   std::max(draw_list_size, static_cast<VkDeviceSize>(sizeof(GpuDrawEntry))),
+                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                   VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+                                   context.draw_list);
+    if (result != VK_SUCCESS) return result;
+
+    const uint32_t zero = 0;
+    result = create_uploaded_buffer(physical_device, device, &zero, sizeof(uint32_t),
+                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                   VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+                                   context.draw_count);
+    if (result != VK_SUCCESS) return result;
+
+    if (!create_pipeline) {
+        return VK_SUCCESS;
+    }
+
+    // Optional cluster_select pipeline, retained for a future GPU
+    // traversal path. Any failure here is reported and skipped rather
+    // than fatal.
+    const auto skip_pipeline = [&](VkResult code, const char* what) {
+        std::fprintf(stderr,
+                     "MERIDIAN_VK: cluster_select %s unavailable (code %d); "
+                     "GPU selection pipeline skipped\n",
+                     what, static_cast<int>(code));
+        if (context.descriptor_set != VK_NULL_HANDLE) context.descriptor_set = VK_NULL_HANDLE;
+        if (context.descriptor_pool != VK_NULL_HANDLE) {
+            vkDestroyDescriptorPool(device, context.descriptor_pool, nullptr);
+            context.descriptor_pool = VK_NULL_HANDLE;
+        }
+        if (context.pipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(device, context.pipeline, nullptr);
+            context.pipeline = VK_NULL_HANDLE;
+        }
+        if (context.pipeline_layout != VK_NULL_HANDLE) {
+            vkDestroyPipelineLayout(device, context.pipeline_layout, nullptr);
+            context.pipeline_layout = VK_NULL_HANDLE;
+        }
+        if (context.descriptor_set_layout != VK_NULL_HANDLE) {
+            vkDestroyDescriptorSetLayout(device, context.descriptor_set_layout, nullptr);
+            context.descriptor_set_layout = VK_NULL_HANDLE;
+        }
+    };
 
     // Shader uses raw uint[] SSBOs to avoid GLSL struct alignment mismatches with C++.
     // Field offsets are hardcoded to match the GPU ABI structs in gpu_abi.h.
     const std::string compute_source = load_shader_source(resolve_shader_path("cluster_select.comp"));
+
+    try {
 
     const std::vector<uint32_t> spirv =
         compile_glsl_to_spirv(compute_source, shaderc_compute_shader, "cluster_select.comp");
@@ -46,11 +105,12 @@ VkResult create_compute_selection_context(VkPhysicalDevice physical_device, VkDe
     set_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     set_layout_info.bindingCount = 11;
     set_layout_info.pBindings = bindings;
-    VkResult result = vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr,
+    result = vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr,
                                                    &context.descriptor_set_layout);
     if (result != VK_SUCCESS) {
         vkDestroyShaderModule(device, module, nullptr);
-        return result;
+        skip_pipeline(result, "layout");
+        return VK_SUCCESS;
     }
 
     VkPushConstantRange push_range{};
@@ -67,7 +127,8 @@ VkResult create_compute_selection_context(VkPhysicalDevice physical_device, VkDe
     result = vkCreatePipelineLayout(device, &layout_info, nullptr, &context.pipeline_layout);
     if (result != VK_SUCCESS) {
         vkDestroyShaderModule(device, module, nullptr);
-        return result;
+        skip_pipeline(result, "pipeline layout");
+        return VK_SUCCESS;
     }
 
     VkComputePipelineCreateInfo pipeline_info{};
@@ -80,24 +141,10 @@ VkResult create_compute_selection_context(VkPhysicalDevice physical_device, VkDe
     result = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr,
                                        &context.pipeline);
     vkDestroyShaderModule(device, module, nullptr);
-    if (result != VK_SUCCESS) return result;
-
-    // Output buffers
-    const VkDeviceSize draw_list_size =
-        static_cast<VkDeviceSize>(max_clusters) * sizeof(GpuDrawEntry);
-    result = create_uploaded_buffer(physical_device, device, nullptr,
-                                   std::max(draw_list_size, static_cast<VkDeviceSize>(sizeof(GpuDrawEntry))),
-                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                                   VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
-                                   context.draw_list);
-    if (result != VK_SUCCESS) return result;
-
-    const uint32_t zero = 0;
-    result = create_uploaded_buffer(physical_device, device, &zero, sizeof(uint32_t),
-                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                                   VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
-                                   context.draw_count);
-    if (result != VK_SUCCESS) return result;
+    if (result != VK_SUCCESS) {
+        skip_pipeline(result, "pipeline");
+        return VK_SUCCESS;
+    }
 
     // Descriptor pool and set
     VkDescriptorPoolSize pool_size{};
@@ -110,7 +157,10 @@ VkResult create_compute_selection_context(VkPhysicalDevice physical_device, VkDe
     pool_info.poolSizeCount = 1;
     pool_info.pPoolSizes = &pool_size;
     result = vkCreateDescriptorPool(device, &pool_info, nullptr, &context.descriptor_pool);
-    if (result != VK_SUCCESS) return result;
+    if (result != VK_SUCCESS) {
+        skip_pipeline(result, "descriptor pool");
+        return VK_SUCCESS;
+    }
 
     VkDescriptorSetAllocateInfo alloc_info{};
     alloc_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -118,7 +168,10 @@ VkResult create_compute_selection_context(VkPhysicalDevice physical_device, VkDe
     alloc_info.descriptorSetCount = 1;
     alloc_info.pSetLayouts = &context.descriptor_set_layout;
     result = vkAllocateDescriptorSets(device, &alloc_info, &context.descriptor_set);
-    if (result != VK_SUCCESS) return result;
+    if (result != VK_SUCCESS) {
+        skip_pipeline(result, "descriptor set");
+        return VK_SUCCESS;
+    }
 
     // Bind all 11 buffers
     struct BufferBinding { VkBuffer buffer; VkDeviceSize size; };
@@ -153,6 +206,12 @@ VkResult create_compute_selection_context(VkPhysicalDevice physical_device, VkDe
     }
     if (write_count > 0) {
         vkUpdateDescriptorSets(device, write_count, writes, 0, nullptr);
+    }
+
+    } catch (const std::exception& error) {
+        skip_pipeline(VK_ERROR_INITIALIZATION_FAILED, "shader");
+        std::fprintf(stderr, "MERIDIAN_VK: cluster_select shader build failed: %s\n",
+                     error.what());
     }
 
     return VK_SUCCESS;

@@ -2697,7 +2697,8 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
             static_cast<uint32_t>(report.uploadable_scene.clusters.size() +
                                   report.uploadable_scene.lod_clusters.size());
         result = create_compute_selection_context(selection.physical_device, device, scene_buffers,
-                                                   compute_cull, total_clusters, compute_selection);
+                                                   compute_cull, total_clusters,
+                                                   config.enable_gpu_selection, compute_selection);
         if (result != VK_SUCCESS) {
             std::ostringstream message;
             message << "create_compute_selection_context failed with code " << result;

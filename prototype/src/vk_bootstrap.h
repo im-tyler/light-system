@@ -43,6 +43,11 @@ struct VkBootstrapConfig {
     // pool, no MERIDIAN_GPU lines). On MoltenVK each timestamp writes a
     // counter sample, so timer-off runs measure the unprofiled submit cost.
     bool enable_gpu_timers = true;
+    // Opt-in: build the (currently undispatched) cluster_select compute
+    // pipeline. The live renderer builds draws on the CPU, so the default
+    // is off; creation failure of the optional pipeline never aborts
+    // bootstrap.
+    bool enable_gpu_selection = false;
 };
 
 struct VkBootstrapReport {
