@@ -84,6 +84,25 @@ struct StreamContact {
 constexpr u32 kContactMonopoleBase = 0xFF000000u;
 constexpr u32 kContactWallBase = 0xFFFFFF00u;
 
+// Contact record validation (identical rules to ontos_stream_dump):
+// body_a is always a real fine body; body_b is either a real body
+// (a < b, both < body_count) or one of the static contactant pseudo ids
+// -- a collapsed-region monopole 0xFF000000 + r (r < 4), or, when walls
+// mode is on, one of the four wall ids 0xFFFFFF00 + 0..3. Anything else
+// would index bodies[a] or region_collapse_mass[b - base] out of bounds.
+bool contact_pair_valid(u32 a, u32 b, u32 body_count, bool walls_on) {
+    if (a >= body_count) {
+        return false;
+    }
+    if (b < kContactMonopoleBase) {
+        return b < body_count && a < b;
+    }
+    if (b < kContactWallBase) {
+        return b - kContactMonopoleBase < 4;
+    }
+    return walls_on && b - kContactWallBase < 4;
+}
+
 struct StreamFrame {
     u64 tick = 0;
     u64 fine = 0;
@@ -241,6 +260,7 @@ Stream parse_stream(const std::filesystem::path& path) {
     u64 snapshot_population = 0;
     std::vector<StreamContact> pending_contacts;
     bool params_seen = false;
+    bool walls_on = false;
     u64 last_tick = 0;
     std::size_t off = 20;
 
@@ -414,11 +434,10 @@ Stream parse_stream(const std::filesystem::path& path) {
                         !take_f64(data, off, c.cx) || !take_f64(data, off, c.cy)) {
                         stream_error("truncated Contact", rec_start);
                     }
-                    // Static contactants (spec 24) encode a monopole/wall pseudo
-                    // id in b; only real-body bs are bounds-checked against
-                    // body_count (same rule as ontos_stream_dump).
-                    const bool b_static = c.b >= kContactMonopoleBase;
-                    if (c.a >= c.b || (!b_static && c.b >= body_count) || c.tick == 0) {
+                    // Static contactants (spec 24) encode a monopole/wall
+                    // pseudo id in b; see contact_pair_valid for the exact
+                    // bounds rules (same rules as ontos_stream_dump).
+                    if (!contact_pair_valid(c.a, c.b, body_count, walls_on) || c.tick == 0) {
                         stream_error("bad Contact", rec_start);
                     }
                     pending_contacts.push_back(c);
@@ -453,6 +472,7 @@ Stream parse_stream(const std::filesystem::path& path) {
                         stream_error("bad ContactParams", rec_start);
                     }
                     params_seen = true;
+                    walls_on = walls == 1;
                 } break;
                 case 13: {
                     // Spec 25 RegionShells: validated, not rendered.

@@ -334,6 +334,25 @@ static const f64 C_CONTACT_R = 2.0;
 static const u32 C_MONOPOLE_BASE = 0xFF000000u;
 static const u32 C_WALL_BASE = 0xFFFFFF00u;
 
+// Contact record validation (identical rules to ontos_view): body_a is
+// always a real fine body; body_b is either a real body (a < b, both <
+// body_count) or one of the static contactant pseudo ids -- a
+// collapsed-region monopole 0xFF000000 + r (r < 4), or, when walls mode
+// is on, one of the four wall ids 0xFFFFFF00 + 0..3. Anything else would
+// index bodies[a] or region_collapse_mass[b - base] out of bounds.
+static bool contact_pair_valid(u32 a, u32 b, u32 body_count, bool walls_on) {
+  if (a >= body_count) {
+    return false;
+  }
+  if (b < C_MONOPOLE_BASE) {
+    return b < body_count && a < b;
+  }
+  if (b < C_WALL_BASE) {
+    return b - C_MONOPOLE_BASE < 4;
+  }
+  return walls_on && b - C_WALL_BASE < 4;
+}
+
 struct SplitMix64 {
   u64 state;
   explicit SplitMix64(u64 s) : state(s) {}
@@ -2260,8 +2279,8 @@ static int run_gravity(const std::vector<u8> &data, u64 seed, u32 body_count,
           std::fprintf(stderr, "error: truncated Contact at offset %zu\n", rec_start);
           return 2;
         }
-        const bool b_static = b >= C_MONOPOLE_BASE;
-        if (a >= b || (!b_static && b >= body_count) || t == 0) {
+        const bool contact_ok = contact_pair_valid(a, b, body_count, world.walls_on);
+        if (!contact_ok || t == 0) {
           std::fprintf(stderr,
                        "error: bad Contact (tick=%" PRIu64 " pair=(%" PRIu32 ",%" PRIu32
                        ")) at offset %zu\n",
