@@ -51,8 +51,14 @@ void validate_manifest(const BuildManifest& manifest) {
         throw BuilderError("cluster_triangle_limit must not exceed 256: the visibility encoding "
                            "stores local_triangle in 8 bits and larger limits alias triangle ids");
     }
-    if (manifest.cluster_vertex_limit == 0) {
-        throw BuilderError("cluster_vertex_limit must be greater than zero");
+    // The pinned meshoptimizer meshlet builders (meshopt_buildMeshlets/
+    // Flex/Spatial, clusterizer.cpp) assert 3 <= max_vertices <= 256
+    // (meshopt_Meshlet local vertex indices are one byte wide). A limit of
+    // 1 or 2 survived manifest validation and aborted deep inside the
+    // cluster build on that assert; reject it here with a named error.
+    if (manifest.cluster_vertex_limit < 3 || manifest.cluster_vertex_limit > 256) {
+        throw BuilderError("cluster_vertex_limit must be in [3, 256]: the pinned meshoptimizer "
+                           "meshlet builder requires 3 <= max_vertices <= 256");
     }
     if (manifest.page_cluster_limit == 0) {
         throw BuilderError("page_cluster_limit must be greater than zero");
