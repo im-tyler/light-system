@@ -8,6 +8,20 @@
 
 namespace meridian::detail {
 
+namespace {
+
+// Fixed char arrays are not guaranteed NUL-terminated on disk; construct
+// bounded and reject an unterminated field instead of reading past it.
+std::string fixed_char_field(const char* field, size_t size, const char* field_name) {
+    const size_t length = strnlen(field, size);
+    if (length == size) {
+        throw BuilderError(std::string(field_name) + " is not NUL-terminated");
+    }
+    return std::string(field, length);
+}
+
+}  // namespace
+
 MaterialSectionDisk to_disk(const MaterialSection& section) {
     MaterialSectionDisk disk{};
     const auto name_size = std::min(section.name.size(), sizeof(disk.name) - 1);
@@ -148,8 +162,10 @@ ResourceSummary read_resource_summary(const std::filesystem::path& input_path) {
     const bool file_is_textured = (header.flags & kFileFlagTextured) != 0;
 
     ResourceSummary summary;
-    summary.asset_id = std::string(summary_disk.asset_id);
-    summary.source_asset = std::string(summary_disk.source_asset);
+    summary.asset_id = fixed_char_field(summary_disk.asset_id, sizeof(summary_disk.asset_id),
+                                        "asset_id");
+    summary.source_asset = fixed_char_field(summary_disk.source_asset,
+                                            sizeof(summary_disk.source_asset), "source_asset");
     summary.has_fallback = summary_disk.has_fallback != 0;
     summary.source_vertex_count = summary_disk.source_vertex_count;
     summary.source_triangle_count = summary_disk.source_triangle_count;
