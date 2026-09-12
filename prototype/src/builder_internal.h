@@ -252,7 +252,11 @@ inline float parse_float(std::string_view value) {
     char* parse_end = nullptr;
     errno = 0;
     const float parsed = std::strtof(begin, &parse_end);
-    if (errno == ERANGE || parse_end != begin + trimmed.size()) {
+    // isfinite: strtof happily parses "nan"/"inf" without ERANGE, and a
+    // non-finite manifest value (bounds_padding, explicit bounds) poisons
+    // every downstream min/max comparison.
+    if (errno == ERANGE || parse_end != begin + trimmed.size() ||
+        !std::isfinite(parsed)) {
         throw BuilderError("invalid float value: " + trimmed);
     }
     return parsed;
@@ -338,6 +342,24 @@ inline Bounds3f apply_bounds_padding(Bounds3f bounds, float padding) {
     bounds.max.x += padding;
     bounds.max.y += padding;
     bounds.max.z += padding;
+    // The resolved bounds must stay finite and ordered on every axis.
+    // Padding is validated finite at the manifest, but the base bounds can
+    // still be non-finite (NaN source geometry, inf explicit values from
+    // parse_vec3, which bypasses parse_float), and negative padding is
+    // legal only while it leaves min <= max. Reject here -- the single
+    // choke point both bound-resolution paths (create_stub_resource,
+    // resolve_resource_bounds) go through.
+    const float resolved[6] = {bounds.min.x, bounds.min.y, bounds.min.z,
+                               bounds.max.x, bounds.max.y, bounds.max.z};
+    for (const float value : resolved) {
+        if (!std::isfinite(value)) {
+            throw BuilderError("resolved bounds are not finite");
+        }
+    }
+    if (bounds.min.x > bounds.max.x || bounds.min.y > bounds.max.y ||
+        bounds.min.z > bounds.max.z) {
+        throw BuilderError("resolved bounds are not ordered (min <= max) after bounds_padding");
+    }
     return bounds;
 }
 

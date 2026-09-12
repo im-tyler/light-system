@@ -66,6 +66,27 @@ void validate_manifest(const BuildManifest& manifest) {
     if (manifest.hierarchy_partition_size == 0) {
         throw BuilderError("hierarchy_partition_size must be greater than zero");
     }
+    // NaN padding turns every downstream min/max comparison false (the
+    // padded box reads as empty); explicit bounds must additionally be
+    // ordered before padding so a later negative padding has a defined
+    // starting point. parse_float already rejects non-finite padding.
+    if (!std::isfinite(manifest.bounds_padding)) {
+        throw BuilderError("bounds_padding must be finite");
+    }
+    if (manifest.has_explicit_bounds) {
+        const Bounds3f& bounds = manifest.explicit_bounds;
+        const float fields[6] = {bounds.min.x, bounds.min.y, bounds.min.z,
+                                 bounds.max.x, bounds.max.y, bounds.max.z};
+        for (const float value : fields) {
+            if (!std::isfinite(value)) {
+                throw BuilderError("explicit bounds must be finite");
+            }
+        }
+        if (bounds.min.x > bounds.max.x || bounds.min.y > bounds.max.y ||
+            bounds.min.z > bounds.max.z) {
+            throw BuilderError("explicit bounds must satisfy min <= max on every axis");
+        }
+    }
 }
 
 void validate_resource(const VGeoResource& resource) {
