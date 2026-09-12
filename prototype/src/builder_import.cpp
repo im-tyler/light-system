@@ -426,6 +426,64 @@ std::vector<unsigned char> build_vertex_locks(const MeshData& mesh) {
     return vertex_locks;
 }
 
+// Fan triangulation is only valid for convex polygons. Verify with Newell's
+// face normal plus the turn direction of consecutive edge cross products:
+// a convex polygon has every cross product on the same side of the face
+// normal. Collinear vertices (near-zero cross products) are tolerated;
+// a reflex vertex or a fully degenerate outline is rejected.
+void validate_obj_face_convexity(const MeshData& mesh, const std::vector<uint32_t>& face_indices,
+                                 size_t line_number) {
+    const size_t count = face_indices.size();
+    Vec3f normal{0.0f, 0.0f, 0.0f};
+    for (size_t i = 0; i < count; ++i) {
+        const Vec3f& current = mesh.positions[face_indices[i]];
+        const Vec3f& next = mesh.positions[face_indices[(i + 1) % count]];
+        normal.x += (current.y - next.y) * (current.z + next.z);
+        normal.y += (current.z - next.z) * (current.x + next.x);
+        normal.z += (current.x - next.x) * (current.y + next.y);
+    }
+    const float normal_length =
+        std::sqrt(normal.x * normal.x + normal.y * normal.y + normal.z * normal.z);
+    if (normal_length <= 1e-12f) {
+        throw BuilderError("non-convex face with " + std::to_string(count) +
+                           " vertices at line " + std::to_string(line_number) +
+                           " - split into triangles in the source asset");
+    }
+    const Vec3f normal_hat{normal.x / normal_length, normal.y / normal_length,
+                           normal.z / normal_length};
+    constexpr float kTurnEpsilon = 1e-4f;
+    bool saw_convex_turn = false;
+    for (size_t i = 0; i < count; ++i) {
+        const Vec3f& p0 = mesh.positions[face_indices[i]];
+        const Vec3f& p1 = mesh.positions[face_indices[(i + 1) % count]];
+        const Vec3f& p2 = mesh.positions[face_indices[(i + 2) % count]];
+        const Vec3f e0{p1.x - p0.x, p1.y - p0.y, p1.z - p0.z};
+        const Vec3f e1{p2.x - p1.x, p2.y - p1.y, p2.z - p1.z};
+        const Vec3f turn{e0.y * e1.z - e0.z * e1.y, e0.z * e1.x - e0.x * e1.z,
+                         e0.x * e1.y - e0.y * e1.x};
+        const float turn_length =
+            std::sqrt(turn.x * turn.x + turn.y * turn.y + turn.z * turn.z);
+        if (turn_length <= 1e-12f) {
+            continue;
+        }
+        const float sine = (turn.x * normal_hat.x + turn.y * normal_hat.y +
+                            turn.z * normal_hat.z) / turn_length;
+        if (sine < -kTurnEpsilon) {
+            throw BuilderError("non-convex face with " + std::to_string(count) +
+                               " vertices at line " + std::to_string(line_number) +
+                               " - split into triangles in the source asset");
+        }
+        if (sine > kTurnEpsilon) {
+            saw_convex_turn = true;
+        }
+    }
+    if (!saw_convex_turn) {
+        throw BuilderError("non-convex face with " + std::to_string(count) +
+                           " vertices at line " + std::to_string(line_number) +
+                           " - split into triangles in the source asset");
+    }
+}
+
 MeshData load_obj_mesh(const BuildManifest& manifest) {
     const std::filesystem::path& source_asset = manifest.source_asset;
     std::ifstream input(source_asset);
@@ -494,6 +552,9 @@ MeshData load_obj_mesh(const BuildManifest& manifest) {
         if (face_indices.size() < 3) {
             throw BuilderError("face with fewer than 3 vertices at line " +
                                std::to_string(line_number));
+        }
+        if (face_indices.size() > 3) {
+            validate_obj_face_convexity(mesh, face_indices, line_number);
         }
 
         for (size_t i = 1; i + 1 < face_indices.size(); ++i) {
