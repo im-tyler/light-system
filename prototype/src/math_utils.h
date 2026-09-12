@@ -183,6 +183,9 @@ inline FrustumPlanes extract_frustum_planes(const Mat4f& vp) {
 // Build per-cascade light view-projection matrices and view-space split
 // distances. The sub-frustum for cascade i spans [near .. splits[0]] for i=0,
 // [splits[i-1] .. splits[i]] for i>0, with the last cascade ending at `far`.
+// `light_dir` is the surface-to-light direction (the fragment shader's L);
+// each cascade's shadow camera looks from center + light_dir*radius toward
+// the cascade center.
 //
 // Each cascade fits a tight orthographic light projection around the 8
 // world-space corners of its sub-frustum, then pushes the light near plane
@@ -259,15 +262,25 @@ inline CascadeLightSetup compute_cascade_light_setup(
         // Round up to avoid shimmer as camera moves.
         radius = std::ceil(radius * 16.0f) / 16.0f;
 
+        // Convention: light_dir is the surface-to-light direction (the same
+        // vector the fragment shader uses as L). The light therefore sits at
+        // center + light*radius, and the shadow eye goes there, looking back
+        // at the cascade center -- a light at +Y lights top faces and casts
+        // shadows downward, matching the Lambert term. (The eye previously
+        // sat at center - light*radius, on the opposite side of the scene
+        // from the light, so depth came from the underside of the geometry.)
         const Vec3f eye{
-            center.x - light.x * radius,
-            center.y - light.y * radius,
-            center.z - light.z * radius,
+            center.x + light.x * radius,
+            center.y + light.y * radius,
+            center.z + light.z * radius,
         };
         const Mat4f light_view = look_at_matrix(eye, center, world_up);
-        // Orthographic fit: symmetric box around the cascade center.
-        // Push the near plane back (toward the light) by caster_extent so
-        // shadow casters outside the sub-frustum are captured.
+        // Orthographic fit: symmetric box around the cascade center. The
+        // sphere spans view-space z in [-2*radius, 0] (eye at +light*radius
+        // looking back), so far = 2*radius covers the whole cascade, and the
+        // near plane pushed back to -caster_extent extends caster_extent past
+        // the eye toward the light so shadow casters outside the sub-frustum
+        // (between the light and the cascade) are captured.
         const Mat4f light_proj = ortho_matrix(-radius, radius, -radius, radius,
                                               -caster_extent, 2.0f * radius);
         out.light_vp[i] = multiply_matrix(light_proj, light_view);
