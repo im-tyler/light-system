@@ -12,6 +12,18 @@ void validate_manifest(const BuildManifest& manifest) {
     if (manifest.output_path.empty()) {
         throw BuilderError("manifest is missing output_path");
     }
+    // Fixed char fields in the binary schema (SummaryBlockDisk,
+    // MaterialSectionDisk) silently truncate over-long strings while the
+    // textual sidecar keeps them whole -- same build, different metadata per
+    // representation, and two long names can collide after truncation.
+    // Reject at the manifest so both representations agree; the truncation
+    // in the serializers stays as defense-in-depth.
+    if (manifest.asset_id.size() > sizeof(SummaryBlockDisk::asset_id) - 1) {
+        throw BuilderError("manifest asset_id exceeds the 64-byte fixed field (63 characters max)");
+    }
+    if (manifest.source_asset.string().size() > sizeof(SummaryBlockDisk::source_asset) - 1) {
+        throw BuilderError("manifest source_asset exceeds the 256-byte fixed field (255 characters max)");
+    }
     if (manifest.material_slots.empty()) {
         throw BuilderError("manifest must define at least one material slot");
     }
@@ -19,6 +31,10 @@ void validate_manifest(const BuildManifest& manifest) {
     for (const std::string& material_slot : manifest.material_slots) {
         if (material_slot.empty()) {
             throw BuilderError("manifest material_slots must not contain empty names");
+        }
+        if (material_slot.size() > sizeof(MaterialSectionDisk::name) - 1) {
+            throw BuilderError("manifest material name exceeds the 64-byte fixed field (63 characters max): " +
+                               material_slot);
         }
         if (!material_names.emplace(material_slot, 1).second) {
             throw BuilderError("manifest material_slots must be unique");
