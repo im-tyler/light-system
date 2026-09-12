@@ -636,8 +636,11 @@ struct GravityWorld {
         }
       } else if (std::strcmp(ic_profile, "coarsehit") == 0) {
         // Interceptors (ids 0..3) aimed at a demoted target cluster
-        // (ids 4..7) over shared y lanes; the fine body carries the
-        // smaller id because the section 21/24 sweep is lexicographic.
+        // (ids 4..7) over shared y lanes; the corpus exercises the
+        // fine-low static arm (fine i, coarse j) of the section 24
+        // sweep — the reversed id order (coarse contactant below the
+        // fine body) is pinned by unit regression instead (ontos
+        // OTO-016).
         const f64 lane =
             77.0 + 8.0 * static_cast<f64>(i % 4) + static_cast<f64>(u2) * G_TWO_POW_NEG64 * 2.0;
         if (i < 4) {
@@ -1416,11 +1419,12 @@ struct GravityWorld {
     return {vn, jn};
   }
 
-  // Section 21 + 24 contact pass: single pinned lexicographic impulse sweep
-  // over fine pairs (fine x coarse static pairs included when the
-  // ContactParams record is present), then collapsed-region monopoles in
-  // region order, then walls in body order — applied immediately, after the
-  // second fc kick.
+  // Section 21 + 24 contact pass: single pinned impulse sweep over
+  // unordered real-body pairs in (i, j) id order — (fine, fine)
+  // two-sided, (fine, coarse) static, and with the ContactParams
+  // record (coarse, fine) static against the frozen contactant — then
+  // collapsed-region monopoles in region order, then walls in body
+  // order — applied immediately, after the second fc kick.
   void contact_pass(u64 entering, const std::vector<u8> &flags) {
     const std::size_t n = bodies.size();
     std::vector<f64> radii(n);
@@ -1432,20 +1436,31 @@ struct GravityWorld {
     const bool extended = contacts_params;
     std::vector<std::pair<u32, u32>> nxt;
     std::vector<GContact> events;
+    // Section 24: the sweep visits every unordered real-body pair once
+    // in pinned (i, j) id order and dispatches on membership — a fine
+    // body resolving against an ephemeris-coarse contactant is
+    // reachable whichever member carries the smaller id. Only
+    // (fine, fine), (fine, coarse), and — with the ContactParams
+    // record — (coarse, fine) pairs proceed; collapsed members never
+    // contact individually (their region contacts as a monopole),
+    // coarse-coarse pairs have no movable member, and without the
+    // record non-fine bodies never contact (section 21).
     for (std::size_t i = 0; i < n; ++i) {
-      if (flags[i] != 1) {
-        continue;
-      }
       for (std::size_t j = i + 1; j < n; ++j) {
-        if (flags[j] == 2) {
+        const bool fine_fine = flags[i] == 1 && flags[j] == 1;
+        const bool fine_coarse = flags[i] == 1 && flags[j] == 0;
+        const bool coarse_fine = flags[i] == 0 && flags[j] == 1;
+        if (!(fine_fine || fine_coarse || (coarse_fine && extended))) {
           continue;
         }
-        if (flags[j] == 0 && !extended) {
-          continue;
-        }
-        const GBody sj = state_at(j, entering);
-        const f64 dx = sj.x - bodies[i].x;
-        const f64 dy = sj.y - bodies[i].y;
+        // f is the fine member; so is the other member's state at the
+        // tick (polynomial evaluation for a coarse contactant,
+        // integrated state for a fine pair). The normal points from
+        // the fine body toward the contactant.
+        const std::size_t f = flags[i] == 1 ? i : j;
+        const GBody so = state_at(flags[i] == 1 ? j : i, entering);
+        const f64 dx = so.x - bodies[f].x;
+        const f64 dy = so.y - bodies[f].y;
         const f64 rs = radii[i] + radii[j];
         const f64 d2 = dx * dx + dy * dy;
         if (d2 >= rs * rs) {
@@ -1460,23 +1475,19 @@ struct GravityWorld {
           nx = dx / dist;
           ny = dy / dist;
         }
-        const f64 vrx = sj.vx - bodies[i].vx;
-        const f64 vry = sj.vy - bodies[i].vy;
+        const f64 vrx = so.vx - bodies[f].vx;
+        const f64 vry = so.vy - bodies[f].vy;
         const f64 vn = vrx * nx + vry * ny;
         if (vn >= 0.0) {
           continue;
         }
         const f64 mi = bodies[i].mass;
         const f64 mj = bodies[j].mass;
-        const f64 cx = (bodies[i].x + sj.x) * 0.5;
-        const f64 cy = (bodies[i].y + sj.y) * 0.5;
+        const f64 cx = (bodies[f].x + so.x) * 0.5;
+        const f64 cy = (bodies[f].y + so.y) * 0.5;
         f64 jn;
         f64 mu;
-        if (flags[j] == 0) {
-          const std::pair<f64, f64> res = static_impulse(i, nx, ny, vrx, vry);
-          jn = res.second;
-          mu = mi;
-        } else {
+        if (fine_fine) {
           const f64 inv = 1.0 / (mi + mj);
           const f64 t = vn * inv;
           const f64 s = (1.0 + e) * t;
@@ -1505,6 +1516,10 @@ struct GravityWorld {
             bodies[j].vx -= ftj * (0.0 - ny);
             bodies[j].vy -= ftj * nx;
           }
+        } else {
+          const std::pair<f64, f64> res = static_impulse(f, nx, ny, vrx, vry);
+          jn = res.second;
+          mu = (mi * mj) / (mi + mj);
         }
         bool was = false;
         for (const auto &p : touching) {
@@ -1525,12 +1540,12 @@ struct GravityWorld {
         c.cy = cy;
         c.vn = vn;
         // The contactant is measured at its post-impulse state for fine
-        // pairs (flags 1) and at its (frozen) polynomial evaluation for
-        // coarse pairs (flags 0) — never at the stale demote-time slot.
+        // pairs and at its (frozen) polynomial evaluation for static
+        // pairs — never at the stale demote-time slot.
         c.vn_after =
-            flags[j] == 1
+            fine_fine
                 ? (bodies[j].vx - bodies[i].vx) * nx + (bodies[j].vy - bodies[i].vy) * ny
-                : (sj.vx - bodies[i].vx) * nx + (sj.vy - bodies[i].vy) * ny;
+                : (so.vx - bodies[f].vx) * nx + (so.vy - bodies[f].vy) * ny;
         c.mu = mu;
         events.push_back(c);
       }
