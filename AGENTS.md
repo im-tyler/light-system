@@ -1,5 +1,7 @@
 # AGENTS.md
 
+Open audit items, deferred findings and their reasons live in `AUDIT_OPEN.md` at the repo root (2026-09-09→12 audit sweep). Read it before treating related work as done; update it when you close, defer, or upstream-report an item.
+
 This repository is **public** and mirrored to GitHub at https://github.com/im-tyler/light-system.
 It is a standalone Vulkan renderer (formerly "Project Meridian," the renderer
 subsystem of the retired Godot-parity umbrella; docs/ADRs still use the old name).
