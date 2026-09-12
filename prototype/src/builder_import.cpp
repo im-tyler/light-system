@@ -67,6 +67,40 @@ Vec3f transform_point(const float matrix[16], const Vec3f& point) {
     };
 }
 
+// glTF spec: authored normals transform by the inverse-transpose of the
+// node world matrix's upper 3x3, then renormalize. The cofactor form
+// avoids a full matrix inverse; a degenerate (zero-determinant) transform
+// falls back to the authored direction.
+Vec3f transform_normal(const float matrix[16], const Vec3f& normal) {
+    // Row-major view of the upper 3x3 (world_matrix is column-major).
+    const float a00 = matrix[0], a01 = matrix[4], a02 = matrix[8];
+    const float a10 = matrix[1], a11 = matrix[5], a12 = matrix[9];
+    const float a20 = matrix[2], a21 = matrix[6], a22 = matrix[10];
+    const float c00 = a11 * a22 - a12 * a21;
+    const float c01 = a12 * a20 - a10 * a22;
+    const float c02 = a10 * a21 - a11 * a20;
+    const float c10 = a02 * a21 - a01 * a22;
+    const float c11 = a00 * a22 - a02 * a20;
+    const float c12 = a01 * a20 - a00 * a21;
+    const float c20 = a01 * a12 - a02 * a11;
+    const float c21 = a02 * a10 - a00 * a12;
+    const float c22 = a00 * a11 - a01 * a10;
+    const float det = a00 * c00 + a01 * c01 + a02 * c02;
+    Vec3f result = normal;
+    if (det != 0.0f) {
+        result = Vec3f{
+            (c00 * normal.x + c01 * normal.y + c02 * normal.z) / det,
+            (c10 * normal.x + c11 * normal.y + c12 * normal.z) / det,
+            (c20 * normal.x + c21 * normal.y + c22 * normal.z) / det,
+        };
+    }
+    const float len = std::sqrt(result.x * result.x + result.y * result.y + result.z * result.z);
+    if (len > 1e-12f) {
+        return {result.x / len, result.y / len, result.z / len};
+    }
+    return normal;
+}
+
 bool nearly_equal(float lhs, float rhs, float epsilon = 1e-5f) {
     return std::fabs(lhs - rhs) <= epsilon;
 }
@@ -274,6 +308,20 @@ void append_gltf_primitive(MeshData& mesh, const cgltf_primitive& primitive, con
     const size_t texcoord_write_base = mesh.texcoords.empty()
                                            ? std::numeric_limits<size_t>::max()
                                            : (mesh.texcoords.size() / 2 - positions->count);
+    // The normal stream is mesh-wide and must be homogeneous: primitives
+    // with and without NORMAL cannot mix (a half-authored stream would
+    // silently zero the missing vertices' normals).
+    if (!mesh.positions.empty() &&
+        (normals != nullptr) != !mesh.normals.empty()) {
+        throw BuilderError(
+            "glTF mesh mixes primitives with and without NORMAL attributes; normalize normals in the source asset");
+    }
+    if (normals != nullptr) {
+        mesh.normals.resize(mesh.positions.size() + positions->count);
+    }
+    const size_t normal_write_base =
+        mesh.normals.empty() ? std::numeric_limits<size_t>::max()
+                             : (mesh.normals.size() - positions->count);
     for (cgltf_size vertex_index = 0; vertex_index < positions->count; ++vertex_index) {
         const Vec3f transformed = transform_point(
             world_matrix,
@@ -290,11 +338,14 @@ void append_gltf_primitive(MeshData& mesh, const cgltf_primitive& primitive, con
         }
 
         MeshData::VertexSeamAttributes attributes;
-        if (!unpacked_normals.empty()) {
+        if (normals != nullptr) {
             attributes.has_normal = true;
-            attributes.normal = Vec3f{unpacked_normals[vertex_index * 3 + 0],
-                                      unpacked_normals[vertex_index * 3 + 1],
-                                      unpacked_normals[vertex_index * 3 + 2]};
+            attributes.normal = transform_normal(
+                world_matrix,
+                Vec3f{unpacked_normals[vertex_index * 3 + 0],
+                      unpacked_normals[vertex_index * 3 + 1],
+                      unpacked_normals[vertex_index * 3 + 2]});
+            mesh.normals[normal_write_base + vertex_index] = attributes.normal;
         }
         if (!unpacked_texcoords.empty()) {
             attributes.has_texcoord0 = true;

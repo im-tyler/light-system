@@ -109,7 +109,13 @@ VGeoResource create_stub_resource(const BuildManifest& manifest) {
 VGeoResource build_resource(const BuildManifest& manifest) {
     VGeoResource resource = create_stub_resource(manifest);
     detail::MeshData mesh = detail::load_mesh(manifest);
-    detail::compute_smooth_normals(mesh);
+    // Authored normals (glTF NORMAL, transformed by the node world matrix's
+    // inverse-transpose at import) are kept as-is, preserving hard edges.
+    // Smooth normals are generated only when the source asset has none --
+    // compute_smooth_normals overwrites any existing normal stream.
+    if (mesh.normals.empty()) {
+        detail::compute_smooth_normals(mesh);
+    }
     mesh.emit_uv_payloads = manifest.emit_texture;
     if (manifest.emit_texture) {
         if (mesh.texcoords.empty()) {
