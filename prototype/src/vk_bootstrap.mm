@@ -2642,9 +2642,9 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
                                 resource.lod_geometry_payload.size() &&
                             // Content identity, not just shape: two builds
                             // can match every version/count/total above while
-                            // their payload bytes or page layout differ, and
-                            // streaming from that file feeds the GPU bytes
-                            // that do not belong to this resource.
+                            // their payload bytes, page layout, or metadata
+                            // differ, and streaming from that file feeds the
+                            // GPU bytes that do not belong to this resource.
                             header.content_fingerprint ==
                                 detail::compute_content_fingerprint(resource)) {
                             source_path = candidate;

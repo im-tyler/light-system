@@ -193,13 +193,20 @@ ResourceSummary read_resource_summary(const std::filesystem::path& input_path) {
     return summary;
 }
 
-// 64-bit FNV-1a over the payload bytes and the page layout (fields hashed
-// individually: PageRecord contains alignment padding between page_index and
-// byte_offset that would leak uninitialized bytes into a raw-struct hash).
-// The persisted-.vgeo acceptance check recomputes this from the freshly
-// built resource -- versions/counts/byte-totals alone cannot distinguish two
-// builds whose payloads differ, and the streaming path would then mmap a
-// file whose bytes do not match the resource the GPU was assembled from.
+// 64-bit FNV-1a over the header/summary metadata, the payload bytes, and the
+// page layout (fields hashed individually: PageRecord contains alignment
+// padding between page_index and byte_offset that would leak uninitialized
+// bytes into a raw-struct hash). The metadata coverage is what ties the
+// fingerprint to the fields the textual sidecar and the persisted-.vgeo
+// acceptance check mirror (asset_id, source_asset, fallback/textured flags,
+// bounds, totals, texture dims): without it, a rebuild that changed only
+// metadata produced the same fingerprint and a stale sidecar still paired.
+// The header's table offsets are pure functions of the totals and payload
+// sizes hashed here (see the layout math in write_resource) and are not
+// hashed separately: the viewer's rebuild comparison computes this from an
+// in-memory resource that has not derived its offsets yet. Changing this
+// input set changes every fingerprint; pre-change .vgeo+sidecar pairs then
+// fail the pairing check on purpose (regeneration required).
 uint64_t compute_content_fingerprint(const VGeoResource& resource) {
     uint64_t hash = 1469598103934665603ull;
     const auto mix_bytes = [&hash](const std::byte* data, size_t size) {
@@ -214,13 +221,42 @@ uint64_t compute_content_fingerprint(const VGeoResource& resource) {
             hash *= 1099511628211ull;
         }
     };
+    const auto mix_string = [&mix_bytes, &mix_u64](const std::string& value) {
+        mix_u64(value.size());
+        if (!value.empty()) {
+            mix_bytes(reinterpret_cast<const std::byte*>(value.data()), value.size());
+        }
+    };
     const auto mix_payload = [&](const std::vector<std::byte>& payload) {
         mix_u64(payload.size());
         if (!payload.empty()) {
             mix_bytes(payload.data(), payload.size());
         }
     };
+    // Summary block: asset_id, source_asset, has_fallback, source counts.
+    mix_string(resource.asset_id);
+    mix_string(resource.source_asset.string());
+    mix_u64(resource.has_fallback ? 1ull : 0ull);
+    mix_u64(resource.source_vertex_count);
+    mix_u64(resource.source_triangle_count);
+    // File header flags and totals: the textured flag mirrors a non-empty
+    // texture payload; the byte totals mirror the payload sizes mixed below.
+    mix_u64(resource.texture_payload.empty() ? 0ull : 1ull);
+    mix_u64(resource.texture_width);
+    mix_u64(resource.texture_height);
+    const float bounds_fields[6] = {resource.bounds.min.x, resource.bounds.min.y,
+                                    resource.bounds.min.z, resource.bounds.max.x,
+                                    resource.bounds.max.y, resource.bounds.max.z};
+    mix_bytes(reinterpret_cast<const std::byte*>(bounds_fields), sizeof(bounds_fields));
+    mix_u64(resource.material_sections.size());
+    mix_u64(resource.hierarchy_nodes.size());
+    mix_u64(resource.clusters.size());
     mix_u64(resource.pages.size());
+    mix_u64(resource.lod_groups.size());
+    mix_u64(resource.lod_clusters.size());
+    mix_u64(resource.node_lod_links.size());
+    mix_u64(resource.page_dependencies.size());
+    mix_u64(resource.lod_group_base_runs.size());
     for (const PageRecord& page : resource.pages) {
         mix_u64(page.page_index);
         mix_u64(page.byte_offset);

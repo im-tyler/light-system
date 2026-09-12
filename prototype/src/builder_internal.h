@@ -39,9 +39,11 @@ constexpr std::array<char, 4> kMagic = {'V', 'G', 'E', 'O'};
 // sphere for the radius-compensated normal-cone cull). Readers loading v3/v4
 // files synthesize the sphere from the cluster AABB.
 // v6: content_fingerprint in the file header -- 64-bit FNV-1a over the
-// payload bytes and the page layout, so the persisted-.vgeo fast path can
-// reject a cache whose content does not match the freshly built resource
-// (versions/counts/byte-totals alone cannot).
+// payload bytes, the page layout, and the header/summary metadata, so the
+// persisted-.vgeo fast path can reject a cache whose content does not match
+// the freshly built resource (versions/counts/byte-totals alone cannot, and
+// payload-only coverage let metadata-only rebuilds pair with stale
+// sidecars).
 constexpr uint32_t kSchemaVersion = 6;
 constexpr uint32_t kBuilderVersion = 3;
 constexpr uint32_t kPageFlagLodPayload = 1u << 0;
