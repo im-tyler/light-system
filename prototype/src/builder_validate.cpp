@@ -27,6 +27,14 @@ void validate_manifest(const BuildManifest& manifest) {
     if (manifest.cluster_triangle_limit == 0) {
         throw BuilderError("cluster_triangle_limit must be greater than zero");
     }
+    // The visibility encoding (visibility_format.h) stores local_triangle in
+    // 8 bits (kVisibilityLocalTriangleMask = 0xff): a cluster may hold up to
+    // 256 triangles (local ids 0..255), and any larger limit aliases ids in
+    // the visibility word read back for selection-subset verification.
+    if (manifest.cluster_triangle_limit > 256) {
+        throw BuilderError("cluster_triangle_limit must not exceed 256: the visibility encoding "
+                           "stores local_triangle in 8 bits and larger limits alias triangle ids");
+    }
     if (manifest.cluster_vertex_limit == 0) {
         throw BuilderError("cluster_vertex_limit must be greater than zero");
     }
