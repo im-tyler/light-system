@@ -58,7 +58,7 @@
   "buffers": [
     {
       "uri": "sparse_building_block.bin",
-      "byteLength": 244
+      "byteLength": 256
     }
   ],
   "bufferViews": [
@@ -89,6 +89,16 @@
       "byteOffset": 220,
       "byteLength": 24,
       "target": 34963
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 244,
+      "byteLength": 4
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 248,
+      "byteLength": 8
     }
   ],
   "accessors": [
@@ -140,7 +150,17 @@
       "bufferView": 4,
       "componentType": 5125,
       "count": 6,
-      "type": "SCALAR"
+      "type": "SCALAR",
+      "sparse": {
+        "count": 2,
+        "indices": {
+          "bufferView": 5,
+          "componentType": 5123
+        },
+        "values": {
+          "bufferView": 6
+        }
+      }
     }
   ]
 }

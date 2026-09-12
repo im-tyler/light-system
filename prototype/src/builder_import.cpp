@@ -375,9 +375,21 @@ void append_gltf_primitive(MeshData& mesh, const cgltf_primitive& primitive, con
         }
         const size_t previous_index_count = section.indices.size();
         section.indices.resize(previous_index_count + primitive.indices->count);
-        if (cgltf_accessor_unpack_indices(primitive.indices, section.indices.data() + previous_index_count,
-                                          sizeof(uint32_t), primitive.indices->count) !=
-            primitive.indices->count) {
+        uint32_t* decoded = section.indices.data() + previous_index_count;
+        // cgltf_accessor_unpack_indices returns 0 for sparse accessors (no
+        // sparse support in the pinned cgltf), rejecting valid sparse index
+        // accessors the README commits to supporting. Sparse index accessors
+        // decode per-element through cgltf_accessor_read_index, which applies
+        // the sparse overlay (sparse hit, then base buffer view). Dense
+        // accessors keep the memcpy fast path and stay byte-identical.
+        if (primitive.indices->is_sparse) {
+            for (cgltf_size index = 0; index < primitive.indices->count; ++index) {
+                decoded[index] =
+                    static_cast<uint32_t>(cgltf_accessor_read_index(primitive.indices, index));
+            }
+        } else if (cgltf_accessor_unpack_indices(primitive.indices, decoded, sizeof(uint32_t),
+                                                 primitive.indices->count) !=
+                   primitive.indices->count) {
             throw BuilderError("failed to unpack glTF index accessor");
         }
         for (size_t index = previous_index_count; index < section.indices.size(); ++index) {

@@ -74,11 +74,26 @@ def write_sparse_gltf(output_path: Path) -> None:
     ]
     roof_indices = [3, 2, 6, 3, 6, 7]
 
+    # Sparse overlay on the roof INDEX accessor: entries 0 and 3 are
+    # overridden with their own base values, so the decoded index stream is
+    # byte-identical to the dense accessor while exercising both branches of
+    # the sparse-aware read path (sparse hit at 0/3, base buffer view at the
+    # rest). Keep the override values equal to roof_indices[pos] or the
+    # built geometry changes.
+    roof_sparse_entry_indices = [0, 3]
+    roof_sparse_entry_values = [roof_indices[0], roof_indices[3]]
+
     position_bytes = struct.pack(f"<{len(positions)}f", *positions)
     sparse_index_bytes = struct.pack(f"<{len(sparse_indices)}H", *sparse_indices)
     sparse_value_bytes = struct.pack(f"<{len(sparse_values)}f", *sparse_values)
     wall_index_bytes = struct.pack(f"<{len(wall_indices)}I", *wall_indices)
     roof_index_bytes = struct.pack(f"<{len(roof_indices)}I", *roof_indices)
+    roof_sparse_index_bytes = struct.pack(
+        f"<{len(roof_sparse_entry_indices)}H", *roof_sparse_entry_indices
+    )
+    roof_sparse_value_bytes = struct.pack(
+        f"<{len(roof_sparse_entry_values)}I", *roof_sparse_entry_values
+    )
 
     blob = (
         position_bytes
@@ -86,6 +101,8 @@ def write_sparse_gltf(output_path: Path) -> None:
         + sparse_value_bytes
         + wall_index_bytes
         + roof_index_bytes
+        + roof_sparse_index_bytes
+        + roof_sparse_value_bytes
     )
     buffer_path = output_path.parent / "sparse_building_block.bin"
     buffer_path.write_bytes(blob)
@@ -94,6 +111,8 @@ def write_sparse_gltf(output_path: Path) -> None:
     sparse_value_offset = sparse_index_offset + len(sparse_index_bytes)
     wall_index_offset = sparse_value_offset + len(sparse_value_bytes)
     roof_index_offset = wall_index_offset + len(wall_index_bytes)
+    roof_sparse_index_offset = roof_index_offset + len(roof_index_bytes)
+    roof_sparse_value_offset = roof_sparse_index_offset + len(roof_sparse_index_bytes)
 
     gltf = {
         "asset": {
@@ -146,6 +165,16 @@ def write_sparse_gltf(output_path: Path) -> None:
                 "byteLength": len(roof_index_bytes),
                 "target": 34963,
             },
+            {
+                "buffer": 0,
+                "byteOffset": roof_sparse_index_offset,
+                "byteLength": len(roof_sparse_index_bytes),
+            },
+            {
+                "buffer": 0,
+                "byteOffset": roof_sparse_value_offset,
+                "byteLength": len(roof_sparse_value_bytes),
+            },
         ],
         "accessors": [
             {
@@ -174,6 +203,11 @@ def write_sparse_gltf(output_path: Path) -> None:
                 "componentType": 5125,
                 "count": len(roof_indices),
                 "type": "SCALAR",
+                "sparse": {
+                    "count": len(roof_sparse_entry_indices),
+                    "indices": {"bufferView": 5, "componentType": 5123},
+                    "values": {"bufferView": 6},
+                },
             },
         ],
     }
