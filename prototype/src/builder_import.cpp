@@ -67,6 +67,19 @@ Vec3f transform_point(const float matrix[16], const Vec3f& point) {
     };
 }
 
+// Determinant of the world matrix's upper 3x3 (column-major input). Sign
+// only matters: negative means the node instance mirrors space, which
+// reverses triangle winding (glTF 2.0 spec, section 5.26).
+float transform_determinant(const float matrix[16]) {
+    const float a00 = matrix[0], a01 = matrix[4], a02 = matrix[8];
+    const float a10 = matrix[1], a11 = matrix[5], a12 = matrix[9];
+    const float a20 = matrix[2], a21 = matrix[6], a22 = matrix[10];
+    const float c00 = a11 * a22 - a12 * a21;
+    const float c01 = a12 * a20 - a10 * a22;
+    const float c02 = a10 * a21 - a11 * a20;
+    return a00 * c00 + a01 * c01 + a02 * c02;
+}
+
 // glTF spec: authored normals transform by the inverse-transpose of the
 // node world matrix's upper 3x3, then renormalize. The cofactor form
 // avoids a full matrix inverse; a degenerate (zero-determinant) transform
@@ -85,7 +98,7 @@ Vec3f transform_normal(const float matrix[16], const Vec3f& normal) {
     const float c20 = a01 * a12 - a02 * a11;
     const float c21 = a02 * a10 - a00 * a12;
     const float c22 = a00 * a11 - a01 * a10;
-    const float det = a00 * c00 + a01 * c01 + a02 * c02;
+    const float det = transform_determinant(matrix);
     Vec3f result = normal;
     if (det != 0.0f) {
         result = Vec3f{
@@ -266,7 +279,7 @@ void validate_gltf_primitive(const cgltf_primitive& primitive) {
 }
 
 void append_gltf_primitive(MeshData& mesh, const cgltf_primitive& primitive, const float world_matrix[16],
-                           uint32_t material_section_index) {
+                           uint32_t material_section_index, bool reverse_winding) {
     validate_gltf_primitive(primitive);
     const cgltf_accessor* positions = find_attribute_accessor(primitive, cgltf_attribute_type_position);
     const cgltf_accessor* normals = find_attribute_accessor(primitive, cgltf_attribute_type_normal);
@@ -370,12 +383,24 @@ void append_gltf_primitive(MeshData& mesh, const cgltf_primitive& primitive, con
         for (size_t index = previous_index_count; index < section.indices.size(); ++index) {
             section.indices[index] += base_vertex_index;
         }
+        if (reverse_winding) {
+            for (size_t index = previous_index_count; index + 2 < section.indices.size(); index += 3) {
+                std::swap(section.indices[index + 1], section.indices[index + 2]);
+            }
+        }
     } else {
         if (positions->count % 3 != 0) {
             throw BuilderError("glTF non-indexed triangle primitive vertex count must be divisible by 3");
         }
-        for (cgltf_size index = 0; index < positions->count; ++index) {
-            section.indices.push_back(base_vertex_index + static_cast<uint32_t>(index));
+        for (cgltf_size triangle = 0; triangle + 2 < positions->count; triangle += 3) {
+            section.indices.push_back(base_vertex_index + static_cast<uint32_t>(triangle));
+            if (reverse_winding) {
+                section.indices.push_back(base_vertex_index + static_cast<uint32_t>(triangle + 2));
+                section.indices.push_back(base_vertex_index + static_cast<uint32_t>(triangle + 1));
+            } else {
+                section.indices.push_back(base_vertex_index + static_cast<uint32_t>(triangle + 1));
+                section.indices.push_back(base_vertex_index + static_cast<uint32_t>(triangle + 2));
+            }
         }
     }
 }
@@ -617,11 +642,19 @@ MeshData load_gltf_mesh(const BuildManifest& manifest) {
         if (node->mesh != nullptr) {
             float world_matrix[16] = {};
             cgltf_node_transform_world(node, world_matrix);
+            // glTF declares triangles counter-clockwise unless the node's
+            // global transform mirrors space (negative determinant), where
+            // the authored winding becomes clockwise. The renderer treats
+            // CCW as front and flips authored normals on back faces, so a
+            // mirrored instance must reverse its winding here to keep
+            // facing (and therefore shading) correct.
+            const bool reverse_winding = transform_determinant(world_matrix) < 0.0f;
             for (cgltf_size primitive_index = 0; primitive_index < node->mesh->primitives_count; ++primitive_index) {
                 const cgltf_primitive& primitive = node->mesh->primitives[primitive_index];
                 const uint32_t material_section_index =
                     resolve_gltf_material_slot(primitive, *data, material_lookup, manifest);
-                append_gltf_primitive(mesh, primitive, world_matrix, material_section_index);
+                append_gltf_primitive(mesh, primitive, world_matrix, material_section_index,
+                                      reverse_winding);
             }
         }
 
