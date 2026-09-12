@@ -13,27 +13,6 @@ void print_usage() {
     std::cerr << "Usage: meridian_residency --manifest <path> --error-threshold <value> [--frames <count>] [--resident-budget <count>] [--bootstrap-resident none|all|base-only|lod-only] [--eviction-grace <frames>]\n";
 }
 
-bool page_is_lod(const meridian::PageRecord& page) {
-    return page.lod_cluster_count != 0;
-}
-
-void bootstrap_residency(meridian::ResidencyModel& model, const meridian::VGeoResource& resource,
-                         std::string_view mode) {
-    if (mode == "none") {
-        return;
-    }
-
-    for (uint32_t page_index = 0; page_index < resource.pages.size(); ++page_index) {
-        const bool is_lod = page_is_lod(resource.pages[page_index]);
-        const bool should_reside = mode == "all" || (mode == "base-only" && !is_lod) ||
-                                   (mode == "lod-only" && is_lod);
-        if (should_reside) {
-            model.pages[page_index].state = meridian::PageResidencyState::resident;
-            model.pages[page_index].last_touched_frame = 0;
-        }
-    }
-}
-
 void print_indices(std::string_view label, const std::vector<uint32_t>& values) {
     std::cout << label << '=';
     for (size_t i = 0; i < values.size(); ++i) {
@@ -95,8 +74,8 @@ int main(int argc, char** argv) {
         const meridian::VGeoResource resource = meridian::build_resource(manifest);
         meridian::validate_resource(resource);
 
-        meridian::ResidencyModel model = meridian::create_residency_model(resource);
-        bootstrap_residency(model, resource, bootstrap_mode);
+        meridian::ResidencyModel model = meridian::create_residency_model(
+            resource, meridian::parse_residency_bootstrap_mode(bootstrap_mode));
 
         std::cout << "asset_id=" << resource.asset_id << '\n';
         std::cout << "error_threshold=" << error_threshold << '\n';

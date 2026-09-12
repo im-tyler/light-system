@@ -1,5 +1,6 @@
 #include "replay_script.h"
 
+#include "runtime_model.h"
 #include "vgeo_builder.h"
 
 #include <fstream>
@@ -110,10 +111,7 @@ ReplayScript load_replay_script(const std::filesystem::path& script_path) {
         throw BuilderError("replay script error_threshold count must match frame_count");
     }
 
-    if (script.bootstrap_resident != "none" && script.bootstrap_resident != "all" &&
-        script.bootstrap_resident != "base-only" && script.bootstrap_resident != "lod-only") {
-        throw BuilderError("invalid replay bootstrap_resident mode: " + script.bootstrap_resident);
-    }
+    parse_residency_bootstrap_mode(script.bootstrap_resident);
 
     return script;
 }

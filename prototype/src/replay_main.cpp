@@ -16,27 +16,6 @@ void print_usage() {
     std::cerr << "Usage: meridian_replay --manifest <path> --script <path> [--detail counts|verbose]\n";
 }
 
-bool page_is_lod(const meridian::PageRecord& page) {
-    return page.lod_cluster_count != 0;
-}
-
-void bootstrap_residency(meridian::ResidencyModel& model, const meridian::VGeoResource& resource,
-                         std::string_view mode) {
-    if (mode == "none") {
-        return;
-    }
-
-    for (uint32_t page_index = 0; page_index < resource.pages.size(); ++page_index) {
-        const bool is_lod = page_is_lod(resource.pages[page_index]);
-        const bool should_reside = mode == "all" || (mode == "base-only" && !is_lod) ||
-                                   (mode == "lod-only" && is_lod);
-        if (should_reside) {
-            model.pages[page_index].state = meridian::PageResidencyState::resident;
-            model.pages[page_index].last_touched_frame = 0;
-        }
-    }
-}
-
 void print_indices(std::string_view label, const std::vector<uint32_t>& values) {
     std::cout << label << '=';
     for (size_t i = 0; i < values.size(); ++i) {
@@ -109,8 +88,8 @@ int main(int argc, char** argv) {
         meridian::validate_resource(resource);
 
         meridian::UploadableScene uploadable_scene = meridian::build_uploadable_scene(resource);
-        meridian::ResidencyModel model = meridian::create_residency_model(resource);
-        bootstrap_residency(model, resource, script.bootstrap_resident);
+        meridian::ResidencyModel model = meridian::create_residency_model(
+            resource, meridian::parse_residency_bootstrap_mode(script.bootstrap_resident));
 
         std::cout << "asset_id=" << resource.asset_id << '\n';
         std::cout << "replay_name=" << script.name << '\n';

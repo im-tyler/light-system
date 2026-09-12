@@ -1,6 +1,7 @@
 #include "runtime_model.h"
 
 #include <algorithm>
+#include <cassert>
 
 namespace meridian {
 
@@ -24,14 +25,52 @@ void request_page(PageResidencyEntry& entry, uint32_t priority, uint32_t page_in
 
 }  // namespace
 
-ResidencyModel create_residency_model(const VGeoResource& resource) {
+ResidencyBootstrapMode parse_residency_bootstrap_mode(std::string_view mode) {
+    if (mode == "none") {
+        return ResidencyBootstrapMode::none;
+    }
+    if (mode == "all") {
+        return ResidencyBootstrapMode::all;
+    }
+    if (mode == "base-only") {
+        return ResidencyBootstrapMode::base_only;
+    }
+    if (mode == "lod-only") {
+        return ResidencyBootstrapMode::lod_only;
+    }
+    throw BuilderError("invalid residency bootstrap mode: " + std::string(mode));
+}
+
+ResidencyModel create_residency_model(const VGeoResource& resource,
+                                      ResidencyBootstrapMode bootstrap) {
     ResidencyModel model;
     model.pages.resize(resource.pages.size());
-    // Initialize all pages as resident so geometry is available immediately
-    for (auto& page : model.pages) {
-        page.state = PageResidencyState::resident;
-        page.last_touched_frame = 0;
+    // Establish exactly the advertised initial set: pages in the set start
+    // resident (available immediately), the complement starts unloaded.
+    // `all` preserves the original everything-resident default the viewer
+    // runtime relies on.
+    for (uint32_t page_index = 0; page_index < resource.pages.size(); ++page_index) {
+        PageResidencyEntry& page = model.pages[page_index];
+        const bool is_lod = resource.pages[page_index].lod_cluster_count != 0;
+        const bool should_reside = bootstrap == ResidencyBootstrapMode::all ||
+                                   (bootstrap == ResidencyBootstrapMode::base_only && !is_lod) ||
+                                   (bootstrap == ResidencyBootstrapMode::lod_only && is_lod);
+        if (should_reside) {
+            page.state = PageResidencyState::resident;
+            page.last_touched_frame = 0;
+        } else {
+            page.state = PageResidencyState::unloaded;
+            page.last_touched_frame = 0xffffffffu;
+        }
     }
+#ifndef NDEBUG
+    if (bootstrap == ResidencyBootstrapMode::none) {
+        for (const PageResidencyEntry& page : model.pages) {
+            assert(!is_resident_like(page.state) &&
+                   "bootstrap mode 'none' must start with zero pages resident");
+        }
+    }
+#endif
     return model;
 }
 
