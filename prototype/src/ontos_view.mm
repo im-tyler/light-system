@@ -1850,6 +1850,20 @@ int main(int argc, char** argv) {
             cam.cy = wy - ndc_y * s->fb_height / (2.0 * cam.zoom);
         });
 
+        uint32_t available_extension_count = 0;
+        vkEnumerateInstanceExtensionProperties(nullptr, &available_extension_count, nullptr);
+        std::vector<VkExtensionProperties> available_extensions(available_extension_count);
+        if (available_extension_count > 0) {
+            vkEnumerateInstanceExtensionProperties(nullptr, &available_extension_count,
+                                                   available_extensions.data());
+        }
+        const auto supports_extension = [&available_extensions](const char* name) {
+            for (const VkExtensionProperties& extension : available_extensions) {
+                if (std::strcmp(extension.extensionName, name) == 0) return true;
+            }
+            return false;
+        };
+
         uint32_t glfw_extension_count = 0;
         const char** glfw_extensions =
             glfwGetRequiredInstanceExtensions(&glfw_extension_count);
@@ -1861,13 +1875,25 @@ int main(int argc, char** argv) {
             // This Homebrew GLFW reports no Vulkan support; mirror
             // meridian_vk_bootstrap and drive the metal surface by hand.
             instance_extensions.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
-            instance_extensions.push_back(VK_EXT_METAL_SURFACE_EXTENSION_NAME);
+            if (supports_extension(VK_EXT_METAL_SURFACE_EXTENSION_NAME)) {
+                instance_extensions.push_back(VK_EXT_METAL_SURFACE_EXTENSION_NAME);
+            } else {
+                throw std::runtime_error("required macOS metal surface extension is not available");
+            }
 #else
             throw std::runtime_error("GLFW did not report required Vulkan instance extensions");
 #endif
         }
-        instance_extensions.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
-        instance_extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+        // VK_KHR_get_physical_device_properties2 is core since Vulkan 1.1
+        // and the requested apiVersion below is 1.2, so the extension name
+        // is not requested at all (mirrors the main renderer's LS-39 fix) --
+        // loaders that only expose it as an extension must not fail
+        // instance creation over it.
+        bool portability_enumeration = false;
+        if (supports_extension(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
+            instance_extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+            portability_enumeration = true;
+        }
 
         std::vector<const char*> layers;
         if (validate) {
@@ -1903,7 +1929,12 @@ int main(int argc, char** argv) {
         instance_info.ppEnabledExtensionNames = instance_extensions.data();
         instance_info.enabledLayerCount = static_cast<uint32_t>(layers.size());
         instance_info.ppEnabledLayerNames = layers.empty() ? nullptr : layers.data();
-        instance_info.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+        // The portability enumeration flag is only valid together with the
+        // VK_KHR_portability_enumeration extension; setting it when the
+        // extension was not enabled fails instance creation.
+        if (portability_enumeration) {
+            instance_info.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+        }
 
         Viewer v;
         VkResult result = vkCreateInstance(&instance_info, nullptr, &v.instance);
