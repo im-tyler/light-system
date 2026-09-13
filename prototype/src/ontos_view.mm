@@ -188,6 +188,25 @@ u32 le32_at(ByteView d, std::size_t off) {
     throw std::runtime_error(message.str());
 }
 
+// Spec section 16: a timestamped record's tick field repeats the TickHeader
+// tick of the tick the record belongs to. Immediate records (CellFlipped,
+// RegionState, BodyState, TotalsState) belong to the section they appear
+// in; boundary records (RegionCollapsed, RegionMultipole, Contact,
+// RegionRadial, RegionShells) belong to the next tick -- the verifier
+// applies them at the next TickHeader, and boundary records queued before
+// the first TickHeader target tick 1. One shared check mirrors those
+// ordering rules (BodyState inlines the immediate check; Contact keeps its
+// queue validation at the next TickHeader).
+void check_record_tick(const char* what, u64 record_tick, u64 applicable_tick,
+                       std::size_t rec_start) {
+    if (record_tick != applicable_tick) {
+        std::ostringstream message;
+        message << what << " record tick " << record_tick << " does not match applicable tick "
+                << applicable_tick;
+        stream_error(message.str().c_str(), rec_start);
+    }
+}
+
 void finalize_frame(StreamFrame& frame, bool has_snapshot, u64 snapshot_population,
                     u32 body_count, const u8 region_level[4]) {
     if (has_snapshot && snapshot_population != frame.bodies.size()) {
@@ -301,6 +320,9 @@ Stream parse_stream(const std::filesystem::path& path) {
                     if (!take_u64(data, off, t) || !take_u32(data, off, x) || !take_u32(data, off, y)) {
                         stream_error("truncated CellFlipped", rec_start);
                     }
+                    check_record_tick("CellFlipped", t,
+                                      stream.frames.empty() ? 0 : stream.frames.back().tick,
+                                      rec_start);
                 } break;
                 case 4: {
                     u32 rx = 0;
@@ -335,6 +357,7 @@ Stream parse_stream(const std::filesystem::path& path) {
                     if (stream.frames.empty()) {
                         stream_error("RegionState before any TickHeader", rec_start);
                     }
+                    check_record_tick("RegionState", t, stream.frames.back().tick, rec_start);
                     region_level[ry * 2 + rx] = lv;
                 } break;
                 case 6: {
@@ -387,6 +410,7 @@ Stream parse_stream(const std::filesystem::path& path) {
                     if (stream.frames.empty()) {
                         stream_error("TotalsState before any TickHeader", rec_start);
                     }
+                    check_record_tick("TotalsState", t, stream.frames.back().tick, rec_start);
                     stream.frames.back().fine = fine;
                     stream.frames.back().coarse = cn;
                 } break;
@@ -409,6 +433,9 @@ Stream parse_stream(const std::filesystem::path& path) {
                     if (rx > 1 || ry > 1) {
                         stream_error("bad RegionCollapsed", rec_start);
                     }
+                    check_record_tick("RegionCollapsed", t,
+                                      (stream.frames.empty() ? 0 : stream.frames.back().tick) + 1,
+                                      rec_start);
                     stream.region_collapse_mass[ry * 2 + rx] = mass;
                 } break;
                 case 9: {
@@ -426,6 +453,9 @@ Stream parse_stream(const std::filesystem::path& path) {
                     if (rx > 1 || ry > 1) {
                         stream_error("bad RegionMultipole", rec_start);
                     }
+                    check_record_tick("RegionMultipole", t,
+                                      (stream.frames.empty() ? 0 : stream.frames.back().tick) + 1,
+                                      rec_start);
                 } break;
                 case 10: {
                     StreamContact c;
@@ -455,6 +485,9 @@ Stream parse_stream(const std::filesystem::path& path) {
                     if (rx > 1 || ry > 1) {
                         stream_error("bad RegionRadial", rec_start);
                     }
+                    check_record_tick("RegionRadial", t,
+                                      (stream.frames.empty() ? 0 : stream.frames.back().tick) + 1,
+                                      rec_start);
                 } break;
                 case 12: {
                     // Spec 24 ContactParams: at most one, before the first
@@ -489,6 +522,9 @@ Stream parse_stream(const std::filesystem::path& path) {
                     if (rx > 1 || ry > 1) {
                         stream_error("bad RegionShells", rec_start);
                     }
+                    check_record_tick("RegionShells", t,
+                                      (stream.frames.empty() ? 0 : stream.frames.back().tick) + 1,
+                                      rec_start);
                 } break;
                 default: {
                     std::ostringstream message;
