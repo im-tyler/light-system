@@ -1426,6 +1426,10 @@ struct VoiceBank {
         }
         voice.gl = gl;
         voice.gr = gr;
+        // The mixer skips inactive voices; the copy below lands the fully
+        // initialized ring as live (without this, spawned contacts were
+        // constructed and then never sounded).
+        voice.active = true;
         std::lock_guard<std::mutex> lock(mutex);
         ContactVoice* slot = nullptr;
         u64 most_emitted = 0;
