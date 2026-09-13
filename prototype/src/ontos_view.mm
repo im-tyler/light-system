@@ -2356,7 +2356,6 @@ int main(int argc, char** argv) {
 
             const double frame_start = glfwGetTime();
             vkWaitForFences(v.device, 1, &v.in_flight, VK_TRUE, UINT64_MAX);
-            vkResetFences(v.device, 1, &v.in_flight);
 
             // Fill the slot this frame renders. The slot parity alternates
             // every render frame while ticks advance only every
@@ -2499,6 +2498,12 @@ int main(int argc, char** argv) {
                     : v.render_finished_per_image.front();
             submit.signalSemaphoreCount = 1;
             submit.pSignalSemaphores = &signal_semaphore;
+            // Reset only here, on the path that owns the submit: the
+            // OUT_OF_DATE acquire branch above skips submitting entirely,
+            // and a reset-but-never-signaled fence would make the next
+            // vkWaitForFences block forever (swapchain recreation does not
+            // repair fence state).
+            vkResetFences(v.device, 1, &v.in_flight);
             result = vkQueueSubmit(v.queue, 1, &submit, v.in_flight);
             if (result != VK_SUCCESS) throw std::runtime_error("vkQueueSubmit failed");
 
