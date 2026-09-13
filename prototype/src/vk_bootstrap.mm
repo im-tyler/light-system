@@ -1411,21 +1411,58 @@ void destroy_swapchain(VkDevice device, SwapchainContext& swapchain) {
 namespace {  // reopen anonymous namespace
 
 VkResult create_swapchain(VkPhysicalDevice physical_device, VkDevice device, VkSurfaceKHR surface,
-                          GLFWwindow* window, const QueueFamilySelection& queues,
-                          SwapchainContext& swapchain) {
+                           GLFWwindow* window, const QueueFamilySelection& queues,
+                           SwapchainContext& swapchain) {
     VkSurfaceCapabilitiesKHR capabilities{};
-    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface, &capabilities);
+    VkResult result = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface,
+                                                                &capabilities);
+    if (result != VK_SUCCESS) {
+        return result;
+    }
 
     uint32_t format_count = 0;
-    vkGetPhysicalDeviceSurfaceFormatsKHR(physical_device, surface, &format_count, nullptr);
+    result = vkGetPhysicalDeviceSurfaceFormatsKHR(physical_device, surface, &format_count, nullptr);
+    if (result != VK_SUCCESS) {
+        return result;
+    }
     std::vector<VkSurfaceFormatKHR> formats(format_count);
-    vkGetPhysicalDeviceSurfaceFormatsKHR(physical_device, surface, &format_count, formats.data());
+    if (format_count > 0) {
+        result = vkGetPhysicalDeviceSurfaceFormatsKHR(physical_device, surface, &format_count,
+                                                      formats.data());
+        if (result == VK_INCOMPLETE) {
+            // The format set changed between the two calls; keep the
+            // truncated prefix, which is still enough to select from.
+            formats.resize(std::min<std::size_t>(format_count, formats.size()));
+        } else if (result != VK_SUCCESS) {
+            return result;
+        }
+    }
+    // A valid surface always exposes at least one format; an empty set
+    // means the surface is dead and .front() below would be UB.
+    if (formats.empty()) {
+        return VK_ERROR_SURFACE_LOST_KHR;
+    }
 
     uint32_t present_mode_count = 0;
-    vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device, surface, &present_mode_count, nullptr);
+    result = vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device, surface,
+                                                       &present_mode_count, nullptr);
+    if (result != VK_SUCCESS) {
+        return result;
+    }
     std::vector<VkPresentModeKHR> present_modes(present_mode_count);
-    vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device, surface, &present_mode_count,
-                                              present_modes.data());
+    if (present_mode_count > 0) {
+        result = vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device, surface,
+                                                           &present_mode_count,
+                                                           present_modes.data());
+        if (result == VK_INCOMPLETE) {
+            present_modes.resize(std::min<std::size_t>(present_mode_count, present_modes.size()));
+        } else if (result != VK_SUCCESS) {
+            return result;
+        }
+    }
+    if (present_modes.empty()) {
+        return VK_ERROR_SURFACE_LOST_KHR;
+    }
 
     swapchain.surface_format = choose_surface_format(formats);
     swapchain.present_mode = choose_present_mode(present_modes);
@@ -1468,16 +1505,31 @@ VkResult create_swapchain(VkPhysicalDevice physical_device, VkDevice device, VkS
         create_info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     }
 
-    VkResult result = vkCreateSwapchainKHR(device, &create_info, nullptr, &swapchain.swapchain);
+    result = vkCreateSwapchainKHR(device, &create_info, nullptr, &swapchain.swapchain);
     if (result != VK_SUCCESS) {
         return result;
     }
 
     uint32_t swapchain_image_count = 0;
-    vkGetSwapchainImagesKHR(device, swapchain.swapchain, &swapchain_image_count, nullptr);
+    result = vkGetSwapchainImagesKHR(device, swapchain.swapchain, &swapchain_image_count, nullptr);
+    if (result != VK_SUCCESS) {
+        destroy_swapchain(device, swapchain);
+        return result;
+    }
+    if (swapchain_image_count == 0) {
+        destroy_swapchain(device, swapchain);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
     swapchain.images.resize(swapchain_image_count);
-    vkGetSwapchainImagesKHR(device, swapchain.swapchain, &swapchain_image_count,
-                            swapchain.images.data());
+    result = vkGetSwapchainImagesKHR(device, swapchain.swapchain, &swapchain_image_count,
+                                     swapchain.images.data());
+    if (result == VK_INCOMPLETE) {
+        swapchain.images.resize(
+            std::min<std::size_t>(swapchain_image_count, swapchain.images.size()));
+    } else if (result != VK_SUCCESS) {
+        destroy_swapchain(device, swapchain);
+        return result;
+    }
 
     swapchain.image_views.resize(swapchain.images.size());
     for (size_t image_index = 0; image_index < swapchain.images.size(); ++image_index) {
