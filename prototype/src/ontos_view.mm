@@ -503,6 +503,18 @@ Stream parse_stream(const std::filesystem::path& path) {
     }
     ::munmap(mapped, file_size);
 
+    // The format has no terminal flush: contacts queue until the next
+    // TickHeader validates their tick, so records left in the queue at EOF
+    // would attach to a tick that never arrives. The verifier has rejected
+    // this since LS-60; the viewer rejects it too instead of silently
+    // dropping the records.
+    if (!pending_contacts.empty()) {
+        std::ostringstream message;
+        message << "stream ends with " << pending_contacts.size()
+                << " dangling Contact record(s) (no following TickHeader)";
+        throw std::runtime_error(message.str());
+    }
+
     if (stream.frames.empty()) {
         throw std::runtime_error("stream contains no ticks");
     }
