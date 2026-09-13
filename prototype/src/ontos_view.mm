@@ -778,8 +778,9 @@ struct Viewer {
     GpuBuffer quad_buffer;
     GpuBuffer line_buffer;
     GpuBuffer line_instance_buffer;
-    // Double-buffered so the CPU fills slot (frame + 1) & 1 while the GPU may
-    // still be reading the other slot from the previous submit.
+    // Consecutive frames write alternating slots; the single in-flight
+    // fence serializes submits, so the slot picked below is never read by
+    // still-running GPU work when it is refilled.
     GpuBuffer body_instance_buffers[2];
     GpuBuffer contact_instance_buffers[2];
 
@@ -2357,16 +2358,18 @@ int main(int argc, char** argv) {
             vkWaitForFences(v.device, 1, &v.in_flight, VK_TRUE, UINT64_MAX);
             vkResetFences(v.device, 1, &v.in_flight);
 
-            // Fill the slot the previous submit did NOT read: the fence above
-            // guarantees the frame-before-last retired, so this slot's bytes
-            // are no longer in flight.
+            // Fill the slot this frame renders. The slot parity alternates
+            // every render frame while ticks advance only every
+            // frames_per_tick frames, so filling only on tick changes left
+            // the other parity slot stale (or never initialized); both the
+            // body and flash instances are refilled per frame instead.
             GpuBuffer& instance_slot = v.body_instance_buffers[frame_number & 1];
             GpuBuffer& flash_slot = v.contact_instance_buffers[frame_number & 1];
+            fill_body_instances(frame, static_cast<BodyInstance*>(instance_slot.mapped));
             if (!flashes.empty()) {
                 fill_flash_instances(flashes, static_cast<BodyInstance*>(flash_slot.mapped));
             }
             if (tick_changed) {
-                fill_body_instances(frame, static_cast<BodyInstance*>(instance_slot.mapped));
                 for (const StreamContact& c : frame.contacts) {
                     ContactFlash flash;
                     flash.x = static_cast<float>(c.cx);
