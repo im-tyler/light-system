@@ -898,6 +898,23 @@ void create_image(Viewer& v, VkFormat format, VkImageUsageFlags usage, VkImageAs
     result = vkCreateImageView(v.device, &view_info, nullptr, &out.view);
     if (result != VK_SUCCESS) throw std::runtime_error("vkCreateImageView failed");
 }
+// First supported composite alpha mode, preferring opaque (mirrors the
+// main renderer's LS-37 policy). The spec guarantees at least one bit in
+// supportedCompositeAlpha; INHERIT is the final fallback and is always
+// legal.
+VkCompositeAlphaFlagBitsKHR choose_composite_alpha(VkCompositeAlphaFlagsKHR supported) {
+    if ((supported & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR) != 0) {
+        return VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    }
+    if ((supported & VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR) != 0) {
+        return VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
+    }
+    if ((supported & VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR) != 0) {
+        return VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR;
+    }
+    return VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
+}
+
 void create_swapchain(Viewer& v, GLFWwindow* window) {
     VkSurfaceCapabilitiesKHR capabilities{};
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(v.physical_device, v.surface, &capabilities);
@@ -962,7 +979,7 @@ void create_swapchain(Viewer& v, GLFWwindow* window) {
     create_info.imageArrayLayers = 1;
     create_info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     create_info.preTransform = capabilities.currentTransform;
-    create_info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    create_info.compositeAlpha = choose_composite_alpha(capabilities.supportedCompositeAlpha);
     create_info.presentMode = present_mode;
     create_info.clipped = VK_TRUE;
     create_info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
