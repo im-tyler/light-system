@@ -1428,10 +1428,11 @@ struct GravityWorld {
 
   // Section 21 + 24 contact pass: single pinned impulse sweep over
   // unordered real-body pairs in (i, j) id order — (fine, fine)
-  // two-sided, (fine, coarse) static, and with the ContactParams
-  // record (coarse, fine) static against the frozen contactant — then
-  // collapsed-region monopoles in region order, then walls in body
-  // order — applied immediately, after the second fc kick.
+  // two-sided, and with the ContactParams record either static
+  // orientation, (fine, coarse) and (coarse, fine), against the
+  // frozen contactant — then collapsed-region monopoles in region
+  // order, then walls in body order — applied immediately, after
+  // the second fc kick.
   void contact_pass(u64 entering, const std::vector<u8> &flags) {
     const std::size_t n = bodies.size();
     std::vector<f64> radii(n);
@@ -1443,21 +1444,19 @@ struct GravityWorld {
     const bool extended = contacts_params;
     std::vector<std::pair<u32, u32>> nxt;
     std::vector<GContact> events;
-    // Section 24: the sweep visits every unordered real-body pair once
-    // in pinned (i, j) id order and dispatches on membership — a fine
-    // body resolving against an ephemeris-coarse contactant is
-    // reachable whichever member carries the smaller id. Only
-    // (fine, fine), (fine, coarse), and — with the ContactParams
-    // record — (coarse, fine) pairs proceed; collapsed members never
-    // contact individually (their region contacts as a monopole),
-    // coarse-coarse pairs have no movable member, and without the
-    // record non-fine bodies never contact (section 21).
-    for (std::size_t i = 0; i < n; ++i) {
+        // Only (fine, fine) pairs proceed on contact mode alone;
+        // either static orientation — (fine, coarse) and
+        // (coarse, fine) — proceeds only with the ContactParams
+        // record (without it non-fine bodies never contact,
+        // section 21). Collapsed members never contact individually
+        // (their region contacts as a monopole) and coarse-coarse
+        // pairs have no movable member.
+        for (std::size_t i = 0; i < n; ++i) {
       for (std::size_t j = i + 1; j < n; ++j) {
         const bool fine_fine = flags[i] == 1 && flags[j] == 1;
         const bool fine_coarse = flags[i] == 1 && flags[j] == 0;
         const bool coarse_fine = flags[i] == 0 && flags[j] == 1;
-        if (!(fine_fine || fine_coarse || (coarse_fine && extended))) {
+        if (!(fine_fine || ((fine_coarse || coarse_fine) && extended))) {
           continue;
         }
         // f is the fine member; so is the other member's state at the
